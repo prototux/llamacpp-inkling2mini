@@ -12,7 +12,8 @@ services:
     image: ${IMAGE:-ghcr.io/prototux/llamacpp-inkling2mini:latest}
     pull_policy: missing
     env_file:
-      - path: .env
+      # the test scripts point INKLING_ENV_FILE at an empty file so that each run gets only its own settings
+      - path: ${INKLING_ENV_FILE:-.env}
         required: false
     volumes:
       - ${MODELS_DIR:-./models}:/models:ro

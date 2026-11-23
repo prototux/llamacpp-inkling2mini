@@ -63,6 +63,11 @@ if [[ ${DSPARK:-off} == on ]]; then
     )
 fi
 
+# sampling inside the GPU graph: no logits copy to the host per token (not with grammars or a reasoning budget)
+if [[ ${BACKEND_SAMPLING:-off} == on ]]; then
+    args+=(--backend-sampling)
+fi
+
 if [[ -n ${API_KEY:-} ]]; then
     args+=(--api-key "$API_KEY")
 fi

@@ -1,0 +1,384 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index b009d460d..8e05778b5 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1746,6 +1746,15 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.n_ctx             = params.n_ctx;
+     cparams.n_seq_max         = params.n_parallel;
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
++    // LLAMA_SPEC_RS_SEQ=<n> overrides the rollback snapshots of the target (0: none, the server then checkpoints
++    // the partial state - recurrent state and SWA cells - of the sequence before every draft); for profiling
++    if (const char * env = std::getenv("LLAMA_SPEC_RS_SEQ")) {
++        const int n = std::atoi(env);
++        if (n >= 0 && cparams.n_rs_seq != (uint32_t) n) {
++            LOG_WRN("%s: LLAMA_SPEC_RS_SEQ: n_rs_seq %u -> %d\n", __func__, cparams.n_rs_seq, n);
++            cparams.n_rs_seq = (uint32_t) n;
++        }
++    }
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+     cparams.n_batch           = params.n_batch;
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 8db83f65b..269b94d73 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1388,11 +1388,76 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+     std::vector<std::mt19937> draw_rng;
+     std::vector<int64_t>      draw_seed; // the seed each generator was last seeded with (-1: reseed)
+ 
++    // adaptive drafting (from ggml-org/llama.cpp#32773), opt-in with LLAMA_SPEC_ADAPT=<min acceptance rate>:
++    // two states only, a full n_max draft or no draft, because every change of the verification batch size
++    // rebuilds the target graph (~25 ms on Inkling 2). A sequence whose running acceptance rate falls below the
++    // threshold after 8 verifications stops drafting for 64 tokens, then starts again with a fresh rate.
++    struct adapt_state {
++        float   rate   = 0.5f; // EMA of accepted/drafted, weight 0.15
++        int32_t last_n = 0;    // tokens drafted in the last step
++        int32_t n_seen = 0;
++        int32_t paused = 0;    // steps left without drafting
++    };
++    std::vector<adapt_state> adapt;
++    bool  adapt_on  = false;
++    float adapt_min = 0.33f;
++
++    // LLAMA_DSPARK_BLOCK=<n>: a markov context draft decodes n block tokens instead of the trained block_size
++    // (experiment: fewer mask positions in the non-causal block, so the drafts can differ from the trained ones)
++    int32_t block_tokens_max = 0;
++
++    // whether this sequence drafts in this step
++    bool adapt_drafts(llama_seq_id seq_id) {
++        if (!adapt_on) {
++            return true;
++        }
++        auto & a = adapt[seq_id];
++        if (a.paused > 0) {
++            if (--a.paused == 0) {
++                a = {};
++            }
++            return false;
++        }
++        if (a.n_seen >= 8 && a.rate < adapt_min) {
++            a.paused = 64;
++            return false;
++        }
++        return true;
++    }
++
++    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
++        if (!adapt_on || (size_t) seq_id >= adapt.size()) {
++            return;
++        }
++        auto & a = adapt[seq_id];
++        if (a.last_n > 0) {
++            a.rate = 0.85f*a.rate + 0.15f*std::min(1.0f, (float) n_accepted / a.last_n);
++            a.n_seen++;
++        }
++        a.last_n = 0;
++    }
++
+     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+     {
+         const llama_model * model_dft = llama_get_model(this->params.ctx_dft);
+ 
++        if (const char * env = getenv("LLAMA_SPEC_ADAPT")) {
++            const float threshold = (float) atof(env);
++            if (threshold > 0.0f && threshold < 1.0f) {
++                adapt_on  = true;
++                adapt_min = threshold;
++                adapt.resize(n_seq);
++                LOG_INF("%s: adaptive drafting: pause 64 tokens below %.2f acceptance\n", __func__, adapt_min);
++            }
++        }
++        if (const char * env = getenv("LLAMA_DSPARK_BLOCK")) {
++            block_tokens_max = atoi(env);
++            if (block_tokens_max > 0) {
++                LOG_WRN("%s: LLAMA_DSPARK_BLOCK: markov context drafts decode at most %d block tokens\n", __func__, block_tokens_max);
++            }
++        }
++
+         {
+             char buf[32] = {};
+             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
+@@ -1490,7 +1555,7 @@ public:
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+-            if (!dp.drafting) {
++            if (!dp.drafting || !adapt_drafts(seq_id)) {
+                 continue;
+             }
+ 
+@@ -1519,7 +1584,11 @@ public:
+ 
+             // the block attention is non-causal: a draft with a markov context decodes the full trained block, then reads n_max of it
+             const int32_t n_draft = params.n_max;
+-            const int32_t n_block_tokens = has_markov_context ? block_size : n_draft + (sample_from_anchor ? 0 : 1);
++            const int32_t n_read  = n_draft + (sample_from_anchor ? 0 : 1);
++            int32_t n_block_tokens = has_markov_context ? block_size : n_read;
++            if (has_markov_context && block_tokens_max > 0) {
++                n_block_tokens = std::min(block_size, std::max(block_tokens_max, n_read));
++            }
+             i_block_beg[seq_id] = batch.size();
+             n_block    [seq_id] = n_block_tokens;
+             for (int32_t i = 0; i < n_block_tokens; ++i) {
+@@ -1592,6 +1661,9 @@ public:
+                     result.clear();
+                     dp.result_q->clear();
+                 }
++                if (adapt_on) {
++                    adapt[seq_id].last_n = (int32_t) result.size();
++                }
+                 continue;
+             }
+ 
+@@ -1624,6 +1696,9 @@ public:
+             if (result.size() < (size_t) params.n_min) {
+                 result.clear();
+             }
++            if (adapt_on) {
++                adapt[seq_id].last_n = (int32_t) result.size();
++            }
+         }
+     }
+ };
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index eb20544f1..9e3a57c66 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -106,6 +106,15 @@ static bool ggml_cuda_fattn_q8_0_in_place_enabled() {
+     return enabled;
+ }
+ 
++// LLAMA_INKLING_FA_VEC_VERIFY=0 sends small Inkling 2 batches (speculative verification) to the tile kernel again
++static bool ggml_cuda_fattn_vec_verify_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_INKLING_FA_VEC_VERIFY");
++        return !env || atoi(env) != 0;
++    }();
++    return enabled;
++}
++
+ // LLAMA_INKLING_FA_MMA=0 keeps the Inkling 2 prefill on the tile kernel (CUDA cores) instead of the tensor cores
+ static bool ggml_cuda_fattn_mma_bias_enabled() {
+     static const bool enabled = [] {
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 42c0ef1c4..cc31f2d88 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -322,7 +322,9 @@ static __global__ void flash_attn_ext_vec(
+         for (int j = 0; j < ncols; ++j) {
+             if constexpr (indexed_bias) {
+                 const int k = k_VKQ_0 + tid;
+-                const half m = use_rows && rows[k] < 0 ? half(-INFINITY) : head_bias.add(maskh[j*ne11 + tid], ic0 + j, k);
++                // columns past the last query (ncols > 1) are computed but not written: keep their reads in bounds
++                const half m = ncols > 1 && ic0 + j >= int(ne01.z) ? half(0.0f) :
++                    use_rows && rows[k] < 0 ? half(-INFINITY) : head_bias.add(maskh[j*ne11 + tid], ic0 + j, k);
+                 KQ_reg[j] += slope*__half2float(m);
+                 KQ_max_new[j] = fmaxf(KQ_max[j], KQ_reg[j] + FATTN_KQ_MAX_OFFSET);
+             }
+@@ -578,6 +580,14 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
+             fattn_kernel = dst->src[5] ? flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true, true> :
+                                           flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true, false>;
+         }
++    } else if constexpr (cols_per_block == 2 && D == 128 && !use_logit_softcap) {
++        // small batches with the Inkling 2 bias (speculative verification), see ggml_cuda_get_best_fattn_kernel
++        if (dst->src[6]) {
++            GGML_ASSERT(!dst->src[5]);
++            fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true, false>;
++        }
++    } else {
++        GGML_ASSERT(!dst->src[6] && "no vec kernel instance with the indexed bias for this shape");
+     }
+     const bool need_f16_K = type_K == GGML_TYPE_F16;
+     const bool need_f16_V = type_V == GGML_TYPE_F16;
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 407f9c586..4fc250ce4 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -687,6 +687,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+                 ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type)) {
+             return BEST_FATTN_KERNEL_VEC;
+         }
++        // speculative verification batches (1 + n_draft tokens): the vec kernel reads a quantized cache natively
++        if (softcap == 0.0f && Q->ne[0] == 128 && Q->ne[1] <= 8 && !kv_rows && n_kv % FATTN_KQ_STRIDE == 0 &&
++                ggml_cuda_fattn_vec_verify_enabled() && ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type)) {
++            return BEST_FATTN_KERNEL_VEC;
++        }
+         // prefill on the tensor cores: the MMA kernel adds the bias of its one Q head to the mask tile
+         if (Q->ne[0] == 128 && V->ne[0] == 128 && softcap == 0.0f && !kv_rows && Q->ne[1] > 8 &&
+                 GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && ggml_cuda_fattn_mma_bias_enabled() &&
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f9644d2d3..ed982dde4 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4263,7 +4263,8 @@ void llm_graph_context::build_conv_state_store(
+         ggml_tensor * s,
+         ggml_tensor * conv_x,
+             int64_t   n_cols,
+-             size_t   offs) const {
++             size_t   offs,
++        ggml_tensor ** snapshots) const {
+     const auto * mctx_cur = inp->mctx;
+ 
+     const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
+@@ -4273,7 +4274,12 @@ void llm_graph_context::build_conv_state_store(
+     const size_t row_size  = s->nb[1];
+     const size_t cell_offs = mctx_cur->get_head()*row_size + offs;
+ 
+-    if (cparams.n_rs_seq == 0) {
++    if (snapshots) {
++        *snapshots = nullptr;
++    }
++
++    // the current state (rollback slot 0): a plain copy, the same chain with or without snapshots
++    {
+         ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
+                 n_cols, channels, n_seqs,
+                 conv_x->nb[1], conv_x->nb[2],
+@@ -4284,7 +4290,6 @@ void llm_graph_context::build_conv_state_store(
+                 row_size, cell_offs);
+ 
+         ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+-        return;
+     }
+ 
+     // [TAG_RECURRENT_ROLLBACK_SPLITS]
+@@ -4294,21 +4299,37 @@ void llm_graph_context::build_conv_state_store(
+     const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
+     const int64_t Kw = std::min(n, K);
+ 
+-    // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
+-    // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
+-    ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
+-    s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
+-    s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
+-    cb(s_slot_rev, "s_slot_rev", -1);
++    if (Kw < 2) {
++        return; // no snapshots, or a single token: slot 0 is all this ubatch can roll back to
++    }
++
++    // the slot order {K-1, ..., 0} is a constant: built once per state buffer (device) and graph, every store
++    // takes a tail of it; the size K never depends on the ubatch, so the reserved graph covers them all
++    ggml_tensor *& s_slot_rev = rs_slot_order[s->buffer];
++    if (!s_slot_rev) {
++        s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
++        s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
++        s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
++        cb(s_slot_rev, "s_slot_rev", -1);
++    }
++
++    // slots {Kw-1, ..., 1}: slot 0 is the plain copy above
++    ggml_tensor * slot_order = ggml_view_1d(ctx0, s_slot_rev, Kw - 1, ggml_row_size(GGML_TYPE_I32, K - Kw));
+ 
+-    ggml_tensor * slot_order = ggml_view_1d(ctx0, s_slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
++    // the snapshots read overlapping windows of conv_x; a concatenation is rebuilt for them so that the one the
++    // convolution reads has no other consumer and stays fusable with the state copy and the convolution
++    ggml_tensor * x_snap = conv_x;
++    if (conv_x->op == GGML_OP_CONCAT) {
++        const int32_t dim = ((const int32_t *) conv_x->op_params)[0]; // the concat dimension (see ggml_concat)
++        x_snap = ggml_concat(ctx0, conv_x->src[0], conv_x->src[1], dim);
++    }
+ 
+     // window w starts at column n - (Kw - 1) + w (ascending time) and is rollback slot Kw - 1 - w,
+     // consecutive windows start one element apart, so they overlap
+-    ggml_tensor * windows = ggml_view_4d(ctx0, conv_x,
+-            n_cols, Kw, channels, n_seqs,
+-            ggml_element_size(conv_x), conv_x->nb[1], conv_x->nb[2],
+-            ggml_row_size(conv_x->type, n - (Kw - 1)));
++    ggml_tensor * windows = ggml_view_4d(ctx0, x_snap,
++            n_cols, Kw - 1, channels, n_seqs,
++            ggml_element_size(x_snap), x_snap->nb[1], x_snap->nb[2],
++            ggml_row_size(x_snap->type, n - (Kw - 1)));
+ 
+     // [n_cols, slot, channel, seq] view of the cells of this ubatch
+     ggml_tensor * slots = ggml_view_4d(ctx0, s,
+@@ -4316,7 +4337,13 @@ void llm_graph_context::build_conv_state_store(
+             (size_t) mctx_cur->get_size()*row_size, ggml_row_size(s->type, n_cols), row_size,
+             cell_offs);
+ 
+-    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots, windows, slot_order));
++    ggml_tensor * store = ggml_set_rows(ctx0, slots, windows, slot_order);
++
++    if (snapshots) {
++        *snapshots = store;
++    } else {
++        ggml_build_forward_expand(gf, store);
++    }
+ }
+ 
+ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 5250ca285..afd39e3a6 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1155,6 +1155,9 @@ struct llm_graph_context {
+     ggml_context * ctx0 = nullptr;
+     ggml_cgraph  * gf   = nullptr;
+ 
++    // rollback slot order {n_rs_seq, ..., 0} of build_conv_state_store, one per state buffer (device) and graph
++    mutable std::map<ggml_backend_buffer_t, ggml_tensor *> rs_slot_order;
++
+     llm_graph_context(const llm_graph_params & params);
+     virtual ~llm_graph_context() = default;
+ 
+@@ -1513,12 +1516,17 @@ struct llm_graph_context {
+ 
+     // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels, n_seqs},
+     // at byte offset offs of each row of s, and with n_rs_seq > 0 once per rollback slot of this ubatch
++    // store the last n_cols columns of conv_x as the convolution state, plus the rollback snapshots when n_rs_seq > 0
++    // the current state is always a plain copy in the graph right away, in the same op chain as without snapshots,
++    // so that backends can fuse it with the convolution; the snapshot store is expanded into the graph too, unless
++    // the caller takes it in `snapshots` to expand it after the convolution, which keeps that chain in one run
+     void build_conv_state_store(
+             llm_graph_input_rs * inp,
+             ggml_tensor * s,
+             ggml_tensor * conv_x,
+                 int64_t   n_cols,
+-                 size_t   offs) const;
++                 size_t   offs,
++            ggml_tensor ** snapshots = nullptr) const;
+ 
+     ggml_tensor * build_rwkv_token_shift_load(
+         llm_graph_input_rs * inp,
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 15767d441..4cb102bf5 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -240,7 +240,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
+     x = ggml_concat(ctx0, past, x, 0);
+ 
+-    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
++    // the rollback snapshots (speculative decoding, n_rs_seq > 0) are expanded after the convolution: the chain
++    // {concat, state copy, conv, residual, scale} then stays one run of nodes that backends fuse
++    ggml_tensor * snapshots = nullptr;
++    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state), &snapshots);
+ 
+     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
+     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+@@ -268,6 +271,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+     // right after the state store, so that the convolution is one run of nodes that backends can fuse
+     ggml_build_forward_expand(gf, out);
+ 
++    if (snapshots) {
++        ggml_build_forward_expand(gf, snapshots);
++    }
++
+     return out;
+ }
+ 
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 6faa8843d..21759a23e 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -1524,7 +1524,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
+ 
+                         // the k-pool layout is updated in place when drafts are rejected
+                         // TODO: the meta backend aborts with n_rs_seq > 0 (view of permuted tensor not implemented)
+-                        if ((arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
++                        // inkling2: the convolution state snapshots of build_conv_state_store (DSpark verification batches)
++                        if ((arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_INKLING2 ||
++                                    arch == LLM_ARCH_INKLING2_LOOP) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                             const double nmse_rollback = check_draft_rollback(model_and_ctx_dev.first.get(), tokens, logits_dev);
+                             if (!(nmse_rollback <= 1e-4)) {
+                                 if (test_ok) {

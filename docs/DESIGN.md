@@ -76,5 +76,13 @@ Unsloth's draft GGUF predates the DSpark code in this build ("markov_w1.weight h
 `scripts/convert-dspark.sh` converts the draft from the official checkpoint instead (BF16: the converter quantizes
 the Markov head together with its 200K-vocabulary projection otherwise). With it, acceptance on code is ~50% at a
 draft length of 3, and decoding goes from 75 to ~63 tok/s on a 3090: one verification step of 4 tokens costs ~3x a
-single-token step, while plain decoding uses only ~15% of the GPU's memory bandwidth. The cause is under
-investigation; until it is fixed, plain decoding is faster.
+single-token step, while plain decoding uses only ~15% of the GPU's memory bandwidth: decoding is bound by the
+~12.8K kernel launches per token, not by memory.
+
+The main cause found (patch 0006): speculative decoding makes the target keep rollback snapshots of its
+convolution state, and the graph code wrote them with a chain of ops that the fused Inkling 2 kernels do not
+match, so every verification step ran ~1.2-1.5K extra kernels. The fix writes slot 0 of the state in the fusable
+form and the snapshots with one extra op per state buffer. Smaller costs remain: MoE weights are read once per
+(token, expert) pair in a 4-token verify, the draft decodes its block and re-injects the verified rows (two draft
+graphs and syncs per step), and the target samples on the host unless `BACKEND_SAMPLING=on`. These fixes are not
+measured on a GPU yet, so DSpark stays off by default.

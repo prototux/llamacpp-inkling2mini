@@ -10,6 +10,7 @@ Applied in file-name order with `git apply` on upstream llama.cpp at the commit 
 | `0003-inkling2-fused-cuda-glue-kernels.patch` | realugbun, branch [`inkling2-speed`](https://github.com/realugbun/llama.cpp/tree/inkling2-speed), commits `7ec7714fa` `26739461d` `520a486b0` `0f6ac0c9c` | fused CUDA kernels for the Inkling 2 glue op chains; one conflict with 0001 resolved by keeping the indexed-bias graph |
 | `0004-inkling2-attention-prefill-position-bias-q8-kv.patch` | this repository | tensor-core prefill with the bias, position-mode bias, q8_0 K/V read in place, tests |
 | `0005-inkling2-loop-kv-sharing-and-drift-tool.patch` | this repository | opt-in cross-pass KV sharing, `llama-inkling-pass-kv` |
+| `0006-inkling2-dspark-verify-fixes.patch` | this repository; adaptive drafting ported from [#32773](https://github.com/ggml-org/llama.cpp/pull/32773) by Oxsilaris06 | fusable convolution-state chain with rollback snapshots, vec attention kernel for verification batches, adaptive drafting, `LLAMA_DSPARK_BLOCK`, `LLAMA_SPEC_RS_SEQ` |
 
 To update: rebase the changes on a newer upstream commit, regenerate the patches with `git diff --binary` between
 the successive steps, set `LLAMA_CPP_COMMIT`, and check that applying them reproduces the tree you tested

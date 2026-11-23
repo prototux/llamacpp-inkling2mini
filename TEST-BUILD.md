@@ -1,4 +1,4 @@
-# megakernel test build (rev 7)
+# megakernel test build (rev 8)
 
 The GitHub repository (prototux/llamacpp-inkling2mini, build-2) plus two patches that are not published yet:
 
@@ -19,6 +19,11 @@ reference as `PERF FAIL`. With MK_PROJ, the K/V norms move before the projection
 Rev 7: the glue stage (`LLAMA_INKLING_MK_GLUE=1`): the loop controllers, the input norms and their q8_1 quantization
 of a layer in 1-2 kernels (loop-pass attention 14 launches -> 2), the q8_1 consumed directly by the projections and
 the MoE (so MK_MOE becomes a gain). Estimated ~490 fewer launches per token. Not yet run on a GPU.
+
+Rev 8: `scripts/mk-diagnose.sh` runs the two diagnostics that should explain the open problems: `MK_CHECK`
+compares every fused stage with the unfused computation bit for bit inside the real server (finds the kernel behind
+the repetition loop, or clears them all), `MK_PROFILE` times each decode step per kernel class (explains why glue gave
+no speedup). New stages: `MK_GLUE=2` (controllers as one cooperative kernel) and the depth mix folded into the glue.
 
 ## Install from ghcr.io (any machine)
 

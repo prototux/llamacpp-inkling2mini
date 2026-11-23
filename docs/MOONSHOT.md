@@ -356,3 +356,86 @@ docker compose run --rm --no-deps -e LLAMA_INKLING_MK_GLUE=1 --entrypoint /app/t
 # server / bench: LLAMA_INKLING_MK_GLUE=1 alone, then with LLAMA_INKLING_MK_MOE=1, then with MK_PROJ=1 (bug still open):
 # greedy identity against the switch-off run, bench.py decode tok/s, LLAMA_GRAPH_STATS=1 for the node counts
 ```
+
+## Branch `megakernel`, iteration 7: one cooperative glue kernel, the depth mix folded in
+
+Blind as before: sm_86 compile 0 errors, CPU tests pass, nothing run on the 3090 yet (rev 7 = iteration 6 is being tested).
+
+| Stage | Switch | What runs | Launches per loop-pass attention (ref 14 incl. 5 quantize) | Status |
+|---|---|---|---|---|
+| glue, two kernels | `LLAMA_INKLING_MK_GLUE=1` | kernel A CTRL_DOWN x units, kernel B CTRL_OUT rows + last-block norm/q8_1 | 2 (+1 MIX kernel) | iteration 6, rev 7 on the 3090 |
+| glue, one kernel | `LLAMA_INKLING_MK_GLUE=2` | `inkling2_glue_coop_f32`: [mix] -> grid barrier -> CTRL_DOWN items -> grid barrier -> CTRL_OUT items -> last-block norm/q8_1 | 1 (+1 MIX kernel for odd state counts) | new |
+| mix folded in | with either value | even state counts: the exact MIX body for the unit's query runs in the glue kernels; odd counts keep the separate MIX kernel (its unfused path is cuBLAS, the fused MIX is not bit-exact there) | -1 where even | new |
+
+### `MK_GLUE=2`: the cooperative kernel
+- `cudaLaunchKernelEx` with `cudaLaunchAttributeCooperative`; grid = min(blocks wanted by the larger phase = 72 x units,
+  resident capacity = `cudaOccupancyMaxActiveBlocksPerMultiprocessor` x SM count, queried once); phases stride their
+  block-items over the grid; `cooperative_groups::this_grid().sync()` between the phases (compiles for sm_86 on CUDA
+  12.8 without `-rdc`). The cooperative launch is refused by the driver (CUDA error, not a hang) if the grid could not
+  be resident; the matcher falls back to the two kernels when the device reports no cooperative launch support or the
+  capacity is 0. Only controller instances take this path (the others are one kernel already).
+- Open point for the 3090: cooperative launches inside stream capture (llama-server's CUDA graphs). CUDA 12 kernel
+  nodes carry the cooperative attribute, so the capture is expected to work; the self-test runs under capture and will
+  say. If it fails there, the fallback is `=1` (the ticket pattern), nothing else changes.
+- The CTRL_OUT -> norm boundary keeps the ticket (last block normalizes all units): one fewer barrier.
+
+### The depth mix in the glue
+- `inkling2_glue_mix`: the body of `inkling2_mix_exact_f32` for one query. The two mul_mat_vec_f products it replicates
+  compute their columns independently, and the soft_max_f32 warp butterfly with zeros past the states gives the same
+  sum for any power-of-two width >= the state count, so one width (16) reproduces the <4>, <8> and <16> variants.
+  Kernel A (16 blocks per unit): every block mixes for itself into shared memory (same bits), block 0 publishes the row
+  for kernel B. Kernel B without controllers: mixes into shared memory, normalizes from there. Cooperative kernel: phase
+  0, one block per unit into the scratch row, barrier.
+- Matcher: the glue starts at the MIX's RMS_NORM when `inkling2_match_mix` reports the exact configuration (even
+  n_states, mmvf shapes, n_q <= 3, one token); every unit input must be a row view of the MIX output, the views'
+  uses are the units' nodes (3 with controllers, 1 without), the MIX output's uses are those views; the MIX output is
+  never written (the units read the scratch). Shared views (SWA loop layers: one query, three controllers) are handled.
+- Launches: -1 per glue instance with an even state count (the state count is the attention-residual block count + 1,
+  so about half of the 96 instances per token): ~-50 launches/token on top of iteration 6.
+
+### Self-test additions
+`glue ... glue=2` lines (loop pass 3 ctrl, FFN ctrl, 6 steps under a replayed graph, mix 4 states + 3 ctrl) for proj=0
+and proj=1; mix cases: 4 states + 3 ctrl, 8 states + 3 norms, 2 states/1 query/1 norm, 1 query + 3 ctrl (SWA loop),
+3 states (odd: MIX stays apart, the glue takes its output), FFN mix 4 + ctrl, mix 4 + 3 ctrl over 6 steps. Same
+comparison as before (every normalized output and every consumer product, bit-for-bit; PERF FAIL if slower).
+
+### Toward the whole layer application (designed, not built)
+Next phase: the projections in the same launch, reading the q8_1 from the glue scratch. `mul_mat_vec_q`'s result bits
+depend on its launch configuration (nwarps x rows_per_block chosen per type/ncols in `mul_mat_vec_q_switch_ncols_dst`,
+the warp partials reduced through shared memory), so the body must be refactored into a `__device__` function
+parameterized by a virtual block (nwarps warps of a 1024-thread block emulate one mmvq block, the shared reduction per
+virtual block) before it can run after a grid barrier; `mul_mat_vec_q_multi` (one entry per product, already the
+ncols_dst == 1 body) is the one to refactor, in mmvq.cu, with the glue phases moved to a header both files include.
+Then: convs + clips (one block per head: the CONV/CLIP bodies), flash attention (the vec kernel body per (KV head, split)
++ combine), gate/wo (selfq body), conv + residual, FFN glue (this stage), router + top-8, expert gate_up/down (the
+MUL_MAT_ID multi body), SITU, weighted sum, conv + residual. Each phase is a device function of an existing kernel, so
+the self-test can print the first phase whose output differs (compare the phase outputs that the unfused graph also
+materializes). This should wait for the 3090 results of iterations 6-7: the ticket pattern, the cooperative capture
+and the scratch hand-off are the mechanisms every later phase builds on.
+
+### Diagnostics for the 3090 loop and the missing glue gain (`LLAMA_INKLING_MK_CHECK`, `LLAMA_INKLING_MK_PROFILE`)
+The 3090 shows repetition loops (MK_PROJ=1 fast; with MK_PROJ off a slower onset under the user's current switch set) that
+the self-tests do not reproduce, and MK_GLUE=1 gave no measurable speed-up. Both get one run each:
+- `LLAMA_INKLING_MK_CHECK=1` with `GGML_CUDA_DISABLE_GRAPHS=1` (and the stage switches on): every stage that would fuse
+  (proj, wo, moe, glue) runs its kernels into a shadow buffer and then declines the fusion, so the unfused nodes run and
+  the model's output is the unfused one; when the evaluation has passed the run, both results are compared bit-for-bit
+  on the host (the glue's q8_1 against the quantization of the unfused output as well) and every mismatch prints the
+  evaluation number, stage, tensor and first differing element (`=2` prints the OK instances too; a summary every 50
+  evaluations). Reading: mismatches name the kernel; no mismatch and still a loop means the loop is not in a fused
+  kernel (then bisect the other switches: DECODE_SINKS and the odd-count MIX are the known non-bitwise paths).
+- `LLAMA_INKLING_MK_PROFILE=1` with `GGML_CUDA_DISABLE_GRAPHS=1`: cudaEvents around every launched node or fused group,
+  summed per op class and printed every 50 decode evaluations with the host wall time of the evaluation loop. The gap
+  between wall and GPU time is launch overhead; the per-class GPU time says what the ~12.8 ms are (expert mmvq,
+  attention, projections, the small f32 products of the controllers, norms, convs...). Note the event brackets include
+  the gaps between kernels, so "GPU time" is an upper bound of kernel time; with CUDA graphs on the real decode is
+  faster than this run, the proportions are what matters. Decide from this whether more fusion can pay at all.
+```
+docker compose run --rm --no-deps -e LLAMA_INKLING_MK_GLUE=1 -e LLAMA_INKLING_MK_PROJ=1 -e LLAMA_INKLING_MK_MOE=1 -e LLAMA_INKLING_MK_WO=1 \
+    -e LLAMA_INKLING_MK_CHECK=1 -e GGML_CUDA_DISABLE_GRAPHS=1 inkling   # server/cli as usual, greedy prompt; read the mk_check lines
+docker compose run --rm --no-deps -e LLAMA_INKLING_MK_PROFILE=1 -e GGML_CUDA_DISABLE_GRAPHS=1 inkling                      # all MK off: the baseline breakdown
+docker compose run --rm --no-deps -e LLAMA_INKLING_MK_PROFILE=1 -e GGML_CUDA_DISABLE_GRAPHS=1 -e LLAMA_INKLING_MK_GLUE=1 inkling
+```
+Reading the MK_PROJ sources once more against the unfused path found no difference: `mul_mat_vec_q_multi` is the
+ncols_dst == 1 body of `mul_mat_vec_q` (same mapping, reductions and output guard), the inputs are quantized by the same
+`quantize_row_q8_1_cuda`, the matcher only takes products the unfused dispatch sends to mmvq, outputs are checked against
+inputs for overlap. The shadow comparison is the way to locate it in the real graph.

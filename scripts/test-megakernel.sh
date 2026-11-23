@@ -35,6 +35,7 @@ configs=(
     "mk-wo|LLAMA_INKLING_MK_WO=1"
     "mk-moe|LLAMA_INKLING_MK_MOE=1"
     "mk-glue|LLAMA_INKLING_MK_GLUE=1"
+    "mk-glue2|LLAMA_INKLING_MK_GLUE=2"
     "mk-glue-moe-wo|LLAMA_INKLING_MK_GLUE=1 LLAMA_INKLING_MK_MOE=1 LLAMA_INKLING_MK_WO=1"
     "all-on|LLAMA_INKLING_NO_MASK=1 LLAMA_INKLING_FA_VEC_GQA=1 GGML_CUDA_GRAPH_OPT=2 LLAMA_INKLING_MK_WO=1 LLAMA_INKLING_MK_MOE=1"
 )
@@ -89,7 +90,13 @@ if has_step kernels; then
         note "FAIL megakernel self-test crashed: rerun with debug ($out/megakernel-debug.log)"
         run_tool "$out/megakernel-debug.log" "LLAMA_INKLING_MK_DEBUG=1 CUDA_LAUNCH_BLOCKING=1" /app/test-inkling-megakernel
     fi
-    # glue stage self-test (its cases run with the switch set)
+    # glue stage self-test (its cases run with the switch set): 2 kernels, then the cooperative kernel
+    if run_tool "$out/megakernel-glue2.log" "LLAMA_INKLING_MK_GLUE=2" /app/test-inkling-megakernel; then
+        note "$(grep -E '^glue|PERF FAIL' "$out/megakernel-glue2.log" | sed 's/^/  /')"
+        if grep -q -E '(^| )FAIL' "$out/megakernel-glue2.log"; then note "FAIL glue=2 self-test ($out/megakernel-glue2.log)"; else note "PASS glue=2 self-test"; fi
+    else
+        note "FAIL glue=2 self-test crashed ($out/megakernel-glue2.log)"
+    fi
     if run_tool "$out/megakernel-glue.log" "LLAMA_INKLING_MK_GLUE=1" /app/test-inkling-megakernel; then
         note "$(grep -E '^glue|PERF FAIL' "$out/megakernel-glue.log" | sed 's/^/  /')"
         if grep -q -E '(^| )FAIL' "$out/megakernel-glue.log"; then note "FAIL glue self-test ($out/megakernel-glue.log)"; else note "PASS glue self-test"; fi

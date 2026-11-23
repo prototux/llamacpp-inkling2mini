@@ -1,8 +1,8 @@
 diff --git a/docs/inkling-moonshot.md b/docs/inkling-moonshot.md
-index 23b8fdd52..e8ca5c59d 100644
+index 23b8fdd52..a1baa32cd 100644
 --- a/docs/inkling-moonshot.md
 +++ b/docs/inkling-moonshot.md
-@@ -95,3 +95,264 @@ All commands through the compose service; `E` stands for the environment of the
+@@ -95,3 +95,347 @@ All commands through the compose service; `E` stands for the environment of the
     `n_ctx`. For q4_0 run `llama-perplexity -c 8192` against the q8_0 cache and decide on the loss.
  6. Configuration experiments without code: `-ub 2048 -b 2048` for prefill (4x more rows per expert GEMM), and
     `--backend-sampling` for decode (no 800 KB logits copy per token).
@@ -267,6 +267,89 @@ index 23b8fdd52..e8ca5c59d 100644
 +# server / bench: LLAMA_INKLING_MK_GLUE=1 alone, then with LLAMA_INKLING_MK_MOE=1, then with MK_PROJ=1 (bug still open):
 +# greedy identity against the switch-off run, bench.py decode tok/s, LLAMA_GRAPH_STATS=1 for the node counts
 +```
++
++## Branch `megakernel`, iteration 7: one cooperative glue kernel, the depth mix folded in
++
++Blind as before: sm_86 compile 0 errors, CPU tests pass, nothing run on the 3090 yet (rev 7 = iteration 6 is being tested).
++
++| Stage | Switch | What runs | Launches per loop-pass attention (ref 14 incl. 5 quantize) | Status |
++|---|---|---|---|---|
++| glue, two kernels | `LLAMA_INKLING_MK_GLUE=1` | kernel A CTRL_DOWN x units, kernel B CTRL_OUT rows + last-block norm/q8_1 | 2 (+1 MIX kernel) | iteration 6, rev 7 on the 3090 |
++| glue, one kernel | `LLAMA_INKLING_MK_GLUE=2` | `inkling2_glue_coop_f32`: [mix] -> grid barrier -> CTRL_DOWN items -> grid barrier -> CTRL_OUT items -> last-block norm/q8_1 | 1 (+1 MIX kernel for odd state counts) | new |
++| mix folded in | with either value | even state counts: the exact MIX body for the unit's query runs in the glue kernels; odd counts keep the separate MIX kernel (its unfused path is cuBLAS, the fused MIX is not bit-exact there) | -1 where even | new |
++
++### `MK_GLUE=2`: the cooperative kernel
++- `cudaLaunchKernelEx` with `cudaLaunchAttributeCooperative`; grid = min(blocks wanted by the larger phase = 72 x units,
++  resident capacity = `cudaOccupancyMaxActiveBlocksPerMultiprocessor` x SM count, queried once); phases stride their
++  block-items over the grid; `cooperative_groups::this_grid().sync()` between the phases (compiles for sm_86 on CUDA
++  12.8 without `-rdc`). The cooperative launch is refused by the driver (CUDA error, not a hang) if the grid could not
++  be resident; the matcher falls back to the two kernels when the device reports no cooperative launch support or the
++  capacity is 0. Only controller instances take this path (the others are one kernel already).
++- Open point for the 3090: cooperative launches inside stream capture (llama-server's CUDA graphs). CUDA 12 kernel
++  nodes carry the cooperative attribute, so the capture is expected to work; the self-test runs under capture and will
++  say. If it fails there, the fallback is `=1` (the ticket pattern), nothing else changes.
++- The CTRL_OUT -> norm boundary keeps the ticket (last block normalizes all units): one fewer barrier.
++
++### The depth mix in the glue
++- `inkling2_glue_mix`: the body of `inkling2_mix_exact_f32` for one query. The two mul_mat_vec_f products it replicates
++  compute their columns independently, and the soft_max_f32 warp butterfly with zeros past the states gives the same
++  sum for any power-of-two width >= the state count, so one width (16) reproduces the <4>, <8> and <16> variants.
++  Kernel A (16 blocks per unit): every block mixes for itself into shared memory (same bits), block 0 publishes the row
++  for kernel B. Kernel B without controllers: mixes into shared memory, normalizes from there. Cooperative kernel: phase
++  0, one block per unit into the scratch row, barrier.
++- Matcher: the glue starts at the MIX's RMS_NORM when `inkling2_match_mix` reports the exact configuration (even
++  n_states, mmvf shapes, n_q <= 3, one token); every unit input must be a row view of the MIX output, the views'
++  uses are the units' nodes (3 with controllers, 1 without), the MIX output's uses are those views; the MIX output is
++  never written (the units read the scratch). Shared views (SWA loop layers: one query, three controllers) are handled.
++- Launches: -1 per glue instance with an even state count (the state count is the attention-residual block count + 1,
++  so about half of the 96 instances per token): ~-50 launches/token on top of iteration 6.
++
++### Self-test additions
++`glue ... glue=2` lines (loop pass 3 ctrl, FFN ctrl, 6 steps under a replayed graph, mix 4 states + 3 ctrl) for proj=0
++and proj=1; mix cases: 4 states + 3 ctrl, 8 states + 3 norms, 2 states/1 query/1 norm, 1 query + 3 ctrl (SWA loop),
++3 states (odd: MIX stays apart, the glue takes its output), FFN mix 4 + ctrl, mix 4 + 3 ctrl over 6 steps. Same
++comparison as before (every normalized output and every consumer product, bit-for-bit; PERF FAIL if slower).
++
++### Toward the whole layer application (designed, not built)
++Next phase: the projections in the same launch, reading the q8_1 from the glue scratch. `mul_mat_vec_q`'s result bits
++depend on its launch configuration (nwarps x rows_per_block chosen per type/ncols in `mul_mat_vec_q_switch_ncols_dst`,
++the warp partials reduced through shared memory), so the body must be refactored into a `__device__` function
++parameterized by a virtual block (nwarps warps of a 1024-thread block emulate one mmvq block, the shared reduction per
++virtual block) before it can run after a grid barrier; `mul_mat_vec_q_multi` (one entry per product, already the
++ncols_dst == 1 body) is the one to refactor, in mmvq.cu, with the glue phases moved to a header both files include.
++Then: convs + clips (one block per head: the CONV/CLIP bodies), flash attention (the vec kernel body per (KV head, split)
+++ combine), gate/wo (selfq body), conv + residual, FFN glue (this stage), router + top-8, expert gate_up/down (the
++MUL_MAT_ID multi body), SITU, weighted sum, conv + residual. Each phase is a device function of an existing kernel, so
++the self-test can print the first phase whose output differs (compare the phase outputs that the unfused graph also
++materializes). This should wait for the 3090 results of iterations 6-7: the ticket pattern, the cooperative capture
++and the scratch hand-off are the mechanisms every later phase builds on.
++
++### Diagnostics for the 3090 loop and the missing glue gain (`LLAMA_INKLING_MK_CHECK`, `LLAMA_INKLING_MK_PROFILE`)
++The 3090 shows repetition loops (MK_PROJ=1 fast; with MK_PROJ off a slower onset under the user's current switch set) that
++the self-tests do not reproduce, and MK_GLUE=1 gave no measurable speed-up. Both get one run each:
++- `LLAMA_INKLING_MK_CHECK=1` with `GGML_CUDA_DISABLE_GRAPHS=1` (and the stage switches on): every stage that would fuse
++  (proj, wo, moe, glue) runs its kernels into a shadow buffer and then declines the fusion, so the unfused nodes run and
++  the model's output is the unfused one; when the evaluation has passed the run, both results are compared bit-for-bit
++  on the host (the glue's q8_1 against the quantization of the unfused output as well) and every mismatch prints the
++  evaluation number, stage, tensor and first differing element (`=2` prints the OK instances too; a summary every 50
++  evaluations). Reading: mismatches name the kernel; no mismatch and still a loop means the loop is not in a fused
++  kernel (then bisect the other switches: DECODE_SINKS and the odd-count MIX are the known non-bitwise paths).
++- `LLAMA_INKLING_MK_PROFILE=1` with `GGML_CUDA_DISABLE_GRAPHS=1`: cudaEvents around every launched node or fused group,
++  summed per op class and printed every 50 decode evaluations with the host wall time of the evaluation loop. The gap
++  between wall and GPU time is launch overhead; the per-class GPU time says what the ~12.8 ms are (expert mmvq,
++  attention, projections, the small f32 products of the controllers, norms, convs...). Note the event brackets include
++  the gaps between kernels, so "GPU time" is an upper bound of kernel time; with CUDA graphs on the real decode is
++  faster than this run, the proportions are what matters. Decide from this whether more fusion can pay at all.
++```
++docker compose run --rm --no-deps -e LLAMA_INKLING_MK_GLUE=1 -e LLAMA_INKLING_MK_PROJ=1 -e LLAMA_INKLING_MK_MOE=1 -e LLAMA_INKLING_MK_WO=1 \
++    -e LLAMA_INKLING_MK_CHECK=1 -e GGML_CUDA_DISABLE_GRAPHS=1 inkling   # server/cli as usual, greedy prompt; read the mk_check lines
++docker compose run --rm --no-deps -e LLAMA_INKLING_MK_PROFILE=1 -e GGML_CUDA_DISABLE_GRAPHS=1 inkling                      # all MK off: the baseline breakdown
++docker compose run --rm --no-deps -e LLAMA_INKLING_MK_PROFILE=1 -e GGML_CUDA_DISABLE_GRAPHS=1 -e LLAMA_INKLING_MK_GLUE=1 inkling
++```
++Reading the MK_PROJ sources once more against the unfused path found no difference: `mul_mat_vec_q_multi` is the
++ncols_dst == 1 body of `mul_mat_vec_q` (same mapping, reductions and output guard), the inputs are quantized by the same
++`quantize_row_q8_1_cuda`, the matcher only takes products the unfused dispatch sends to mmvq, outputs are checked against
++inputs for overlap. The shadow comparison is the way to locate it in the real graph.
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 5b3c32858..4aa490c55 100644
 --- a/ggml/src/ggml-cuda/common.cuh
@@ -301,10 +384,19 @@ index 5ad8d9b3c..37c4ab357 100644
          // Calculate KQ tile and keep track of new maximum KQ values:
          float KQ_reg[ncols]; // KQ in registers.
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1ad59ebb1..371fc7af4 100644
+index 1ad59ebb1..bd028e93f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -95,6 +95,7 @@
+@@ -79,6 +79,8 @@
+ #include "ggml.h"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <cstring>
+ #include <array>
+ #include <atomic>
+ #include <charconv>
+@@ -95,6 +97,7 @@
  #include <cstdarg>
  #include <cstdio>
  #include <cstdlib>
@@ -312,7 +404,7 @@ index 1ad59ebb1..371fc7af4 100644
  #include <string>
  #include <vector>
  
-@@ -995,6 +996,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -995,6 +998,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      if (copy_event != nullptr) {
          CUDA_CHECK(cudaEventDestroy(copy_event));
      }
@@ -320,7 +412,7 @@ index 1ad59ebb1..371fc7af4 100644
      for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
          for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
              if (streams[i][j] != nullptr) {
-@@ -2636,7 +2638,13 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -2636,7 +2640,13 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
      return true;
  }
  
@@ -334,9 +426,351 @@ index 1ad59ebb1..371fc7af4 100644
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
      const ggml_tensor * ids  = dst->src[2];
-@@ -4467,6 +4475,146 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4466,7 +4476,500 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     return false;
  }
  
++// ---------------------------------------------------------------------------------------------------------------------
++// LLAMA_INKLING_MK_CHECK=1: shadow comparison of every megakernel stage against the unfused path, in the real graph.
++// A stage that would fuse runs its kernels into a shadow buffer and then declines the fusion, so the unfused nodes run
++// and the model's output is the unfused one; when the evaluation has passed the run, both results are compared
++// bit-for-bit on the host and every mismatch is printed with the evaluation number, the stage, the tensor and the first
++// differing element (=2 also prints every OK instance). Needs the CUDA graphs off (GGML_CUDA_DISABLE_GRAPHS=1): the
++// comparison synchronizes the stream. If the model still loops with this on, the loop is not in a fused kernel.
++static int ggml_cuda_mk_check_mode() {
++    static const int mode = [] {
++        const char * env = getenv("LLAMA_INKLING_MK_CHECK");
++        return env ? atoi(env) : 0;
++    }();
++    return mode;
++}
++
++struct ggml_cuda_mk_check_out {
++    char      name[GGML_MAX_NAME];
++    const ggml_tensor * t;       // the unfused output (its data is read after the run executed)
++    void    * shadow;            // the fused output
++    size_t    nbytes;
++    void    * q8;                // optional: the fused q8_1 of the output (glue), compared with the quantization of t
++    size_t    q8_nbytes;
++};
++
++struct ggml_cuda_mk_check_pending {
++    const char * stage;
++    int          end;            // the raw index of the last node of the run: compared when the evaluation passed it
++    int          n;
++    ggml_cuda_mk_check_out outs[MMVQ_MULTI_MAX];
++};
++
++struct ggml_cuda_mk_check_state {
++    std::vector<ggml_cuda_mk_check_pending> pendings;
++    char * arena      = nullptr; // one allocation for the shadows, bump-allocated per pending, reset when none is pending
++    size_t arena_size = 0;
++    size_t arena_used = 0;
++    int    eval       = 0;       // evaluations seen
++    long   n_checked  = 0;
++    long   n_bad      = 0;
++    bool   warned_capture = false;
++};
++
++static ggml_cuda_mk_check_state & ggml_cuda_mk_check() {
++    static ggml_cuda_mk_check_state st;
++    return st;
++}
++
++// a shadow buffer of nbytes (16-byte aligned), or nullptr when the arena is exhausted (the stage then runs unfused only)
++static void * ggml_cuda_mk_check_alloc(size_t nbytes) {
++    ggml_cuda_mk_check_state & st = ggml_cuda_mk_check();
++    if (st.arena == nullptr) {
++        st.arena_size = 64u << 20;
++        CUDA_CHECK(cudaMalloc(&st.arena, st.arena_size));
++    }
++    nbytes = GGML_PAD(nbytes, 256);
++    if (st.arena_used + nbytes > st.arena_size) {
++        return nullptr;
++    }
++    void * p = st.arena + st.arena_used;
++    st.arena_used += nbytes;
++    return p;
++}
++
++// true when a stage may run its shadow now (check mode on, not inside a CUDA graph capture)
++static bool ggml_cuda_mk_check_active(ggml_backend_cuda_context & ctx) {
++    if (ggml_cuda_mk_check_mode() == 0) {
++        return false;
++    }
++    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
++    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &status));
++    if (status != cudaStreamCaptureStatusNone) {
++        ggml_cuda_mk_check_state & st = ggml_cuda_mk_check();
++        if (!st.warned_capture) {
++            st.warned_capture = true;
++            GGML_LOG_WARN("mk_check: a CUDA graph is being captured, the stages are not checked in this graph; run with GGML_CUDA_DISABLE_GRAPHS=1\n");
++        }
++        return false;
++    }
++    return true;
++}
++
++static void ggml_cuda_mk_check_add(const char * stage, int end, int n, const ggml_tensor * const * outs, void * const * shadows,
++        void * const * q8s, size_t q8_nbytes) {
++    ggml_cuda_mk_check_state & st = ggml_cuda_mk_check();
++    ggml_cuda_mk_check_pending p = {};
++    p.stage = stage;
++    p.end   = end;
++    p.n     = n;
++    for (int k = 0; k < n; ++k) {
++        snprintf(p.outs[k].name, sizeof(p.outs[k].name), "%s", outs[k]->name);
++        p.outs[k].t         = outs[k];
++        p.outs[k].shadow    = shadows[k];
++        p.outs[k].nbytes    = ggml_nbytes(outs[k]);
++        p.outs[k].q8        = q8s != nullptr ? q8s[k] : nullptr;
++        p.outs[k].q8_nbytes = q8s != nullptr ? q8_nbytes : 0;
++    }
++    st.pendings.push_back(p);
++}
++
++// compare the pendings whose run the evaluation has passed (i: the raw index about to be evaluated; -1: all)
++static void ggml_cuda_mk_check_flush(ggml_backend_cuda_context & ctx, int i) {
++    ggml_cuda_mk_check_state & st = ggml_cuda_mk_check();
++    if (st.pendings.empty()) {
++        return;
++    }
++    bool synced = false;
++    std::vector<ggml_cuda_mk_check_pending> keep;
++    for (const ggml_cuda_mk_check_pending & p : st.pendings) {
++        if (i >= 0 && i <= p.end) {
++            keep.push_back(p);
++            continue;
++        }
++        if (!synced) {
++            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++            synced = true;
++        }
++        for (int k = 0; k < p.n; ++k) {
++            const ggml_cuda_mk_check_out & o = p.outs[k];
++            std::vector<char> ref(o.nbytes), fused(o.nbytes);
++            CUDA_CHECK(cudaMemcpy(ref.data(), o.t->data, o.nbytes, cudaMemcpyDeviceToHost));
++            CUDA_CHECK(cudaMemcpy(fused.data(), o.shadow, o.nbytes, cudaMemcpyDeviceToHost));
++            st.n_checked++;
++            bool ok = true;
++            if (memcmp(ref.data(), fused.data(), o.nbytes) != 0) {
++                ok = false;
++                const size_t n_el = o.nbytes/sizeof(float);
++                const float * a = (const float *) ref.data();
++                const float * b = (const float *) fused.data();
++                size_t first = 0, n_diff = 0;
++                double max_abs = 0.0;
++                for (size_t e = 0; e < n_el; ++e) {
++                    if (a[e] != b[e] || std::isnan(b[e])) {
++                        if (n_diff == 0) {
++                            first = e;
++                        }
++                        n_diff++;
++                        max_abs = std::max(max_abs, (double) fabs((double) a[e] - (double) b[e]));
++                    }
++                }
++                GGML_LOG_INFO("mk_check: eval %d %s %s MISMATCH: %zu of %zu elements differ, max abs %.3g, first [%zu] unfused %.9g fused %.9g\n",
++                        st.eval, p.stage, o.name, n_diff, n_el, max_abs, first, a[first], b[first]);
++            }
++            if (o.q8 != nullptr) {
++                // the fused q8_1 against the quantization of the unfused output
++                std::vector<char> q8_fused(o.q8_nbytes), q8_ref(o.q8_nbytes);
++                void * q8_tmp = ggml_cuda_mk_check_alloc(o.q8_nbytes);
++                if (q8_tmp != nullptr) {
++                    const int64_t ne0 = o.t->ne[0];
++                    quantize_row_q8_1_cuda((const float *) o.t->data, q8_tmp, ne0, ne0, ne0, ne0, GGML_PAD(ne0, MATRIX_ROW_PADDING), 1, 1, 1, ctx.stream());
++                    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++                    CUDA_CHECK(cudaMemcpy(q8_ref.data(), q8_tmp, o.q8_nbytes, cudaMemcpyDeviceToHost));
++                    CUDA_CHECK(cudaMemcpy(q8_fused.data(), o.q8, o.q8_nbytes, cudaMemcpyDeviceToHost));
++                    if (memcmp(q8_ref.data(), q8_fused.data(), o.q8_nbytes) != 0) {
++                        ok = false;
++                        size_t first = 0;
++                        while (first < o.q8_nbytes && q8_ref[first] == q8_fused[first]) {
++                            first++;
++                        }
++                        GGML_LOG_INFO("mk_check: eval %d %s %s q8_1 MISMATCH: first byte %zu (block %zu offset %zu) unfused %d fused %d\n",
++                                st.eval, p.stage, o.name, first, first/sizeof(block_q8_1), first%sizeof(block_q8_1), (int) q8_ref[first], (int) q8_fused[first]);
++                    }
++                }
++            }
++            st.n_bad += !ok;
++            if (ok && ggml_cuda_mk_check_mode() >= 2) {
++                GGML_LOG_INFO("mk_check: eval %d %s %s OK\n", st.eval, p.stage, o.name);
++            }
++        }
++    }
++    st.pendings.swap(keep);
++    if (st.pendings.empty()) {
++        st.arena_used = 0;
++    }
++}
++
++// the end of an evaluation: compare what is left, count the evaluation, print a summary every 50 evaluations
++static void ggml_cuda_mk_check_end_eval(ggml_backend_cuda_context & ctx) {
++    if (ggml_cuda_mk_check_mode() == 0) {
++        return;
++    }
++    ggml_cuda_mk_check_flush(ctx, -1);
++    ggml_cuda_mk_check_state & st = ggml_cuda_mk_check();
++    st.eval++;
++    if (st.eval % 50 == 0 || (st.n_bad > 0 && st.eval <= 5)) {
++        GGML_LOG_INFO("mk_check: %d evaluations, %ld stage outputs compared, %ld mismatching\n", st.eval, st.n_checked, st.n_bad);
++    }
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// LLAMA_INKLING_MK_PROFILE=1: the time of one evaluation by op class, from cudaEvents around every launched node or
++// fused group (CUDA graphs off: GGML_CUDA_DISABLE_GRAPHS=1). Printed every 50 evaluations of graphs with >= 100 nodes
++// (the decode graphs), with the host wall time of the evaluation loop: the gap between the two is launch overhead.
++static bool ggml_cuda_mk_profile_mode() {
++    static const bool enabled = getenv("LLAMA_INKLING_MK_PROFILE") != nullptr;
++    return enabled;
++}
++
++enum ggml_cuda_mk_class {
++    MK_CLASS_MOE,       // MUL_MAT_ID (expert products)
++    MK_CLASS_ATTN,      // FLASH_ATTN_EXT
++    MK_CLASS_PROJ,      // quantized MUL_MAT (projections, lm_head, fused runs)
++    MK_CLASS_SMALL_MM,  // f32/f16/bf16 MUL_MAT (controllers, sinks, conv taps, router, mix)
++    MK_CLASS_GLUE,      // fused groups from RMS_NORM with more than 2 nodes (glue, ctrl, mix) and CONCAT groups
++    MK_CLASS_NORM,      // RMS_NORM (+ MUL)
++    MK_CLASS_CONV,      // SSM_CONV and the conv fusions
++    MK_CLASS_ROUTER,    // SOFT_MAX, ARGSORT, SUM_ROWS, top-k chains
++    MK_CLASS_COPY,      // GET_ROWS, CPY, SET_ROWS, CONT
++    MK_CLASS_ELEM,      // elementwise
++    MK_CLASS_OTHER,
++    MK_CLASS_COUNT,
++};
++
++static const char * ggml_cuda_mk_class_name(int c) {
++    static const char * names[MK_CLASS_COUNT] = { "moe experts (mul_mat_id)", "attention (flash_attn)", "quantized mul_mat (proj, lm_head)",
++        "f32/bf16 mul_mat (ctrl, sinks, taps, router, mix)", "fused glue/ctrl/mix groups", "norms", "convs", "router/top-k",
++        "copies (get_rows, cpy, set_rows, cont)", "elementwise", "other" };
++    return names[c];
++}
++
++static int ggml_cuda_mk_classify(const ggml_tensor * node, int n_fused) {
++    switch (node->op) {
++        case GGML_OP_MUL_MAT_ID:     return MK_CLASS_MOE;
++        case GGML_OP_FLASH_ATTN_EXT: return MK_CLASS_ATTN;
++        case GGML_OP_MUL_MAT:        return ggml_is_quantized(node->src[0]->type) ? MK_CLASS_PROJ : MK_CLASS_SMALL_MM;
++        case GGML_OP_RMS_NORM:       return n_fused > 2 ? MK_CLASS_GLUE : MK_CLASS_NORM;
++        case GGML_OP_CONCAT:         return n_fused > 1 ? MK_CLASS_CONV : MK_CLASS_COPY;
++        case GGML_OP_SSM_CONV:       return MK_CLASS_CONV;
++        case GGML_OP_SOFT_MAX:
++        case GGML_OP_ARGSORT:
++        case GGML_OP_SUM_ROWS:
++        case GGML_OP_TOP_K:          return MK_CLASS_ROUTER;
++        case GGML_OP_GET_ROWS:
++        case GGML_OP_CPY:
++        case GGML_OP_SET_ROWS:
++        case GGML_OP_CONT:
++        case GGML_OP_DUP:            return MK_CLASS_COPY;
++        case GGML_OP_ADD:
++        case GGML_OP_SUB:
++        case GGML_OP_MUL:
++        case GGML_OP_DIV:
++        case GGML_OP_SCALE:
++        case GGML_OP_UNARY:
++        case GGML_OP_GLU:
++        case GGML_OP_CLAMP:
++        case GGML_OP_SQR:
++        case GGML_OP_SQRT:
++        case GGML_OP_FILL:
++        case GGML_OP_REPEAT:         return MK_CLASS_ELEM;
++        default:                     return MK_CLASS_OTHER;
++    }
++}
++
++struct ggml_cuda_mk_profile_state {
++    std::vector<cudaEvent_t> events;       // 2 per launched group
++    std::vector<int>         classes;      // per group
++    std::vector<int>         counts;       // nodes per group
++    int    n_groups = 0;
++    double total_ms[MK_CLASS_COUNT] = {};
++    long   total_groups[MK_CLASS_COUNT] = {};
++    double total_wall_ms = 0.0;
++    double total_gpu_ms  = 0.0;
++    int    n_evals = 0;
++    int64_t t_start = 0;
++};
++
++static ggml_cuda_mk_profile_state & ggml_cuda_mk_profile() {
++    static ggml_cuda_mk_profile_state st;
++    return st;
++}
++
++static void ggml_cuda_mk_profile_begin_eval() {
++    ggml_cuda_mk_profile_state & st = ggml_cuda_mk_profile();
++    st.n_groups = 0;
++    st.t_start  = ggml_time_us();
++}
++
++// before a node or fused group is launched
++static void ggml_cuda_mk_profile_begin(cudaStream_t stream) {
++    ggml_cuda_mk_profile_state & st = ggml_cuda_mk_profile();
++    const size_t need = 2*(size_t) (st.n_groups + 1);
++    while (st.events.size() < need) {
++        cudaEvent_t e;
++        CUDA_CHECK(cudaEventCreate(&e));
++        st.events.push_back(e);
++    }
++    CUDA_CHECK(cudaEventRecord(st.events[2*st.n_groups], stream));
++}
++
++static void ggml_cuda_mk_profile_end(cudaStream_t stream, const ggml_tensor * node, int n_fused) {
++    ggml_cuda_mk_profile_state & st = ggml_cuda_mk_profile();
++    CUDA_CHECK(cudaEventRecord(st.events[2*st.n_groups + 1], stream));
++    if ((int) st.classes.size() <= st.n_groups) {
++        st.classes.resize(st.n_groups + 1);
++        st.counts.resize(st.n_groups + 1);
++    }
++    st.classes[st.n_groups] = ggml_cuda_mk_classify(node, n_fused);
++    st.counts[st.n_groups]  = n_fused;
++    st.n_groups++;
++}
++
++static void ggml_cuda_mk_profile_end_eval(ggml_backend_cuda_context & ctx, int n_nodes) {
++    ggml_cuda_mk_profile_state & st = ggml_cuda_mk_profile();
++    if (st.n_groups == 0) {
++        return;
++    }
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    const double wall_ms = (ggml_time_us() - st.t_start)/1000.0;
++    if (n_nodes < 100) {
++        return; // not a decode graph
++    }
++    double eval_ms[MK_CLASS_COUNT] = {};
++    long   eval_groups[MK_CLASS_COUNT] = {};
++    double gpu_ms = 0.0;
++    for (int g = 0; g < st.n_groups; ++g) {
++        float ms = 0.0f;
++        CUDA_CHECK(cudaEventElapsedTime(&ms, st.events[2*g], st.events[2*g + 1]));
++        eval_ms[st.classes[g]] += ms;
++        eval_groups[st.classes[g]]++;
++        gpu_ms += ms;
++    }
++    st.n_evals++;
++    st.total_wall_ms += wall_ms;
++    st.total_gpu_ms  += gpu_ms;
++    for (int c = 0; c < MK_CLASS_COUNT; ++c) {
++        st.total_ms[c]     += eval_ms[c];
++        st.total_groups[c] += eval_groups[c];
++    }
++    if (st.n_evals % 50 == 1) {
++        GGML_LOG_INFO("mk_profile: evaluation %d: %d nodes, %d launched groups, host wall %.3f ms, GPU time (event-bracketed, incl. gaps) %.3f ms; averages over %d evaluations:\n",
++                st.n_evals, n_nodes, st.n_groups, wall_ms, gpu_ms, st.n_evals);
++        for (int c = 0; c < MK_CLASS_COUNT; ++c) {
++            if (st.total_groups[c] == 0) {
++                continue;
++            }
++            GGML_LOG_INFO("mk_profile:   %-52s %7.3f ms  %6.1f groups  %6.1f us/group\n", ggml_cuda_mk_class_name(c),
++                    st.total_ms[c]/st.n_evals, (double) st.total_groups[c]/st.n_evals, 1000.0*st.total_ms[c]/st.total_groups[c]);
++        }
++        GGML_LOG_INFO("mk_profile:   %-52s %7.3f ms wall, %7.3f ms GPU\n", "total per evaluation", st.total_wall_ms/st.n_evals, st.total_gpu_ms/st.n_evals);
++    }
++}
++
  // try and fuse nodes and return the number of nodes to skip
 +// LLAMA_INKLING_MK_PROJ=1: a run of consecutive one-token MUL_MAT nodes over quantized weights (the Inkling 2
 +// attention projections) runs as one kernel per weight type, each distinct input quantized once. Read on every call
@@ -389,6 +823,18 @@ index 1ad59ebb1..371fc7af4 100644
 +            src0->ne[0] % QK8_1 == 0 && src0->ne[0] <= 3072 && src0->ne[3] == 1 && node->nb[0] == sizeof(float) &&
 +            src0->buffer != nullptr && ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
 +            !ggml_cuda_should_use_mmq_few(src0, src1, ids, cc) && node->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
++        if (ggml_cuda_mk_check_active(ctx)) {
++            // LLAMA_INKLING_MK_CHECK: the fused product into a shadow, the unfused one into the node
++            void * shadow = ggml_cuda_mk_check_alloc(ggml_nbytes(node));
++            if (shadow != nullptr) {
++                ggml_tensor copy = *node;
++                copy.data = shadow;
++                ggml_cuda_mul_mat_vec_q_id_selfq(ctx, src0, src1, ids, &copy, ggml_cuda_mk_debug());
++                const ggml_tensor * outs[1] = { node };
++                ggml_cuda_mk_check_add("moe", -1, 1, outs, &shadow, nullptr, 0);
++            }
++            return false;
++        }
 +        ggml_cuda_mul_mat_vec_q_id_selfq(ctx, src0, src1, ids, node, ggml_cuda_mk_debug());
 +        return true;
 +    }
@@ -481,16 +927,44 @@ index 1ad59ebb1..371fc7af4 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      if (ggml_cuda_fusion_disabled()) {
-@@ -4475,7 +4623,54 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4475,7 +4978,118 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
++    const bool mk_check = ggml_cuda_mk_check_mode() != 0;
++    if (mk_check) {
++        ggml_cuda_mk_check_flush(*cuda_ctx, i); // the runs the evaluation has passed
++    }
++
 +    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mk_proj_mode() != 0) {
 +        int n = 0;
 +        const ggml_tensor * src0[MMVQ_MULTI_MAX];
 +        const ggml_tensor * src1[MMVQ_MULTI_MAX];
 +        ggml_tensor *       dst[MMVQ_MULTI_MAX];
 +        const int end = ggml_cuda_mk_proj_match(cgraph, i, n, src0, src1, dst);
++        if (end > 0 && mk_check && ggml_cuda_mk_check_active(*cuda_ctx)) {
++            // LLAMA_INKLING_MK_CHECK: the fused run into shadows, then the unfused products run one by one
++            ggml_tensor   copies[MMVQ_MULTI_MAX];
++            ggml_tensor * dst_copies[MMVQ_MULTI_MAX];
++            void        * shadows[MMVQ_MULTI_MAX];
++            bool          ok = true;
++            for (int k = 0; k < n; ++k) {
++                shadows[k] = ggml_cuda_mk_check_alloc(ggml_nbytes(dst[k]));
++                ok = ok && shadows[k] != nullptr;
++                copies[k]      = *dst[k];
++                copies[k].data = shadows[k];
++                dst_copies[k]  = &copies[k];
++            }
++            if (ok) {
++                if (ggml_cuda_mk_proj_mode() == 2) {
++                    ggml_cuda_mul_mat_vec_q_multi(*cuda_ctx, n, src0, src1, dst_copies, ggml_cuda_mk_debug());
++                } else {
++                    ggml_cuda_mul_mat_vec_q_selfq(*cuda_ctx, n, src0, src1, nullptr, dst_copies, ggml_cuda_mk_debug());
++                }
++                ggml_cuda_mk_check_add("proj", end - 1, n, (const ggml_tensor * const *) dst, shadows, nullptr, 0);
++            }
++            return 0;
++        }
 +        if (end > 0) {
 +            if (ggml_cuda_mk_proj_mode() == 2) {
 +                // the inputs quantized by separate launches (comparison)
@@ -518,6 +992,18 @@ index 1ad59ebb1..371fc7af4 100644
 +            const ggml_tensor * src1[1] = { a };
 +            const ggml_tensor * gate[1] = { g };
 +            ggml_tensor *       dst[1]  = { mm };
++            if (mk_check && ggml_cuda_mk_check_active(*cuda_ctx)) {
++                void * shadow = ggml_cuda_mk_check_alloc(ggml_nbytes(mm));
++                if (shadow != nullptr) {
++                    ggml_tensor   copy = *mm;
++                    ggml_tensor * dst_copy[1] = { &copy };
++                    copy.data = shadow;
++                    ggml_cuda_mul_mat_vec_q_selfq(*cuda_ctx, 1, src0, src1, gate, dst_copy, ggml_cuda_mk_debug());
++                    const ggml_tensor * outs[1] = { mm };
++                    ggml_cuda_mk_check_add("wo", i + 2, 1, outs, &shadow, nullptr, 0);
++                }
++                return 0;
++            }
 +            ggml_cuda_mul_mat_vec_q_selfq(*cuda_ctx, 1, src0, src1, gate, dst, ggml_cuda_mk_debug());
 +            return 2;
 +        }
@@ -529,23 +1015,50 @@ index 1ad59ebb1..371fc7af4 100644
 +        if (node->op == GGML_OP_RMS_NORM && ggml_cuda_mk_glue_mode() != 0 && !cuda_ctx->stream_context().plan.active()) {
 +            ggml_cuda_inkling2_glue glue;
 +            if (ggml_cuda_inkling2_glue_match(cgraph, i, glue)) {
-+                ggml_cuda_inkling2_glue_run(*cuda_ctx, glue, ggml_cuda_mk_debug());
++                if (mk_check && ggml_cuda_mk_check_active(*cuda_ctx)) {
++                    // the glue into shadows (its q8_1 kept in its slots, not published), then the unfused chain
++                    ggml_cuda_inkling2_glue shadow_glue = glue;
++                    ggml_tensor copies[3];
++                    void *      shadows[3];
++                    void *      q8s[3];
++                    bool        ok = true;
++                    const int   slot0 = ggml_cuda_mk_glue_next_slot(*cuda_ctx);
++                    for (int j = 0; j < glue.n_units; ++j) {
++                        shadows[j] = ggml_cuda_mk_check_alloc(ggml_nbytes(glue.u[j].y));
++                        ok = ok && shadows[j] != nullptr;
++                        copies[j]         = *glue.u[j].y;
++                        copies[j].data    = shadows[j];
++                        shadow_glue.u[j].y = &copies[j];
++                        q8s[j] = ggml_cuda_mk_glue_slot(*cuda_ctx, slot0 + j);
++                    }
++                    if (ok) {
++                        ggml_cuda_inkling2_glue_run(*cuda_ctx, shadow_glue, ggml_cuda_mk_glue_mode(), ggml_cuda_mk_debug(), /*publish*/ false);
++                        const ggml_tensor * outs[3] = { glue.u[0].y, glue.u[1].y, glue.u[2].y };
++                        ggml_cuda_mk_check_add("glue", i + glue.n_nodes - 1, glue.n_units, outs, shadows, q8s,
++                                GGML_PAD(glue.u[0].y->ne[0], MATRIX_ROW_PADDING)/QK8_1*sizeof(block_q8_1));
++                    }
++                    return 0;
++                }
++                ggml_cuda_inkling2_glue_run(*cuda_ctx, glue, ggml_cuda_mk_glue_mode(), ggml_cuda_mk_debug());
 +                return glue.n_nodes - 1;
 +            }
 +        }
          ggml_cuda_inkling2_args inkling2;
          if (ggml_cuda_inkling2_match(cgraph, i, inkling2)) {
              ggml_cuda_inkling2_fused(*cuda_ctx, inkling2);
-@@ -5322,6 +5517,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5322,6 +5936,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
 +    ggml_cuda_mk_glue_begin_eval(*cuda_ctx); // LLAMA_INKLING_MK_GLUE: the q8_1 outputs of the previous evaluation are stale
++    if (ggml_cuda_mk_profile_mode()) {
++        ggml_cuda_mk_profile_begin_eval();
++    }
 +
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -5330,6 +5527,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5330,6 +5949,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      ggml_cuda_concurrent_event * concurrent_event           = nullptr;
      bool                         should_launch_concurrent_events = false;
  
@@ -604,7 +1117,7 @@ index 1ad59ebb1..371fc7af4 100644
  #ifdef USE_CUDA_GRAPH
      ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
      const int         chunk_size = ggml_cuda_graph_chunk_size();
-@@ -5429,7 +5678,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5429,7 +6100,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  #ifdef USE_CUDA_GRAPH
                  // fused nodes are skipped together, so a cut never splits a fusion
                  // a concurrent region must join before its capture can end
@@ -613,7 +1126,7 @@ index 1ad59ebb1..371fc7af4 100644
                      ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                      CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
                      chunk_end = i + chunk_size;
-@@ -5471,6 +5720,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5471,12 +6142,40 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -639,7 +1152,22 @@ index 1ad59ebb1..371fc7af4 100644
                  if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                      continue;
                  }
-@@ -5484,6 +5752,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
++                const bool mk_profile = ggml_cuda_mk_profile_mode() && !use_cuda_graph;
++                if (mk_profile) {
++                    ggml_cuda_mk_profile_begin(cuda_ctx->stream());
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
++                if (mk_profile && nodes_to_skip != 0) {
++                    ggml_cuda_mk_profile_end(cuda_ctx->stream(), node, nodes_to_skip + 1); // the fused group
++                }
++
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+@@ -5484,6 +6183,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                              nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                              ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
  #endif
@@ -649,18 +1177,32 @@ index 1ad59ebb1..371fc7af4 100644
                      i += nodes_to_skip;
                      continue;
                  }
-@@ -5510,6 +5781,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5509,6 +6211,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
- 
++                if (mk_profile) {
++                    ggml_cuda_mk_profile_end(cuda_ctx->stream(), node, 1); // closes the bracket opened before try_fuse
++                }
++
 +                if (plan_active) {
 +                    plan_record(i, i);
 +                }
-+
+ 
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
-                }
-@@ -5655,6 +5930,253 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -5534,6 +6243,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         } else {
+             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
+         }
++        ggml_cuda_mk_check_end_eval(*cuda_ctx); // LLAMA_INKLING_MK_CHECK: the comparisons left, the summary
++        if (ggml_cuda_mk_profile_mode() && !use_cuda_graph) {
++            ggml_cuda_mk_profile_end_eval(*cuda_ctx, cgraph->n_nodes); // LLAMA_INKLING_MK_PROFILE
++        }
+     }
+ 
+     if (use_cuda_graph && !cuda_graph_update_required) {
+@@ -5655,6 +6368,253 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
      }
  }
  
@@ -914,7 +1456,7 @@ index 1ad59ebb1..371fc7af4 100644
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
-@@ -5817,12 +6339,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5817,12 +6777,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      GGML_UNUSED(cgraph);
  #endif
  
@@ -929,7 +1471,7 @@ index 1ad59ebb1..371fc7af4 100644
          return;
      }
  
-@@ -5833,6 +6351,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5833,6 +6789,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          return;
      }
  
@@ -1013,18 +1555,22 @@ index 7b9c27789..5275a0dbc 100644
      }
  };
 diff --git a/ggml/src/ggml-cuda/inkling2.cu b/ggml/src/ggml-cuda/inkling2.cu
-index abdffb8d4..e3b6f8f6a 100644
+index abdffb8d4..1e08d54cf 100644
 --- a/ggml/src/ggml-cuda/inkling2.cu
 +++ b/ggml/src/ggml-cuda/inkling2.cu
-@@ -4,6 +4,7 @@
+@@ -4,6 +4,11 @@
  #include "../ggml-impl.h"
  
  #include <algorithm>
 +#include <set>
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#include <cooperative_groups.h>
++#endif
  
  // Every fusion except one MIX path gives the same bits as the op chain it replaces: the kernels keep the order of
  // every fp32 operation, round each intermediate the unfused kernels store (__fmul_rn/__fsub_rn/__fadd_rn, so nothing
-@@ -1438,30 +1439,18 @@ static bool inkling2_ctrl_tokens_ok(const ggml_tensor * w, int64_t n_tok) {
+@@ -1438,30 +1443,18 @@ static bool inkling2_ctrl_tokens_ok(const ggml_tensor * w, int64_t n_tok) {
  // warp sums), with the block size that mul_mat_vec_f picks for the row length.
  static constexpr int INKLING2_CTRL_DOWN_BLOCK = 1024;
  
@@ -1067,7 +1613,7 @@ index abdffb8d4..e3b6f8f6a 100644
  
      const int n4 = n/4;
  
-@@ -1501,10 +1490,30 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_DOWN_BLOCK) inkling2_ctrl
+@@ -1501,10 +1494,30 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_DOWN_BLOCK) inkling2_ctrl
      }
  
      if (gt == 0 && o < n_out) {
@@ -1099,7 +1645,7 @@ index abdffb8d4..e3b6f8f6a 100644
  static bool inkling2_match_ctrl_down(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
      if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_MUL_MAT }, { i + 3 }) ||
              !ggml_check_edges(cgraph, i, { {2, 0, 0}, {2, 1, 1}, {3, 1, 2} })) {
-@@ -1583,27 +1592,16 @@ static void inkling2_ctrl_down(ggml_backend_cuda_context & ctx, const ggml_cuda_
+@@ -1583,27 +1596,16 @@ static void inkling2_ctrl_down(ggml_backend_cuda_context & ctx, const ggml_cuda_
  // 2l and 2l + 1 (one float2), then the xor-butterfly warp sum. The results are the bits of the unfused ops.
  static constexpr int INKLING2_CTRL_OUT_ROWS = 8; // output elements (warps) per block
  
@@ -1134,7 +1680,7 @@ index abdffb8d4..e3b6f8f6a 100644
          df += fv.x*hv.x;
          df += fv.y*hv.y;
          dg += gv.x*hv.x;
-@@ -1613,14 +1611,33 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_OUT_ROWS*WARP_SIZE) inkli
+@@ -1613,14 +1615,33 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_OUT_ROWS*WARP_SIZE) inkli
      dg = warp_reduce_sum<WARP_SIZE>(dg);
  
      if (lane == 0) {
@@ -1171,7 +1717,7 @@ index abdffb8d4..e3b6f8f6a 100644
  static bool inkling2_match_ctrl_out(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
      // MUL_MAT(F) MUL_MAT(G) TANH(f) MUL(., x) SUB(x, .) TANH(g) MUL(., m) ADD
      if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
-@@ -1862,6 +1879,568 @@ static void inkling2_ctrl_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_
+@@ -1862,6 +1883,983 @@ static void inkling2_ctrl_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_
              (int64_t) (m->nb[1]/sizeof(float)));
  }
  
@@ -1206,6 +1752,14 @@ index abdffb8d4..e3b6f8f6a 100644
 +    block_q8_1  * q8;     // the q8_1 of y, GGML_PAD(n, MATRIX_ROW_PADDING)/QK8_1 blocks
 +    int64_t w_down_s1, f_s1, g_s1;
 +    float   eps_x, eps_m, eps_y;
++    // the depth mix computed in the kernel (mix_n_states > 0; else x is the input): the states are
++    // [mix_p_0 .. mix_p_{n_states-2}, rms_norm(mix_x)], the weights softmax_l(mix_scale*<state_l, mix_q>)
++    const float * mix_p;  // the earlier (normalized) states, rows of mix_p_s1 floats
++    const float * mix_x;  // the current state, n floats
++    const float * mix_q;  // this unit's query, n floats
++    int64_t mix_p_s1;
++    int     mix_n_states;
++    float   mix_eps, mix_scale;
 +};
 +
 +struct inkling2_glue_args {
@@ -1215,8 +1769,11 @@ index abdffb8d4..e3b6f8f6a 100644
 +    int     n_pad;      // quantized length
 +    int     rank;       // controller rank (ctrl)
 +    int     mmvf_block; // mul_mat_vec_f's block for rows of 2n floats (ctrl)
++    int     mmvf_block_mix; // mul_mat_vec_f's block for rows of n floats (mix)
++    bool    has_mix;    // the units compute their depth mix
 +    float * h;          // scratch: the controller inputs, rank floats per unit (ctrl)
 +    float * yc;         // scratch: the controller outputs, n floats per unit (ctrl)
++    float * xm;         // scratch: the mixed inputs, n floats per unit (mix)
 +    int   * counters;   // one per unit, zero between launches (ctrl)
 +    bool    debug;
 +};
@@ -1236,8 +1793,9 @@ index abdffb8d4..e3b6f8f6a 100644
 +    block_q8_1 * slot(int i)   { return (block_q8_1 *) (buf + (size_t) i*INKLING2_GLUE_SLOT_SIZE); }
 +    float      * h()           { return (float *) (buf + (size_t) INKLING2_GLUE_SLOTS*INKLING2_GLUE_SLOT_SIZE); }
 +    float      * yc()          { return h() + 3*INKLING2_GLUE_MAX_RANK; }
-+    int        * counters()    { return (int *) (yc() + 3*INKLING2_GLUE_MAX_N); }
-+    static size_t size()       { return (size_t) INKLING2_GLUE_SLOTS*INKLING2_GLUE_SLOT_SIZE + (3*INKLING2_GLUE_MAX_RANK + 3*INKLING2_GLUE_MAX_N)*sizeof(float) + 256; }
++    float      * xm()          { return yc() + 3*INKLING2_GLUE_MAX_N; }
++    int        * counters()    { return (int *) (xm() + 3*INKLING2_GLUE_MAX_N); }
++    static size_t size()       { return (size_t) INKLING2_GLUE_SLOTS*INKLING2_GLUE_SLOT_SIZE + (3*INKLING2_GLUE_MAX_RANK + 6*INKLING2_GLUE_MAX_N)*sizeof(float) + 256; }
 +};
 +
 +static ggml_cuda_mk_glue_state & inkling2_glue_state(ggml_backend_cuda_context & ctx) {
@@ -1346,6 +1904,156 @@ index abdffb8d4..e3b6f8f6a 100644
 +    }
 +}
 +
++// The depth mix of one unit with the bits of inkling2_mix_exact_f32, for the unit's query alone: the columns of the two
++// mul_mat_vec_f products the exact kernel replicates are independent, and the soft_max_f32 warp butterfly over 32 lanes
++// with zeros past the states gives the same sum for any power-of-two width >= the state count, so one width (16) serves
++// every state count. One block of 1024 threads; the mixed row goes to y (shared or global, complete on return).
++struct inkling2_glue_mix_shared {
++    float s_warp[INKLING2_GLUE_BLOCK/WARP_SIZE];
++    float s_score[INKLING2_MIX_MAX_STATES];
++    float s_prob[INKLING2_MIX_MAX_STATES];
++};
++
++static __device__ void inkling2_glue_mix(const inkling2_glue_unit & u, float * y, const int n, const int mmvf_block,
++        float * s_sum, inkling2_glue_mix_shared & sh) {
++    constexpr int ms  = INKLING2_MIX_MAX_STATES;
++    constexpr int bs  = INKLING2_GLUE_BLOCK;
++    const int     tid = threadIdx.x;
++
++    const float * p        = u.mix_p;
++    const float * x        = u.mix_x;
++    const float * q        = u.mix_q;
++    const int     n_states = u.mix_n_states;
++    const int     n_p      = n_states - 1; // states before x
++
++    // rms_norm_f32 of x
++    float sum_x2 = inkling2_rms_norm_partial(x, n/4);
++    sum_x2 = block_reduce<block_reduce_method::SUM, bs>(sum_x2, s_sum);
++    const float x_scale = rsqrtf(__fadd_rn(sum_x2 / n, u.mix_eps));
++
++    // the scores: mul_mat_vec_f, one group of mmvf_block threads per state
++    const int n_groups = bs/mmvf_block;
++    const int wpg      = mmvf_block/WARP_SIZE;
++    const int g        = tid/mmvf_block;
++    const int gt       = tid%mmvf_block;
++    for (int l0 = 0; l0 < n_states; l0 += n_groups) {
++        const int l = l0 + g;
++        float acc = 0.0f;
++        if (l < n_states) {
++            for (int col2 = gt; col2 < n/2; col2 += mmvf_block) {
++                float2 sv;
++                if (l < n_p) {
++                    sv = ((const float2 *) (p + l*u.mix_p_s1))[col2];
++                } else {
++                    const float2 xv = ((const float2 *) x)[col2];
++                    sv = make_float2(__fmul_rn(x_scale, xv.x), __fmul_rn(x_scale, xv.y));
++                }
++                const float2 qv = ((const float2 *) q)[col2];
++                acc += sv.x*qv.x;
++                acc += sv.y*qv.y;
++            }
++        }
++        acc = warp_reduce_sum<WARP_SIZE>(acc);
++        if (wpg > 1) {
++            if (tid % WARP_SIZE == 0) {
++                sh.s_warp[tid/WARP_SIZE] = acc;
++            }
++            __syncthreads();
++            if (gt < WARP_SIZE) {
++                float v = gt < wpg ? sh.s_warp[g*wpg + gt] : 0.0f;
++                v = warp_reduce_sum<WARP_SIZE>(v);
++                if (gt == 0 && l < n_states) {
++                    sh.s_score[l] = v;
++                }
++            }
++            __syncthreads();
++        } else {
++            if (gt == 0 && l < n_states) {
++                sh.s_score[l] = acc;
++            }
++            __syncthreads();
++        }
++    }
++
++    // the weights: soft_max_f32 with one warp, lane l holding state l
++    if (tid == 0) {
++        float v[ms];
++        float max_v = -INFINITY;
++#pragma unroll
++        for (int l = 0; l < ms; ++l) {
++            if (l < n_states) {
++                v[l]  = __fmul_rn(sh.s_score[l], u.mix_scale);
++                max_v = fmaxf(max_v, v[l]);
++            }
++        }
++        float e[ms];
++#pragma unroll
++        for (int l = 0; l < ms; ++l) {
++            e[l] = l < n_states ? expf(v[l] - max_v) : 0.0f;
++        }
++        float b[ms];
++#pragma unroll
++        for (int l = 0; l < ms; ++l) {
++            b[l] = e[l];
++        }
++#pragma unroll
++        for (int offset = ms/2; offset > 0; offset >>= 1) {
++            float nb[ms];
++#pragma unroll
++            for (int l = 0; l < ms; ++l) {
++                nb[l] = b[l] + b[l ^ offset];
++            }
++#pragma unroll
++            for (int l = 0; l < ms; ++l) {
++                b[l] = nb[l];
++            }
++        }
++        const float inv_sum = 1.0f / b[0];
++#pragma unroll
++        for (int l = 0; l < ms; ++l) {
++            if (l < n_states) {
++                sh.s_prob[l] = e[l] * inv_sum;
++            }
++        }
++    }
++    __syncthreads();
++
++    // the mix: mul_mat_vec_f over rows of n_states floats, lane c holding the states 2c and 2c + 1
++    constexpr int max_lanes = ms/2;
++    for (int i = tid; i < n; i += bs) {
++        float s[ms];
++#pragma unroll
++        for (int l = 0; l < ms; ++l) {
++            if (l < n_states) {
++                s[l] = l < n_p ? p[l*u.mix_p_s1 + i] : __fmul_rn(x_scale, x[i]);
++            }
++        }
++        float b[max_lanes];
++#pragma unroll
++        for (int c = 0; c < max_lanes; ++c) {
++            b[c] = 0.0f;
++            if (2*c < n_states) {
++                b[c] += s[2*c]*sh.s_prob[2*c];
++                b[c] += s[2*c + 1]*sh.s_prob[2*c + 1];
++            }
++        }
++#pragma unroll
++        for (int offset = max_lanes/2; offset > 0; offset >>= 1) {
++            float nb[max_lanes];
++#pragma unroll
++            for (int c = 0; c < max_lanes; ++c) {
++                nb[c] = b[c] + b[c ^ offset];
++            }
++#pragma unroll
++            for (int c = 0; c < max_lanes; ++c) {
++                b[c] = nb[c];
++            }
++        }
++        y[i] = b[0];
++    }
++    __syncthreads(); // y complete for every thread of the block
++}
++
 +// LLAMA_INKLING_MK_DEBUG: the argument checks of both kernels, once per block; true when the block must stop
 +static __device__ bool inkling2_glue_bad_args(const inkling2_glue_args & args, const bool ctrl) {
 +    bool bad = (int) blockIdx.y >= args.n_units || args.n_units < 1 || args.n_units > 3 || args.n % 4 != 0 ||
@@ -1357,12 +2065,19 @@ index abdffb8d4..e3b6f8f6a 100644
 +    }
 +    if (!bad) {
 +        const inkling2_glue_unit & u = args.u[blockIdx.y];
-+        bad = u.x == nullptr || u.w_norm == nullptr || u.y == nullptr || (uintptr_t) u.x % 16 != 0 ||
-+              (uintptr_t) u.w_norm % 16 != 0 || (uintptr_t) u.y % 16 != 0;
++        bad = u.w_norm == nullptr || u.y == nullptr || (uintptr_t) u.w_norm % 16 != 0 || (uintptr_t) u.y % 16 != 0;
 +        if (ctrl) {
 +            bad = bad || u.m == nullptr || u.w_down == nullptr || u.f == nullptr || u.g == nullptr || (uintptr_t) u.m % 16 != 0 ||
 +                  (uintptr_t) u.w_down % 8 != 0 || (uintptr_t) u.f % 8 != 0 || (uintptr_t) u.g % 8 != 0 ||
 +                  u.w_down_s1 % 2 != 0 || u.f_s1 % 2 != 0 || u.g_s1 % 2 != 0;
++        }
++        if (args.has_mix) {
++            bad = bad || u.mix_n_states < 2 || u.mix_n_states % 2 != 0 || u.mix_n_states > INKLING2_MIX_MAX_STATES ||
++                  u.mix_p == nullptr || u.mix_x == nullptr || u.mix_q == nullptr || args.xm == nullptr ||
++                  (uintptr_t) u.mix_p % 8 != 0 || (uintptr_t) u.mix_x % 16 != 0 || (uintptr_t) u.mix_q % 8 != 0 ||
++                  u.mix_p_s1 % 2 != 0 || args.mmvf_block_mix < WARP_SIZE || INKLING2_GLUE_BLOCK % args.mmvf_block_mix != 0;
++        } else {
++            bad = bad || u.x == nullptr || (uintptr_t) u.x % 16 != 0;
 +        }
 +    }
 +    if (bad && threadIdx.x == 0) {
@@ -1376,6 +2091,8 @@ index abdffb8d4..e3b6f8f6a 100644
 +static __global__ void __launch_bounds__(INKLING2_GLUE_BLOCK) inkling2_glue_ctrl_down_f32(const inkling2_glue_args args) {
 +    __shared__ float s_sum[32];
 +    __shared__ float s_dot[INKLING2_GLUE_BLOCK/WARP_SIZE];
++    __shared__ __align__(16) float s_x[INKLING2_GLUE_MAX_N]; // the mixed input (mix)
++    __shared__ inkling2_glue_mix_shared sh;
 +
 +    if (args.debug && inkling2_glue_bad_args(args, true)) {
 +        return;
@@ -1384,7 +2101,19 @@ index abdffb8d4..e3b6f8f6a 100644
 +    const inkling2_glue_unit & u = args.u[unit];
 +    const int n_groups = INKLING2_GLUE_BLOCK/args.mmvf_block;
 +
-+    inkling2_ctrl_down_block(u.x, u.m, u.w_down, args.h + unit*INKLING2_GLUE_MAX_RANK, args.n, args.rank, u.w_down_s1,
++    // every block of the unit mixes for itself (the same bits), block 0 also publishes the row for kernel B
++    const float * x = u.x;
++    if (args.has_mix) {
++        inkling2_glue_mix(u, s_x, args.n, args.mmvf_block_mix, s_sum, sh);
++        x = s_x;
++        if (blockIdx.x == 0) {
++            float * xm = args.xm + unit*INKLING2_GLUE_MAX_N;
++            for (int i = threadIdx.x; i < args.n; i += INKLING2_GLUE_BLOCK) {
++                xm[i] = s_x[i];
++            }
++        }
++    }
++    inkling2_ctrl_down_block(x, u.m, u.w_down, args.h + unit*INKLING2_GLUE_MAX_RANK, args.n, args.rank, u.w_down_s1,
 +            u.eps_x, u.eps_m, args.mmvf_block, blockIdx.x*n_groups, s_sum, s_dot);
 +}
 +
@@ -1407,8 +2136,9 @@ index abdffb8d4..e3b6f8f6a 100644
 +        const int     r    = blockIdx.x*(INKLING2_GLUE_BLOCK/WARP_SIZE) + tid/WARP_SIZE;
 +        const float * h    = args.h  + unit*INKLING2_GLUE_MAX_RANK;
 +        float       * yc   = args.yc + unit*INKLING2_GLUE_MAX_N;
++        const float * x    = args.has_mix ? args.xm + unit*INKLING2_GLUE_MAX_N : u.x; // the mixed row from kernel A
 +        if (r < args.n) {
-+            inkling2_ctrl_out_row(u.f + r*u.f_s1, u.g + r*u.g_s1, h, u.x + r, u.m + r, yc + r, args.rank, lane);
++            inkling2_ctrl_out_row(u.f + r*u.f_s1, u.g + r*u.g_s1, h, x + r, u.m + r, yc + r, args.rank, lane);
 +        }
 +        // the last block of the unit to arrive continues; the others are done
 +        __threadfence();
@@ -1426,9 +2156,125 @@ index abdffb8d4..e3b6f8f6a 100644
 +        }
 +        inkling2_glue_norm_quant<true>(yc, u.w_norm, u.y, u.q8, args.n, args.n_pad, u.eps_y, s_sum);
 +    } else {
-+        inkling2_glue_norm_quant<false>(u.x, u.w_norm, u.y, u.q8, args.n, args.n_pad, u.eps_y, s_sum);
++        __shared__ __align__(16) float s_x[INKLING2_GLUE_MAX_N];
++        __shared__ inkling2_glue_mix_shared sh;
++        const float * x = u.x;
++        if (args.has_mix) {
++            inkling2_glue_mix(u, s_x, args.n, args.mmvf_block_mix, s_sum, sh);
++            x = s_x;
++        }
++        inkling2_glue_norm_quant<false>(x, u.w_norm, u.y, u.q8, args.n, args.n_pad, u.eps_y, s_sum);
 +    }
 +}
++
++// LLAMA_INKLING_MK_GLUE=2: the controller instances as ONE cooperative kernel. Phase 1 is the CTRL_DOWN work of every unit
++// (16 x units block-items strided over the grid), a grid-wide barrier (cooperative groups; the cooperative launch
++// guarantees that every block is resident, so it cannot deadlock), phase 2 the CTRL_OUT rows strided over the grid,
++// then the last block to finish (ticket) normalizes and quantizes every unit. The grid is at most the number of blocks
++// of 1024 threads the device keeps resident at once (occupancy x SMs), else the launch would be refused.
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#define INKLING2_GLUE_COOP
++#endif
++
++#ifdef INKLING2_GLUE_COOP
++static __global__ void __launch_bounds__(INKLING2_GLUE_BLOCK) inkling2_glue_coop_f32(const inkling2_glue_args args) {
++    __shared__ float s_sum[32];
++    __shared__ float s_dot[INKLING2_GLUE_BLOCK/WARP_SIZE];
++    __shared__ int   s_last;
++
++    if (args.debug && inkling2_glue_bad_args(args, true)) {
++        return;
++    }
++    const int tid       = threadIdx.x;
++    const int n_groups  = INKLING2_GLUE_BLOCK/args.mmvf_block;
++    const int n_dblocks = (args.rank + n_groups - 1)/n_groups;                   // CTRL_DOWN block-items per unit
++    const int n_rblocks = (args.n + INKLING2_GLUE_BLOCK/WARP_SIZE - 1)/(INKLING2_GLUE_BLOCK/WARP_SIZE); // CTRL_OUT row blocks per unit
++
++    // phase 0 (mix): one block per unit mixes into the scratch row every block reads after the barrier
++    if (args.has_mix) {
++        __shared__ inkling2_glue_mix_shared sh;
++        for (int unit = blockIdx.x; unit < args.n_units; unit += gridDim.x) {
++            inkling2_glue_mix(args.u[unit], args.xm + unit*INKLING2_GLUE_MAX_N, args.n, args.mmvf_block_mix, s_sum, sh);
++        }
++        __threadfence();
++        cooperative_groups::this_grid().sync();
++    }
++
++    for (int item = blockIdx.x; item < n_dblocks*args.n_units; item += gridDim.x) {
++        const int unit = item / n_dblocks;
++        const int b    = item % n_dblocks;
++        const inkling2_glue_unit & u = args.u[unit];
++        const float * x = args.has_mix ? args.xm + unit*INKLING2_GLUE_MAX_N : u.x;
++        inkling2_ctrl_down_block(x, u.m, u.w_down, args.h + unit*INKLING2_GLUE_MAX_RANK, args.n, args.rank, u.w_down_s1,
++                u.eps_x, u.eps_m, args.mmvf_block, b*n_groups, s_sum, s_dot);
++        __syncthreads(); // the shared partials are reused by the next item
++    }
++
++    __threadfence();
++    cooperative_groups::this_grid().sync();
++
++    for (int item = blockIdx.x; item < n_rblocks*args.n_units; item += gridDim.x) {
++        const int unit = item / n_rblocks;
++        const int rb   = item % n_rblocks;
++        const inkling2_glue_unit & u = args.u[unit];
++        const float * x = args.has_mix ? args.xm + unit*INKLING2_GLUE_MAX_N : u.x;
++        const int r = rb*(INKLING2_GLUE_BLOCK/WARP_SIZE) + tid/WARP_SIZE;
++        if (r < args.n) {
++            inkling2_ctrl_out_row(u.f + r*u.f_s1, u.g + r*u.g_s1, args.h + unit*INKLING2_GLUE_MAX_RANK, x + r, u.m + r,
++                    args.yc + unit*INKLING2_GLUE_MAX_N + r, args.rank, tid % WARP_SIZE);
++        }
++    }
++
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        s_last = atomicAdd(args.counters, 1) == (int) gridDim.x - 1;
++    }
++    __syncthreads();
++    if (!s_last) {
++        return;
++    }
++    __threadfence();
++    if (tid == 0) {
++        args.counters[0] = 0;
++    }
++    for (int unit = 0; unit < args.n_units; ++unit) {
++        const inkling2_glue_unit & u = args.u[unit];
++        inkling2_glue_norm_quant<true>(args.yc + unit*INKLING2_GLUE_MAX_N, u.w_norm, u.y, u.q8, args.n, args.n_pad, u.eps_y, s_sum);
++        __syncthreads();
++    }
++}
++
++// the largest grid of the cooperative kernel the device keeps resident (0: cooperative launch not available)
++static int inkling2_glue_coop_max_grid() {
++    static int max_grid = -1;
++    if (max_grid < 0) {
++        const int device = ggml_cuda_get_device();
++        int coop = 0;
++        CUDA_CHECK(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, device));
++        int per_sm = 0;
++        if (coop) {
++            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, inkling2_glue_coop_f32, INKLING2_GLUE_BLOCK, 0));
++        }
++        max_grid = coop ? per_sm*ggml_cuda_info().devices[device].nsm : 0;
++    }
++    return max_grid;
++}
++
++static void inkling2_glue_coop_launch(const inkling2_glue_args & args, int grid, cudaStream_t stream) {
++    cudaLaunchAttribute attr = {};
++    attr.id              = cudaLaunchAttributeCooperative;
++    attr.val.cooperative = 1;
++    cudaLaunchConfig_t cfg = {};
++    cfg.gridDim          = dim3(grid, 1, 1);
++    cfg.blockDim         = dim3(INKLING2_GLUE_BLOCK, 1, 1);
++    cfg.dynamicSmemBytes = 0;
++    cfg.stream           = stream;
++    cfg.attrs            = &attr;
++    cfg.numAttrs         = 1;
++    CUDA_CHECK(cudaLaunchKernelEx(&cfg, inkling2_glue_coop_f32, args));
++}
++#endif // INKLING2_GLUE_COOP
 +
 +// the next computed node at or after raw index k (views and empty nodes are skipped by the backend)
 +static int inkling2_next_node(const ggml_cgraph * cgraph, int k) {
@@ -1535,6 +2381,27 @@ index abdffb8d4..e3b6f8f6a 100644
 +
 +    int k = i;
 +
++    // the depth mix before the units, when the exact kernel replicates it (even state counts, mul_mat_vec_f shapes):
++    // its output is consumed only through the units' input views, so it never has to be written
++    {
++        ggml_cuda_inkling2_args mx;
++        if (inkling2_match_mix(cgraph, i, mx) && mx.node[3] != nullptr && mx.dst->ne[2] == 1 && mx.src[2]->ne[1] <= 3 &&
++                !(mx.dst->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            glue.mix         = true;
++            glue.mix_dst     = mx.dst;
++            glue.mix_p       = mx.src[0];
++            glue.mix_x       = mx.src[1];
++            glue.mix_q       = mx.src[2];
++            glue.mix_norm    = mx.node[0];
++            glue.mix_softmax = mx.node[1];
++            glue.mix_concat  = mx.node[2];
++            k = inkling2_next_node(cgraph, i + mx.n_nodes);
++            if (k >= cgraph->n_nodes || cgraph->nodes[k]->op != GGML_OP_RMS_NORM) {
++                return false;
++            }
++        }
++    }
++
 +    // the controllers: CTRL_DOWN_j CTRL_OUT_j, up to three, until a RMS_NORM of a controller output starts the norms
 +    while (glue.n_units < 3) {
 +        const ggml_tensor * t = cgraph->nodes[k];
@@ -1627,10 +2494,52 @@ index abdffb8d4..e3b6f8f6a 100644
 +        if (u.y->ne[0] != n || u.x->ne[0] != n || (glue.ctrl && (u.m->ne[0] != n || u.w_down->ne[1] != glue.u[0].w_down->ne[1]))) {
 +            return false;
 +        }
-+        if (!inkling2_glue_outside(cgraph, i, glue.n_nodes, { u.x, u.m, u.w_down, u.f, u.g, u.w_norm })) {
++        if (!inkling2_glue_outside(cgraph, i, glue.n_nodes, { glue.mix ? nullptr : u.x, u.m, u.w_down, u.f, u.g, u.w_norm })) {
 +            return false;
 +        }
-+        if ((uintptr_t) u.x->data % 16 != 0 || (glue.ctrl && (uintptr_t) u.m->data % 16 != 0)) {
++        if ((!glue.mix && (uintptr_t) u.x->data % 16 != 0) || (glue.ctrl && (uintptr_t) u.m->data % 16 != 0)) {
++            return false;
++        }
++    }
++    if (glue.mix) {
++        // every unit input is a row view of the mix output, the mix output and the views have no other uses
++        const ggml_tensor * dst = glue.mix_dst;
++        if (dst->ne[0] != n || glue.mix_x->ne[0] != n ||
++                !inkling2_glue_outside(cgraph, i, glue.n_nodes, { glue.mix_p, glue.mix_x, glue.mix_q })) {
++            return false;
++        }
++        int n_views = 0;
++        for (int j = 0; j < glue.n_units; ++j) {
++            auto & u = glue.u[j];
++            if (u.x->view_src != dst || u.x->view_offs % dst->nb[1] != 0 || u.x->view_offs / dst->nb[1] >= (size_t) dst->ne[1] ||
++                    ggml_nelements(u.x) != n || u.x->nb[0] != sizeof(float)) {
++                return false;
++            }
++            u.q_idx = (int) (u.x->view_offs / dst->nb[1]);
++            // the view's uses: the units that read it (3 nodes each with controllers, 1 without), inside the run
++            int uses = 0, first = -1;
++            for (int jj = 0; jj < glue.n_units; ++jj) {
++                if (glue.u[jj].x == u.x) {
++                    uses += glue.ctrl ? 3 : 1;
++                    first = first < 0 ? jj : first;
++                }
++            }
++            if (first != j) {
++                continue; // counted with the first unit of this view
++            }
++            n_views++;
++            int kx = -1;
++            for (int kk = i; kk < i + glue.n_nodes; ++kk) {
++                if (cgraph->nodes[kk] == u.x) {
++                    kx = kk;
++                    break;
++                }
++            }
++            if (kx < 0 || ggml_node_get_use_count(cgraph, kx) != uses || (u.x->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++                return false;
++            }
++        }
++        if (ggml_node_get_use_count(cgraph, i + 7) != n_views) {
 +            return false;
 +        }
 +    }
@@ -1640,11 +2549,15 @@ index abdffb8d4..e3b6f8f6a 100644
 +        for (int b = 0; b < glue.n_units; ++b) {
 +            const auto & u = glue.u[b];
 +            // a unit's own output may sit on its input (ggml-alloc in place): the block reads x before it writes y, and
-+            // with controllers every block has finished reading x when the last one writes y
-+            if ((a == b ? !inkling2_same_or_disjoint(y, u.x) : inkling2_overlap(y, u.x)) || inkling2_overlap(y, u.w_norm) ||
++            // with controllers every block has finished reading x when the last one writes y. With the mix the inputs
++            // are the mix's (read by every unit's blocks), the mix output itself is never touched.
++            if ((!glue.mix && (a == b ? !inkling2_same_or_disjoint(y, u.x) : inkling2_overlap(y, u.x))) || inkling2_overlap(y, u.w_norm) ||
 +                    (glue.ctrl && inkling2_overlap(y, u.m)) || (a != b && inkling2_overlap(y, u.y))) {
 +                return false;
 +            }
++        }
++        if (glue.mix && (inkling2_overlap(y, glue.mix_p) || inkling2_overlap(y, glue.mix_x) || inkling2_overlap(y, glue.mix_q))) {
++            return false;
 +        }
 +    }
 +    // without controllers the glue pays off only when a quantized product consumes an output (its quantize launch)
@@ -1660,7 +2573,15 @@ index abdffb8d4..e3b6f8f6a 100644
 +    return true;
 +}
 +
-+void ggml_cuda_inkling2_glue_run(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_glue & glue, bool debug) {
++int ggml_cuda_mk_glue_next_slot(ggml_backend_cuda_context & ctx) {
++    return inkling2_glue_state(ctx).next;
++}
++
++block_q8_1 * ggml_cuda_mk_glue_slot(ggml_backend_cuda_context & ctx, int i) {
++    return inkling2_glue_state(ctx).slot(i % INKLING2_GLUE_SLOTS);
++}
++
++void ggml_cuda_inkling2_glue_run(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_glue & glue, int mode, bool debug, bool publish) {
 +    ggml_cuda_mk_glue_state & st = inkling2_glue_state(ctx);
 +
 +    const int n     = (int) glue.u[0].y->ne[0];
@@ -1674,7 +2595,14 @@ index abdffb8d4..e3b6f8f6a 100644
 +    args.debug    = debug;
 +    args.h        = st.h();
 +    args.yc       = st.yc();
++    args.xm       = st.xm();
 +    args.counters = st.counters();
++    args.has_mix  = glue.mix;
++    if (glue.mix) {
++        args.mmvf_block_mix = inkling2_mmvf_block_size(n, WARP_SIZE);
++        GGML_ASSERT(INKLING2_GLUE_BLOCK % args.mmvf_block_mix == 0 && glue.mix_concat->ne[1] % 2 == 0 &&
++                glue.mix_concat->ne[1] <= INKLING2_MIX_MAX_STATES);
++    }
 +    for (int j = 0; j < glue.n_units; ++j) {
 +        const auto & gu = glue.u[j];
 +        auto & u = args.u[j];
@@ -1682,6 +2610,16 @@ index abdffb8d4..e3b6f8f6a 100644
 +        u.w_norm = (const float *) gu.w_norm->data;
 +        u.y      = (float *) gu.y->data;
 +        u.eps_y  = gu.eps_y;
++        if (glue.mix) {
++            u.x            = nullptr; // the mix output is not written: the kernels mix into their scratch
++            u.mix_p        = (const float *) glue.mix_p->data;
++            u.mix_x        = (const float *) glue.mix_x->data;
++            u.mix_q        = (const float *) ((const char *) glue.mix_q->data + gu.q_idx*glue.mix_q->nb[1]);
++            u.mix_p_s1     = (int64_t) (glue.mix_p->nb[1]/sizeof(float));
++            u.mix_n_states = (int) glue.mix_concat->ne[1];
++            u.mix_eps      = ggml_get_op_params_f32(glue.mix_norm, 0);
++            u.mix_scale    = ggml_get_op_params_f32(glue.mix_softmax, 0);
++        }
 +        if (glue.ctrl) {
 +            u.m         = (const float *) gu.m->data;
 +            u.w_down    = (const float *) gu.w_down->data;
@@ -1703,7 +2641,7 @@ index abdffb8d4..e3b6f8f6a 100644
 +                break;
 +            }
 +        }
-+        if (st.n_entries < INKLING2_GLUE_SLOTS) {
++        if (publish && st.n_entries < INKLING2_GLUE_SLOTS) {
 +            auto & e = st.entries[st.n_entries++];
 +            e.t    = gu.y;
 +            e.data = gu.y->data;
@@ -1720,6 +2658,29 @@ index abdffb8d4..e3b6f8f6a 100644
 +        args.rank       = rank;
 +        args.mmvf_block = mmvf_block;
 +
++#ifdef INKLING2_GLUE_COOP
++        if (mode == 2) {
++            // one cooperative kernel; the grid covers the larger phase but stays resident, else the two kernels
++            const int n_rblocks = (n + INKLING2_GLUE_BLOCK/WARP_SIZE - 1)/(INKLING2_GLUE_BLOCK/WARP_SIZE);
++            const int n_dblocks = (rank + n_groups - 1)/n_groups;
++            const int wanted    = std::max(n_rblocks, n_dblocks)*glue.n_units;
++            const int grid      = std::min(wanted, inkling2_glue_coop_max_grid());
++            if (grid >= 1) {
++                inkling2_glue_coop_launch(args, grid, ctx.stream());
++                if (debug) {
++                    static bool logged = false;
++                    if (!logged) {
++                        logged = true;
++                        GGML_LOG_INFO("mk_glue: cooperative kernel, grid %d of %d wanted (%d resident blocks)\n", grid, wanted, inkling2_glue_coop_max_grid());
++                    }
++                }
++                return;
++            }
++        }
++#else
++        GGML_UNUSED(mode);
++#endif // INKLING2_GLUE_COOP
++
 +        const ggml_cuda_kernel_launch_params pa(dim3((rank + n_groups - 1)/n_groups, glue.n_units, 1), dim3(INKLING2_GLUE_BLOCK, 1, 1), 0, ctx.stream());
 +        ggml_cuda_kernel_launch(inkling2_glue_ctrl_down_f32, pa, args);
 +        const ggml_cuda_kernel_launch_params pb(dim3((n + INKLING2_GLUE_BLOCK/WARP_SIZE - 1)/(INKLING2_GLUE_BLOCK/WARP_SIZE), glue.n_units, 1), dim3(INKLING2_GLUE_BLOCK, 1, 1), 0, ctx.stream());
@@ -1731,8 +2692,8 @@ index abdffb8d4..e3b6f8f6a 100644
 +    if (debug) {
 +        static std::set<const ggml_tensor *> logged;
 +        if (logged.insert(glue.u[0].y).second) {
-+            GGML_LOG_INFO("mk_glue: %d unit(s)%s, n %d, %d nodes from %s\n", glue.n_units, glue.ctrl ? " with controllers" : "",
-+                    n, glue.n_nodes, glue.u[0].x->name);
++            GGML_LOG_INFO("mk_glue: %d unit(s)%s%s, n %d, %d nodes from %s\n", glue.n_units, glue.ctrl ? " with controllers" : "",
++                    glue.mix ? " with the mix" : "", n, glue.n_nodes, glue.u[0].x->name);
 +        }
 +    }
 +}
@@ -1741,10 +2702,10 @@ index abdffb8d4..e3b6f8f6a 100644
  // RELBIAS: the attention mask with the relative-position bias of each head, written straight in the type of the mask,
  // from the bias table tab = W r of each token and head (the MUL_MAT before the chain):
 diff --git a/ggml/src/ggml-cuda/inkling2.cuh b/ggml/src/ggml-cuda/inkling2.cuh
-index a3fb4bfb8..266ef7a44 100644
+index a3fb4bfb8..a575a2d57 100644
 --- a/ggml/src/ggml-cuda/inkling2.cuh
 +++ b/ggml/src/ggml-cuda/inkling2.cuh
-@@ -35,3 +35,32 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
+@@ -35,3 +35,46 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
  
  // run the fused kernel of a match
  void ggml_cuda_inkling2_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_args & args);
@@ -1767,11 +2728,25 @@ index a3fb4bfb8..266ef7a44 100644
 +        const ggml_tensor * w_norm = nullptr; // the norm weight
 +        ggml_tensor       * y      = nullptr; // the output: the MUL node
 +        float               eps_y  = 0.0f;
++        int                 q_idx  = 0;       // mix: the query (row of the mix output) this unit reads
 +    } u[3];
++    // the depth mix before the units, computed in the kernel (even state counts: the exact replication)
++    bool                mix         = false;
++    const ggml_tensor * mix_dst     = nullptr; // the mix output (skipped: the units read it through views)
++    const ggml_tensor * mix_p       = nullptr; // the earlier normalized states [n, n_states - 1]
++    const ggml_tensor * mix_x       = nullptr; // the current state [n]
++    const ggml_tensor * mix_q       = nullptr; // the queries [n, n_q]
++    const ggml_tensor * mix_norm    = nullptr; // the RMS_NORM (eps), SOFT_MAX (scale) and CONCAT (n_states) nodes
++    const ggml_tensor * mix_softmax = nullptr;
++    const ggml_tensor * mix_concat  = nullptr;
 +};
 +
 +bool ggml_cuda_inkling2_glue_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_glue & glue);
-+void ggml_cuda_inkling2_glue_run(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_glue & glue, bool debug);
++// mode: 1 two kernels, 2 one cooperative kernel; publish: register the q8_1 outputs for the consumers (false: the shadow
++// run of LLAMA_INKLING_MK_CHECK)
++void ggml_cuda_inkling2_glue_run(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_glue & glue, int mode, bool debug, bool publish = true);
++int          ggml_cuda_mk_glue_next_slot(ggml_backend_cuda_context & ctx); // the slot the next glue unit writes
++block_q8_1 * ggml_cuda_mk_glue_slot(ggml_backend_cuda_context & ctx, int i); // slot i (wrapped)
 +
 +// the q8_1 of a glue output for a quantized product reading src1 (one row), from the same graph evaluation; nullptr if none
 +const block_q8_1 * ggml_cuda_mk_glue_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * src1);
@@ -2866,10 +3841,10 @@ index 6b8fb1b3a..a41a9460e 100644
  }
 diff --git a/tests/test-inkling-megakernel.cpp b/tests/test-inkling-megakernel.cpp
 new file mode 100644
-index 000000000..97fd326a8
+index 000000000..7b12beeb4
 --- /dev/null
 +++ b/tests/test-inkling-megakernel.cpp
-@@ -0,0 +1,849 @@
+@@ -0,0 +1,914 @@
 +// The Inkling 2 decode megakernel stages against the reference CUDA path, on random weights in the quant types of
 +// UD-Q3_K_XL, at the real shapes of one layer application. Each stage is toggled through its environment switch
 +// between two evaluations of the same graph; the outputs must be bit-identical; the time per evaluation is printed
@@ -2965,10 +3940,11 @@ index 000000000..97fd326a8
 +// reference (switch off) against the stage (switch on); bit-identity required
 +static bool compare_stage(const char * stage, const char * sw, const char * name, ggml_backend_t backend,
 +        const std::vector<const char *> & output_names,
-+        const std::function<void(ggml_context *, ggml_cgraph *, std::vector<ggml_tensor *> &, std::vector<std::pair<ggml_tensor *, const void *>> &)> & build) {
++        const std::function<void(ggml_context *, ggml_cgraph *, std::vector<ggml_tensor *> &, std::vector<std::pair<ggml_tensor *, const void *>> &)> & build,
++        const char * fused_value = "1") {
 +    set_env(sw, "0");
 +    const graph_run ref = run_graph(backend, 50, build);
-+    set_env(sw, "1");
++    set_env(sw, fused_value);
 +    const graph_run mk  = run_graph(backend, 50, build);
 +    set_env(sw, "0");
 +
@@ -3279,13 +4255,18 @@ index 000000000..97fd326a8
 +// normalized inputs (the attention projections, or the expert gate_up MUL_MAT_ID of the FFN) whose results also check
 +// the q8_1 bytes the glue kernel emits for them: a differing byte changes the dot products.
 +struct glue_spec {
-+    int  n_units; // 1 or 3 inputs
-+    bool ctrl;    // loop controllers before the norms
++    int  n_units;        // 1 or 3 inputs
++    bool ctrl;           // loop controllers before the norms
++    int  mix_states = 0; // > 0: the depth mix over this many states (the earlier ones + the current) feeds the units
++    int  n_q        = 0; // queries of the mix (0: one per unit); 1 with three units = a SWA loop layer (one shared row)
 +};
 +
 +// the input tensors, weights and the chain; the normalized outputs in y[]
 +struct glue_chain {
-+    ggml_tensor * mixed    = nullptr; // [n_embd, n_units] input: the attention-input mix (one row per unit)
++    ggml_tensor * mixed    = nullptr; // [n_embd, n_units] input: the attention-input mix (one row per unit); with mix_states
++                                      // the mix is built in the graph from `earlier` [n_embd, states - 1], `cur` and `query`
++    ggml_tensor * earlier  = nullptr;
++    ggml_tensor * cur      = nullptr;
 +    ggml_tensor * messages = nullptr; // [n_embd, 4] input: the pass messages (ctrl)
 +    std::vector<ggml_tensor *> y;     // the normalized inputs
 +    std::vector<std::pair<ggml_tensor *, const std::vector<float> *>> weights;
@@ -3293,8 +4274,22 @@ index 000000000..97fd326a8
 +
 +struct glue_weights {
 +    std::vector<std::vector<float>> w_down, w_gain, w_forget, w_norm;
-+    std::vector<float> mixed, messages;
++    std::vector<float> mixed, messages, earlier, cur, query;
 +    glue_weights(const glue_spec & spec, int64_t n_embd, int64_t rank) {
++        if (spec.mix_states > 0) {
++            earlier.resize(n_embd*(spec.mix_states - 1));
++            cur.resize(n_embd);
++            query.resize(n_embd*(spec.n_q > 0 ? spec.n_q : spec.n_units));
++            for (float & v : earlier) {
++                v = 2.0f*frand(); // the normalized earlier states: unit scale
++            }
++            for (float & v : cur) {
++                v = 2.0f*frand();
++            }
++            for (float & v : query) {
++                v = 0.5f*frand();
++            }
++        }
 +        for (int j = 0; j < spec.n_units; ++j) {
 +            w_norm.emplace_back(n_embd);
 +            for (float & v : w_norm.back()) {
@@ -3330,11 +4325,31 @@ index 000000000..97fd326a8
 +static glue_chain build_glue_chain(ggml_context * ctx, ggml_cgraph * gf, const glue_spec & spec, int64_t n_embd, int64_t rank,
 +        const glue_weights & w) {
 +    glue_chain c;
-+    c.mixed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, spec.n_units);
-+    ggml_set_input(c.mixed);
 +    std::vector<ggml_tensor *> inputs(spec.n_units);
-+    for (int j = 0; j < spec.n_units; ++j) {
-+        inputs[j] = ggml_view_2d(ctx, c.mixed, n_embd, 1, c.mixed->nb[1], j*c.mixed->nb[1]);
++    if (spec.mix_states > 0) {
++        // inkling2.cpp mix(): [earlier states, rms_norm(cur)] attended by the queries
++        const int n_q = spec.n_q > 0 ? spec.n_q : spec.n_units;
++        c.earlier = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, spec.mix_states - 1, 1);
++        c.cur     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
++        ggml_set_input(c.earlier);
++        ggml_set_input(c.cur);
++        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_q);
++        c.weights.emplace_back(query, &w.query);
++        ggml_tensor * states = ggml_rms_norm(ctx, ggml_reshape_3d(ctx, c.cur, n_embd, 1, 1), 1e-6f);
++        states = ggml_concat(ctx, c.earlier, states, 1);
++        ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_q, 1));
++        ggml_tensor * scores  = ggml_mul_mat(ctx, states, queries);
++        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf((float) n_embd), 0.0f);
++        c.mixed = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
++        for (int j = 0; j < spec.n_units; ++j) {
++            inputs[j] = ggml_view_2d(ctx, c.mixed, n_embd, 1, c.mixed->nb[1], (n_q == 1 ? 0 : j)*c.mixed->nb[1]);
++        }
++    } else {
++        c.mixed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, spec.n_units);
++        ggml_set_input(c.mixed);
++        for (int j = 0; j < spec.n_units; ++j) {
++            inputs[j] = ggml_view_2d(ctx, c.mixed, n_embd, 1, c.mixed->nb[1], j*c.mixed->nb[1]);
++        }
 +    }
 +    if (spec.ctrl) {
 +        c.messages = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 4);
@@ -3374,8 +4389,20 @@ index 000000000..97fd326a8
 +    return c;
 +}
 +
++static void glue_chain_inputs(const glue_chain & c, const glue_weights & w, std::vector<std::pair<ggml_tensor *, const void *>> & data) {
++    if (c.earlier) {
++        data.emplace_back(c.earlier, w.earlier.data());
++        data.emplace_back(c.cur, w.cur.data());
++    } else {
++        data.emplace_back(c.mixed, w.mixed.data());
++    }
++    if (c.messages) {
++        data.emplace_back(c.messages, w.messages.data());
++    }
++}
++
 +// the glue chain, then the attention projections (one input: Q, R, K, V and gate read y[0]; three: K reads y[1], V y[2])
-+static bool test_glue_attn(ggml_backend_t backend, const char * name, const glue_spec & spec, ggml_type type_q, ggml_type type_kv, const char * proj) {
++static bool test_glue_attn(ggml_backend_t backend, const char * name, const glue_spec & spec, ggml_type type_q, ggml_type type_kv, const char * proj, const char * mode = "1") {
 +    const int64_t n_embd = 2304, rank = 64, n_q = 3072, n_kv = 1024, n_r = 384;
 +    const glue_weights w(spec, n_embd, rank);
 +    const std::vector<uint8_t> wq = random_weights(type_q, n_embd, n_q), wr = random_weights(type_q, n_embd, n_r),
@@ -3387,14 +4414,11 @@ index 000000000..97fd326a8
 +    for (const char * p : { "q", "r", "k", "v", "gate" }) {
 +        names.push_back(p);
 +    }
-+    std::string label = std::string(name) + " proj=" + proj;
++    std::string label = std::string(name) + " proj=" + proj + (mode[0] == '2' ? " glue=2" : "");
 +    set_env("LLAMA_INKLING_MK_PROJ", proj);
 +    const bool ok = compare_stage("glue", "LLAMA_INKLING_MK_GLUE", label.c_str(), backend, names, [&](ggml_context * ctx, ggml_cgraph * gf, std::vector<ggml_tensor *> & outputs, std::vector<std::pair<ggml_tensor *, const void *>> & data) {
 +        const glue_chain c = build_glue_chain(ctx, gf, spec, n_embd, rank, w);
-+        data.emplace_back(c.mixed, w.mixed.data());
-+        if (c.messages) {
-+            data.emplace_back(c.messages, w.messages.data());
-+        }
++        glue_chain_inputs(c, w, data);
 +        for (const auto & [t, v] : c.weights) {
 +            data.emplace_back(t, v->data());
 +        }
@@ -3422,16 +4446,16 @@ index 000000000..97fd326a8
 +            ggml_build_forward_expand(gf, p);
 +            outputs.push_back(p);
 +        }
-+    });
++    }, mode);
 +    set_env("LLAMA_INKLING_MK_PROJ", "0");
 +    return ok;
 +}
 +
 +// the FFN chain: one unit, then the router (F32 product: reads y, not its q8_1) and the expert gate_up MUL_MAT_ID
 +// (reads the q8_1); MK_MOE follows MK_PROJ so that both consumer paths are covered
-+static bool test_glue_ffn(ggml_backend_t backend, const char * name, bool ctrl, ggml_type type_exp, const char * mk) {
++static bool test_glue_ffn(ggml_backend_t backend, const char * name, bool ctrl, ggml_type type_exp, const char * mk, const char * mode = "1", int mix_states = 0) {
 +    const int64_t n_embd = 2304, rank = 64, n_expert = 16, n_used = 8, n_router = 128;
-+    const glue_spec spec = { 1, ctrl };
++    const glue_spec spec = { 1, ctrl, mix_states, 1 };
 +    const glue_weights w(spec, n_embd, rank);
 +    std::vector<uint8_t> we;
 +    for (int e = 0; e < n_expert; ++e) {
@@ -3446,15 +4470,12 @@ index 000000000..97fd326a8
 +    for (int i = 0; i < n_used; ++i) {
 +        ids[i] = (5*i + 3) % n_expert;
 +    }
-+    std::string label = std::string(name) + " proj=moe=" + mk;
++    std::string label = std::string(name) + " proj=moe=" + mk + (mode[0] == '2' ? " glue=2" : "");
 +    set_env("LLAMA_INKLING_MK_PROJ", mk);
 +    set_env("LLAMA_INKLING_MK_MOE", mk);
 +    const bool ok = compare_stage("glue", "LLAMA_INKLING_MK_GLUE", label.c_str(), backend, { "y0", "router", "experts" }, [&](ggml_context * ctx, ggml_cgraph * gf, std::vector<ggml_tensor *> & outputs, std::vector<std::pair<ggml_tensor *, const void *>> & data) {
 +        const glue_chain c = build_glue_chain(ctx, gf, spec, n_embd, rank, w);
-+        data.emplace_back(c.mixed, w.mixed.data());
-+        if (c.messages) {
-+            data.emplace_back(c.messages, w.messages.data());
-+        }
++        glue_chain_inputs(c, w, data);
 +        for (const auto & [t, v] : c.weights) {
 +            data.emplace_back(t, v->data());
 +        }
@@ -3472,7 +4493,7 @@ index 000000000..97fd326a8
 +            ggml_build_forward_expand(gf, t);
 +            outputs.push_back(t);
 +        }
-+    });
++    }, mode);
 +    set_env("LLAMA_INKLING_MK_PROJ", "0");
 +    set_env("LLAMA_INKLING_MK_MOE", "0");
 +    return ok;
@@ -3480,7 +4501,7 @@ index 000000000..97fd326a8
 +
 +// the server pattern for the glue (as test_steps for the projections): one graph object, several decode steps with new
 +// inputs each step and cache writes, the CUDA graph captured on the second step and replayed afterwards
-+static bool test_glue_steps(ggml_backend_t backend, const char * name, const glue_spec & spec, int n_steps, const char * proj) {
++static bool test_glue_steps(ggml_backend_t backend, const char * name, const glue_spec & spec, int n_steps, const char * proj, const char * mode = "1") {
 +    const int64_t n_embd = 2304, rank = 64, n_q = 3072, n_kv = 1024;
 +    const glue_weights w(spec, n_embd, rank);
 +    const std::vector<uint8_t> wq = random_weights(GGML_TYPE_Q8_0, n_embd, n_q), wk = random_weights(GGML_TYPE_Q8_0, n_embd, n_kv),
@@ -3499,7 +4520,7 @@ index 000000000..97fd326a8
 +
 +    const auto run = [&](bool fused) {
 +        set_env("LLAMA_INKLING_MK_PROJ", proj);
-+        set_env("LLAMA_INKLING_MK_GLUE", fused ? "1" : "0");
++        set_env("LLAMA_INKLING_MK_GLUE", fused ? mode : "0");
 +        ggml_context * ctx = ggml_init({ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(256, false), nullptr, true});
 +        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
 +        const glue_chain c = build_glue_chain(ctx, gf, spec, n_embd, rank, w);
@@ -3540,7 +4561,12 @@ index 000000000..97fd326a8
 +        std::vector<std::vector<float>> out;
 +        double us = 0.0;
 +        for (int step = 0; step < n_steps; ++step) {
-+            ggml_backend_tensor_set(c.mixed, mixed[step].data(), 0, ggml_nbytes(c.mixed));
++            if (c.earlier) {
++                ggml_backend_tensor_set(c.earlier, w.earlier.data(), 0, ggml_nbytes(c.earlier));
++                ggml_backend_tensor_set(c.cur, mixed[step].data(), 0, ggml_nbytes(c.cur));
++            } else {
++                ggml_backend_tensor_set(c.mixed, mixed[step].data(), 0, ggml_nbytes(c.mixed));
++            }
 +            if (c.messages) {
 +                ggml_backend_tensor_set(c.messages, messages[step].data(), 0, ggml_nbytes(c.messages));
 +            }
@@ -3601,8 +4627,8 @@ index 000000000..97fd326a8
 +    }
 +    const bool perf_ok = us_mk <= 1.05*us_ref;
 +    g_perf_fail += !perf_ok;
-+    printf("glue  %-32s %s  ref %8.1f us  fused %8.1f us  (%d steps, proj=%s, CUDA graph replayed from step 2)%s\n", name,
-+            ok ? "PASS" : "FAIL", us_ref, us_mk, n_steps, proj, perf_ok ? "" : "  PERF FAIL (slower than the reference)");
++    printf("glue  %-32s %s  ref %8.1f us  fused %8.1f us  (%d steps, proj=%s, glue=%s, CUDA graph replayed from step 2)%s\n", name,
++            ok ? "PASS" : "FAIL", us_ref, us_mk, n_steps, proj, mode, perf_ok ? "" : "  PERF FAIL (slower than the reference)");
 +    if (!ok) {
 +        printf("      max abs %.3g, %s\n", max_abs, first.c_str());
 +    }
@@ -3702,6 +4728,20 @@ index 000000000..97fd326a8
 +            check(test_glue_ffn(backend,  "ffn pass-1: norm",                false, GGML_TYPE_Q8_0, proj));
 +            check(test_glue_steps(backend, "loop pass, 3 ctrl, 6 steps",    { 3, true },  6, proj));
 +            check(test_glue_steps(backend, "full layer, 3 norms, 6 steps",  { 3, false }, 6, proj));
++            // the depth mix folded in (even state counts: exact); odd counts keep the separate MIX kernel (not bit-exact
++            // for the unfused cuBLAS path), so the glue takes its output as before
++            check(test_glue_attn(backend, "mix 4 states + 3 ctrl + norms",   { 3, true,  4 },    GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, proj));
++            check(test_glue_attn(backend, "mix 8 states + 3 norms",          { 3, false, 8 },    GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, proj));
++            check(test_glue_attn(backend, "mix 2 states, 1 query, 1 norm",   { 1, false, 2, 1 }, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, proj));
++            check(test_glue_attn(backend, "mix 1 query, 3 ctrl (SWA loop)",  { 3, true,  6, 1 }, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, proj));
++            check(test_glue_attn(backend, "mix 3 states (odd: MIX apart)",   { 3, false, 3 },    GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, proj));
++            check(test_glue_ffn(backend,  "ffn mix 4 states + ctrl + norm",  true,  GGML_TYPE_Q8_0, proj, "1", 4));
++            check(test_glue_steps(backend, "mix 4 + 3 ctrl, 6 steps",       { 3, true,  4 },    6, proj));
++            // LLAMA_INKLING_MK_GLUE=2: the controller instances as one cooperative kernel (grid barrier between phases)
++            check(test_glue_attn(backend, "loop pass: 3 ctrl + norms, q8_0", { 3, true },  GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, proj, "2"));
++            check(test_glue_ffn(backend,  "ffn loop pass: ctrl + norm",      true,  GGML_TYPE_Q8_0, proj, "2"));
++            check(test_glue_steps(backend, "loop pass, 3 ctrl, 6 steps",    { 3, true },  6, proj, "2"));
++            check(test_glue_attn(backend, "mix 4 states + 3 ctrl + norms",   { 3, true, 4 }, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, proj, "2"));
 +        }
 +
 +        // experts: gate_up [2304 -> 2304] (the token is every slot's input), down [1152 -> 2304] (one input per slot)

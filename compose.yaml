@@ -9,7 +9,15 @@ name: inkling
 
 services:
   inkling:
-    image: ${IMAGE:-ghcr.io/prototux/llamacpp-inkling2mini:latest}
+    # megakernel test build: prebuilt on ghcr.io by CI from this branch (docker compose pull),
+    # or built locally from docker/Dockerfile + patches/ (docker compose build)
+    image: ${IMAGE:-ghcr.io/prototux/llamacpp-inkling2mini:megakernel}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        CUDA_ARCH: "86"
+        BUILD_JOBS: ${BUILD_JOBS:-6}
     pull_policy: missing
     env_file:
       - path: .env

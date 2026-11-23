@@ -1,0 +1,1601 @@
+diff --git a/docs/inkling-moonshot.md b/docs/inkling-moonshot.md
+index 23b8fdd52..55655c60c 100644
+--- a/docs/inkling-moonshot.md
++++ b/docs/inkling-moonshot.md
+@@ -95,3 +95,95 @@ All commands through the compose service; `E` stands for the environment of the
+    `n_ctx`. For q4_0 run `llama-perplexity -c 8192` against the q8_0 cache and decide on the loss.
+ 6. Configuration experiments without code: `-ub 2048 -b 2048` for prefill (4x more rows per expert GEMM), and
+    `--backend-sampling` for decode (no 800 KB logits copy per token).
++
++## Branch `megakernel`: multi-stream decode (stage 1)
++
++Decode after the fusions is ~2500 kernels per token in one serial CUDA-graph chain (~13 ms); the weights alone
++would take ~3.3 ms. A real megakernel (one kernel per layer application) needs attention, 6 projections, convs,
++router, 8 NVFP4/IQ expert GEMVs and the loop gates in one blind-written kernel: not attempted. Stage 1 attacks the
++same floor generically: run the independent chains of the graph on several CUDA streams inside the CUDA graph, so
++the launch latency and the tails of small kernels overlap, with every fusion kept.
++
++`GGML_CUDA_GRAPH_OPT=2` (ggml-cuda.cu, `ggml_cuda_stream_plan_build`, off by default):
++
++- dependencies between compute nodes by root tensor (views resolved), incl. write-after-read/write-after-write on
++  in-place writes (KV cache `cpy`, conv states);
++- a node continues its predecessor's chain when that predecessor is still the tail of its stream; a MUL_MAT /
++  MUL_MAT_ID sibling (R, K, V, sinks, gate next to Q; conv_proj) takes a free side stream (`GGML_CUDA_GRAPH_OPT_STREAMS`,
++  default 3, max 7); everything else joins a predecessor's stream. Chains stay on one stream so the realugbun and
++  ggml fusions still match; fused groups wait on the cross-stream predecessors of their whole same-stream run and
++  record the events of all their nodes, so a fusion can never break an ordering;
++- one event per compute node; a window opens at the first side-stream node (fork event) and closes at the first
++  main-stream node after which every side chain is consumed (for Inkling: the flash attention of each layer),
++  where the main stream waits on all side streams; every tensor of a window is pinned until its end
++  (`add_alloc_dep`) because ggml-alloc plans for the sequential order;
++- only graphs with <= 512 rows per node (decode, DSpark verification) and only with CUDA graphs enabled;
++  `GGML_CUDA_GRAPH_OPT_DEBUG=1` logs nodes/streams/windows/waits per graph.
++
++Expected (estimate, not measured): the attention projections+convs section of each layer application has ~15
++kernels in 4-6 chains with a critical path of ~5, plus the table/bias chain; ~20-25% of the kernels overlap:
++roughly -1.5 to -2.5 ms per token (75 -> 85-95 tok/s). Lossless: the same kernels, the same order per stream.
++
++Tests: `test-sched-streams` (new: a decode-like 6-block graph with sibling projections, in-place cache writes and
++joins, through `ggml_backend_sched` against the CPU, twice to cover the CUDA-graph replay), and
++`test-llama-archs -a 'inkling2.*'` on the GPU (CUDA logits vs CPU), both with `GGML_CUDA_GRAPH_OPT=2`
++(`GGML_CUDA_GRAPH_OPT_STREAMS=1..7`). Then greedy identity and `bench.py` decode with `=2` vs unset.
++
++Not done / next: RMS_NORM siblings as fork points (the three loop controllers; needs the fused CTRL_DOWN group to
++tolerate a stream change, i.e. waits over the whole lookahead run rather than the same-stream run); overlapping
++the expert GEMVs of a layer with the next layer's work is impossible (true data dependency); a per-layer
++megakernel remains the only way below ~2500 launches.
++
++## Branch `megakernel`, iteration 2: the fused projection kernel (stage "proj")
++
++### q4_0 full-attention cache (LLAMA_INKLING_KV_TYPE_FULL=q4_0) produced garbage on the 3090
++Audit of the in-place q4_0 loader (`fattn_q4_0_ptr`, `fattn_load_chunk` in fattn-common.cuh) against ggml's
++`dequantize_q4_0`: value i < 16 is the low nibble of `qs[i]`, value i + 16 the high nibble of `qs[i]`, both minus 8,
++times `d`; a chunk of 8 values never straddles the nibble halves (chunk starts are multiples of 8), block and row
++strides are whole 18-byte blocks (`fattn_kv_traits<4>`). No defect found by reading; the vec decode path is
++upstream's q4_0 code. The previous test could not have caught a loader bug: its K rows had one non-zero value at
++position 0 and constant V rows, both exactly representable and both insensitive to the nibble half read. New
++cases `test_inkling_dims` in test-flash-attn-indexed-bias: 24 heads x 128, 8 KV heads, 2048 cells, random K/V,
++expected values from ggml's own dequantization of the quantized cache (`ggml_get_type_traits()->to_float`),
++f16/q8_0/q4_0, 1/4/128/512 queries (vec, vec-verify, MMA), masked, maskless causal and maskless window 1024.
++On the 3090 this run localizes the fault: q4_0 at 128/512 queries = the in-place loader (MMA/tile), at 1 query =
++the vec kernel; `LLAMA_INKLING_FA_Q8_0=0` switches the prefill shapes to the F16-copy path for comparison. Please
++also report the exact environment of the garbage run (`LLAMA_INKLING_FA_VEC_GQA`, `LLAMA_INKLING_NO_MASK`).
++
++### Stage "proj": `LLAMA_INKLING_MK_PROJ=1` (default off)
++Decode runs ~2500 kernels per token; every quantized MUL_MAT of one token is two of them (q8_1 quantization of the
++input, then mmvq), and a layer application has 5 of those in the attention projections (Q, R, K, V, gate) plus wo.
++- `src/models/inkling2.cpp`: the projections are built and expanded consecutively, quantized ones first, then the
++  BF16 sinks/conv taps, then the convolutions (the graph was interleaving K's convolution between the K and V
++  projections). Same ops, same results; the order changes which fusions can match.
++- `ggml/src/ggml-cuda/mmvq.cu`: `mul_mat_vec_q_multi<type, small_k>`: grid.y selects the matrix, grid.x its row
++  block; the body is mul_mat_vec_q's ncols_dst == 1 body (same thread-to-block mapping, accumulation order,
++  shared-memory and warp reductions), so every output is bit-identical to the unfused kernel. Host side
++  `ggml_cuda_mul_mat_vec_q_multi`: each distinct input quantized once with `quantize_row_q8_1_cuda` (identical
++  bytes), one launch per (type, small_k) group. Types: Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL
++  (every attention type of UD-Q3_K_XL; BF16 stays on mmvf).
++- `ggml/src/ggml-cuda/ggml-cuda.cu`: `ggml_cuda_mk_proj_match` in try_fuse: a run of >= 2 consecutive one-token
++  MUL_MAT nodes with contiguous quantized weights that the unfused path would also send to mmvq, no run member
++  reading another's output, no compute-buffer weights. Views between them are allowed.
++- Launches saved per token (estimate): pass-1/non-loop layers 5 mmvq + 5 quantize -> 1 + 1 (-8), loop layers
++  -> 1 + 3 (-6); tail layers with mixed types a little less: ~300 launches per token, roughly -1.2 to -1.6 ms
++  (75 -> ~83-85 tok/s). Lossless (bit-identical).
++- `LLAMA_INKLING_MK_DEBUG=1`: the kernel checks its arguments per block and prints block/matrix on a violation.
++
++Self-test `test-inkling-megakernel` (CMake target of the same name): seven projection sets at the real shapes
++(core Q8_0 with one and with three inputs, the layer-18/20/22 type mixes, two and eight products), reference
++(`MK_PROJ=0`) vs fused (`MK_PROJ=1`) on the same backend, CUDA graphs disabled so both really run, bit-identity
++required, wall time per evaluation printed for both (50 repetitions). On FAIL it prints max abs/rel error and the
++first mismatching product, element and values.
++
++### Next stages (designed, not implemented)
++- "wo + gate": the attention output projection fused with the sigmoid gate multiply (the gate is already a
++  separate mmvq in the run): a `mul_mat_vec_q` fusion argument, like the existing gate/bias fusion.
++- "router": sigmoid + bias + top-8 + norm + scale is one fused kernel already; the remaining launches are the two
++  mul_mat_id (gate_up, down) with their q8_1 quantization (2) and the SITU and the weighted reduction (fused): a
++  mul_mat_id variant that quantizes its own input saves 2 launches per layer application.
++- "glue": rs state gather + the three norms + the controllers' two kernels per controller (8): one kernel per
++  layer application that produces the three normalized inputs and the q8_1 bytes for the projection kernel,
++  which then needs no quantize launch at all.
++- The whole layer application as one cooperative kernel (grid sync between phases, 82 SMs) once the pieces above
++  are each verified on the 3090.
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 5ad8d9b3c..37c4ab357 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -289,10 +289,12 @@ static __global__ void flash_attn_ext_vec(
+         K += blockIdx.y*nthreads * nb11;
+         V += blockIdx.y*nthreads * nb21;
+     }
+-    maskh += blockIdx.y*nthreads;
++    // without a mask (maskless Inkling attention) maskh stays nullptr: an offset would make it a non-null bad pointer
++    maskh = maskh ? maskh + blockIdx.y*nthreads : nullptr;
+     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+              // Increment pointers after each loop:
+-             K += use_rows ? 0 : gridDim.y*nthreads*nb11, V += use_rows ? 0 : gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
++             K += use_rows ? 0 : gridDim.y*nthreads*nb11, V += use_rows ? 0 : gridDim.y*nthreads*nb21,
++             maskh = maskh ? maskh + gridDim.y*nthreads : nullptr) {
+ 
+         // Calculate KQ tile and keep track of new maximum KQ values:
+         float KQ_reg[ncols]; // KQ in registers.
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1ad59ebb1..14eb3fa07 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4467,6 +4467,59 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++// LLAMA_INKLING_MK_PROJ=1: a run of consecutive one-token MUL_MAT nodes over quantized weights (the Inkling 2
++// attention projections) runs as one kernel per weight type, each distinct input quantized once. Read on every call
++// so that a test can toggle it between two evaluations of the same graph.
++static int ggml_cuda_mk_proj_mode() {
++    const char * env = getenv("LLAMA_INKLING_MK_PROJ");
++    return env ? atoi(env) : 0;
++}
++
++static bool ggml_cuda_mk_debug() {
++    static const bool enabled = getenv("LLAMA_INKLING_MK_DEBUG") != nullptr;
++    return enabled;
++}
++
++// the run of fusable MUL_MAT nodes starting at i: returns the index past the last node of the run (views and other
++// no-ops in between are part of the run), fills the tensors; 0 if the node does not qualify
++static int ggml_cuda_mk_proj_match(ggml_cgraph * cgraph, int i, int & n, const ggml_tensor ** src0, const ggml_tensor ** src1, ggml_tensor ** dst) {
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    n = 0;
++    int end = i;
++    for (int j = i; j < cgraph->n_nodes && n < MMVQ_MULTI_MAX; ++j) {
++        ggml_tensor * t = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(t)) {
++            continue;
++        }
++        if (t->op != GGML_OP_MUL_MAT || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
++                t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) {
++            break;
++        }
++        const ggml_tensor * w = t->src[0];
++        const ggml_tensor * x = t->src[1];
++        if (!ggml_is_quantized(w->type) || !ggml_cuda_mul_mat_vec_q_multi_supported(w->type) || !ggml_cuda_should_use_mmvq(w->type, cc, 1) ||
++                w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != ggml_type_size(w->type) || w->nb[1] != ggml_row_size(w->type, w->ne[0]) ||
++                w->buffer == nullptr || ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
++                x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1) {
++            break;
++        }
++        // independent products: an input computed by an earlier product of the run ends it
++        bool dependent = false;
++        for (int k = 0; k < n && !dependent; ++k) {
++            dependent = x == dst[k] || (x->view_src != nullptr && x->view_src == dst[k]);
++        }
++        if (dependent) {
++            break;
++        }
++        src0[n] = w;
++        src1[n] = x;
++        dst[n]  = t;
++        n++;
++        end = j + 1;
++    }
++    return n >= 2 ? end : 0;
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     if (ggml_cuda_fusion_disabled()) {
+@@ -4475,6 +4528,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mk_proj_mode() != 0) {
++        int n = 0;
++        const ggml_tensor * src0[MMVQ_MULTI_MAX];
++        const ggml_tensor * src1[MMVQ_MULTI_MAX];
++        ggml_tensor *       dst[MMVQ_MULTI_MAX];
++        const int end = ggml_cuda_mk_proj_match(cgraph, i, n, src0, src1, dst);
++        if (end > 0) {
++            ggml_cuda_mul_mat_vec_q_multi(*cuda_ctx, n, src0, src1, dst, ggml_cuda_mk_debug());
++            return end - 1 - i;
++        }
++    }
++
+     if (cuda_ctx->stream_context().concurrent_events.empty()) {
+         ggml_cuda_inkling2_args inkling2;
+         if (ggml_cuda_inkling2_match(cgraph, i, inkling2)) {
+@@ -5330,6 +5395,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
+     bool                         should_launch_concurrent_events = false;
+ 
++    // GGML_CUDA_GRAPH_OPT=2: the stream plan (ggml_cuda_stream_plan_build)
++    ggml_cuda_stream_plan & plan = stream_ctx.plan;
++    const bool plan_active = plan.active();
++    bool       plan_window = false; // side streams are in flight: no chunk cut, the window end joins them
++    const auto plan_node = [&](const ggml_tensor * t) -> const ggml_cuda_stream_plan_node * {
++        const auto it = plan.nodes.find(t);
++        return it != plan.nodes.end() ? &it->second : nullptr;
++    };
++    // before launching node i on its stream: wait on the cross-stream predecessors of the run of consecutive nodes
++    // on the same stream (at most 32), since a fusion launches several of them as one kernel
++    const auto plan_wait = [&](int i, const ggml_cuda_stream_plan_node & pn) {
++        cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, pn.stream);
++        int n_run = 0;
++        for (int r = i; r < cgraph->n_nodes && n_run < 32; ++r) {
++            const ggml_cuda_stream_plan_node * pr = plan_node(cgraph->nodes[r]);
++            if (pr == nullptr) {
++                continue; // a view or another no-op
++            }
++            if (pr->stream != pn.stream) {
++                break;
++            }
++            for (const ggml_tensor * dep : pr->waits) {
++                const ggml_cuda_stream_plan_node * pd = plan_node(dep);
++                GGML_ASSERT(pd != nullptr);
++                CUDA_CHECK(cudaStreamWaitEvent(stream, pd->event));
++            }
++            n_run++;
++        }
++    };
++    // after launching nodes first..last (one kernel when fused): record their events on the launch stream, and at
++    // the end of a window make the main stream wait on every side stream of the window
++    const auto plan_record = [&](int first, int last) {
++        for (int r = first; r <= last; ++r) {
++            const ggml_cuda_stream_plan_node * pr = plan_node(cgraph->nodes[r]);
++            if (pr == nullptr) {
++                continue;
++            }
++            CUDA_CHECK(cudaEventRecord(pr->event, cuda_ctx->stream()));
++            if (pr->window_end) {
++                cudaStream_t main_stream = cuda_ctx->stream(cuda_ctx->device, 0);
++                for (int st = 1; st <= plan.n_streams; ++st) {
++                    if (pr->window_streams & (1 << st)) {
++                        CUDA_CHECK(cudaEventRecord(plan.join_events[st - 1], cuda_ctx->stream(cuda_ctx->device, st)));
++                        CUDA_CHECK(cudaStreamWaitEvent(main_stream, plan.join_events[st - 1]));
++                    }
++                }
++                cuda_ctx->curr_stream_no = 0;
++                plan_window = false;
++            }
++        }
++    };
++
+ #ifdef USE_CUDA_GRAPH
+     ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
+     const int         chunk_size = ggml_cuda_graph_chunk_size();
+@@ -5429,7 +5546,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ #ifdef USE_CUDA_GRAPH
+                 // fused nodes are skipped together, so a cut never splits a fusion
+                 // a concurrent region must join before its capture can end
+-                if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
++                if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active && !plan_window) {
+                     ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
+                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                     chunk_end = i + chunk_size;
+@@ -5471,6 +5588,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                if (plan_active) {
++                    if (const ggml_cuda_stream_plan_node * pn = plan_node(node)) {
++                        if (pn->window_start) {
++                            // the side streams of the window start after everything launched so far on the main stream
++                            GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
++                            cudaStream_t main_stream = cuda_ctx->stream(cuda_ctx->device, 0);
++                            CUDA_CHECK(cudaEventRecord(plan.fork_event, main_stream));
++                            for (int st = 1; st <= plan.n_streams; ++st) {
++                                if (pn->window_streams & (1 << st)) {
++                                    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(cuda_ctx->device, st), plan.fork_event));
++                                }
++                            }
++                            plan_window = true;
++                        }
++                        cuda_ctx->curr_stream_no = pn->stream;
++                        plan_wait(i, *pn);
++                    }
++                }
++
+                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                     continue;
+                 }
+@@ -5484,6 +5620,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
+                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
+ #endif
++                    if (plan_active) {
++                        plan_record(i, i + nodes_to_skip);
++                    }
+                     i += nodes_to_skip;
+                     continue;
+                 }
+@@ -5510,6 +5649,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 }
+                 GGML_ASSERT(ok);
+ 
++                if (plan_active) {
++                    plan_record(i, i);
++                }
++
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+                }
+@@ -5655,6 +5798,253 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+     }
+ }
+ 
++
++// GGML_CUDA_GRAPH_OPT: 1 is the fork/join optimization of the Q/K/V projections below, 2 the stream plan of
++// ggml_cuda_stream_plan_build (every independent chain of a small-batch graph on its own stream)
++static int ggml_cuda_graph_opt_mode() {
++    static const int mode = [] {
++        const char * env = getenv("GGML_CUDA_GRAPH_OPT");
++        return env != nullptr ? atoi(env) : 0;
++    }();
++    return mode;
++}
++
++static bool ggml_cuda_stream_plan_debug() {
++    static const bool enabled = getenv("GGML_CUDA_GRAPH_OPT_DEBUG") != nullptr;
++    return enabled;
++}
++
++// Builds the stream plan of a graph (GGML_CUDA_GRAPH_OPT=2), for graphs whose nodes have at most 512 rows (decode and
++// small speculative batches, where the per-kernel launch latency dominates; a prefill ubatch has thousands):
++//
++// 1. dependencies between compute nodes by the root tensor of every src and output (views resolved), including the
++//    write-after-read and write-after-write hazards of nodes that write into existing memory (KV cache, states);
++// 2. streams: a node continues the chain of a predecessor that is still the tail of its stream; a MUL_MAT or
++//    MUL_MAT_ID whose predecessor has already been continued (a sibling, e.g. the K and V projections next to Q) takes
++//    a free side stream; everything else joins the stream of one of its predecessors. Chains thus stay on one stream
++//    and the fusions of graph_compute keep matching them;
++// 3. a node waits on the events of its predecessors on other streams (one event per compute node, recorded after
++//    its launch); a window opens at the first side-stream node (the main stream records a fork event the side streams
++//    wait on, so nothing of the window starts before the preceding main-stream work) and closes at the first
++//    main-stream node after which every side chain has been consumed: there the main stream waits on all side streams;
++// 4. every tensor read or written in a window is kept allocated until the window ends (add_alloc_dep): the allocator
++//    plans for the sequential order, and without this a node of one stream could reuse the memory a concurrent node
++//    of another stream still reads.
++static void ggml_cuda_stream_plan_build(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
++    ggml_cuda_stream_plan & plan = cuda_ctx->stream_context().plan;
++    plan.clear();
++
++    static const int n_side = [] {
++        const char * env = getenv("GGML_CUDA_GRAPH_OPT_STREAMS");
++        const int n = env != nullptr ? atoi(env) : 3;
++        return std::max(1, std::min(n, GGML_CUDA_MAX_STREAMS - 1));
++    }();
++
++    // the compute nodes, in graph order
++    std::vector<int> cn;
++    cn.reserve(cgraph->n_nodes);
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        const ggml_tensor * node = cgraph->nodes[i];
++        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            continue;
++        }
++        if (ggml_nrows(node) > 512) {
++            return; // a prefill graph: large kernels, nothing to hide, and the pinned tensors would be large
++        }
++        cn.push_back(i);
++    }
++    const int n = (int) cn.size();
++    if (n < 8) {
++        return;
++    }
++
++    const auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
++
++    // 1. dependencies
++    std::unordered_map<const ggml_tensor *, int>              last_writer;
++    std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
++    std::vector<std::vector<int>> preds(n);
++    std::vector<int>              n_consumers(n, 0);
++    for (int k = 0; k < n; ++k) {
++        const ggml_tensor * node = cgraph->nodes[cn[k]];
++        std::vector<int> & p = preds[k];
++        const auto add = [&](int j) {
++            if (j != k && std::find(p.begin(), p.end(), j) == p.end()) {
++                p.push_back(j);
++            }
++        };
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (node->src[s] == nullptr) {
++                continue;
++            }
++            const auto it = last_writer.find(root(node->src[s]));
++            if (it != last_writer.end()) {
++                add(it->second);
++            }
++        }
++        const ggml_tensor * out = root(node);
++        if (node->view_src != nullptr) {
++            // writes into memory that exists before this node: after its earlier writer and readers
++            const auto it = last_writer.find(out);
++            if (it != last_writer.end()) {
++                add(it->second);
++            }
++            const auto rt = readers.find(out);
++            if (rt != readers.end()) {
++                for (int j : rt->second) {
++                    add(j);
++                }
++            }
++        }
++        for (int j : p) {
++            n_consumers[j]++;
++        }
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (node->src[s] != nullptr) {
++                readers[root(node->src[s])].push_back(k);
++            }
++        }
++        last_writer[out] = k;
++        readers[out].clear();
++    }
++
++    // 2. streams, 3. waits and windows
++    std::vector<int>  stream(n, 0);
++    std::vector<int>  remaining(n_consumers);  // consumers not assigned yet
++    std::vector<int>  pending(n_side + 1, 0);  // per side stream: its nodes with remaining consumers
++    std::vector<int>  tail(n_side + 1, -1);    // last node of each stream
++    std::vector<std::pair<int, int>> windows;  // [first, last] compute index
++    int window_first = -1;
++    int window_mask  = 0;
++    int n_waits = 0;
++
++    for (int k = 0; k < n; ++k) {
++        const ggml_tensor * node = cgraph->nodes[cn[k]];
++        const std::vector<int> & p = preds[k];
++
++        int chosen = -1;
++        // continue the chain of a predecessor that is still the tail of its stream, the main stream first
++        for (int pass = 0; pass < 2 && chosen < 0; ++pass) {
++            for (int j : p) {
++                if (tail[stream[j]] == j && (pass == 1 || stream[j] == 0)) {
++                    chosen = stream[j];
++                    break;
++                }
++            }
++        }
++        // a sibling projection: a free side stream
++        if (chosen < 0 && !p.empty() && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
++            for (int s = 1; s <= n_side; ++s) {
++                if (pending[s] == 0) {
++                    chosen = s;
++                    break;
++                }
++            }
++        }
++        // otherwise behind one of the predecessors: the main stream if one is there, else the latest one
++        if (chosen < 0) {
++            chosen = 0;
++            if (!p.empty()) {
++                int latest = p[0];
++                bool on_main = false;
++                for (int j : p) {
++                    on_main |= stream[j] == 0;
++                    latest = std::max(latest, j);
++                }
++                chosen = on_main ? 0 : stream[latest];
++            }
++        }
++
++        stream[k]    = chosen;
++        tail[chosen] = k;
++        if (chosen != 0) {
++            if (window_first < 0) {
++                window_first = k;
++                window_mask  = 0;
++            }
++            window_mask |= 1 << chosen;
++            if (remaining[k] > 0) {
++                pending[chosen]++;
++            }
++        }
++        for (int j : p) {
++            if (--remaining[j] == 0 && stream[j] != 0) {
++                pending[stream[j]]--;
++            }
++        }
++
++        ggml_cuda_stream_plan_node & pn = plan.nodes[node];
++        pn.stream = chosen;
++        pn.event  = plan.next_event();
++        if (window_first == k) {
++            pn.window_start = true;
++        }
++        for (int j : p) {
++            // predecessors on the main stream before the window are ordered by the fork event
++            if (stream[j] != chosen && !(stream[j] == 0 && window_first >= 0 && j < window_first)) {
++                pn.waits.push_back(cgraph->nodes[cn[j]]);
++                n_waits++;
++            }
++        }
++
++        bool all_consumed = window_first >= 0 && chosen == 0;
++        for (int s = 1; s <= n_side && all_consumed; ++s) {
++            all_consumed = pending[s] == 0;
++        }
++        if (all_consumed || (window_first >= 0 && k == n - 1)) {
++            pn.window_end = true;
++            windows.emplace_back(window_first, k);
++            plan.nodes[cgraph->nodes[cn[window_first]]].window_streams = window_mask;
++            pn.window_streams = window_mask;
++            window_first = -1;
++        }
++    }
++
++    if (windows.empty()) {
++        plan.clear();
++        return;
++    }
++
++    // 4. the tensors of a window stay allocated until its end
++    for (const auto & [first, last] : windows) {
++        ggml_tensor * until = cgraph->nodes[cn[last]];
++        for (int k = first; k <= last; ++k) {
++            ggml_tensor * node = cgraph->nodes[cn[k]];
++            if (node != until) {
++                params->add_alloc_dep(params->user_data, node, until);
++            }
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                if (node->src[s] != nullptr) {
++                    params->add_alloc_dep(params->user_data, node->src[s], until);
++                }
++            }
++        }
++    }
++
++    plan.n_streams = n_side;
++    if (plan.fork_event == nullptr) {
++        CUDA_CHECK(cudaEventCreateWithFlags(&plan.fork_event, cudaEventDisableTiming));
++    }
++    while ((int) plan.join_events.size() < n_side) {
++        cudaEvent_t e;
++        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
++        plan.join_events.push_back(e);
++    }
++
++    if (ggml_cuda_stream_plan_debug()) {
++        std::vector<int> per_stream(n_side + 1, 0);
++        for (int k = 0; k < n; ++k) {
++            per_stream[stream[k]]++;
++        }
++        std::string counts;
++        for (int s = 0; s <= n_side; ++s) {
++            counts += " " + std::to_string(per_stream[s]);
++        }
++        GGML_LOG_INFO("%s: %d compute nodes, %zu windows, %d cross-stream waits, nodes per stream:%s\n",
++                __func__, n, windows.size(), n_waits, counts.c_str());
++    }
++}
++
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+@@ -5817,12 +6207,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     GGML_UNUSED(cgraph);
+ #endif
+ 
+-    static bool enable_graph_optimization = [] {
+-        const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
+-        return env != nullptr && atoi(env) == 1;
+-    }();
+-
+-    if (!enable_graph_optimization) {
++    const int opt_mode = ggml_cuda_graph_opt_mode();
++    if (opt_mode == 0) {
+         return;
+     }
+ 
+@@ -5833,6 +6219,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         return;
+     }
+ 
++    if (opt_mode == 2) {
++        // the stream plan: every independent chain on its own stream, fusions kept (see ggml_cuda_stream_plan_build)
++        ggml_cuda_stream_plan_build(cuda_ctx, cgraph, params);
++        return;
++    }
++
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
+     // number of out-degrees for a particular node
+diff --git a/ggml/src/ggml-cuda/graph.cuh b/ggml/src/ggml-cuda/graph.cuh
+index 7b9c27789..5275a0dbc 100644
+--- a/ggml/src/ggml-cuda/graph.cuh
++++ b/ggml/src/ggml-cuda/graph.cuh
+@@ -212,10 +212,65 @@ struct ggml_cuda_concurrent_event {
+     }
+ };
+ 
++// GGML_CUDA_GRAPH_OPT=2: a stream assignment for every compute node of the graph (ggml_cuda_stream_plan_build).
++// Independent chains run on side streams; a node waits on the events of its predecessors on other streams; a window
++// (from the first side-stream node to the node where every side chain has been consumed) ends with the main stream
++// waiting on all side streams, and keeps all its tensors allocated until then so that concurrent nodes never alias.
++struct ggml_cuda_stream_plan_node {
++    int  stream       = 0;     // 0: the main stream
++    bool window_start = false; // record the fork event on the main stream before this node, side streams wait on it
++    bool window_end   = false; // after this node the main stream waits on the side streams used by the window
++    int  window_streams = 0;   // side streams the window uses (window_start and window_end nodes)
++    cudaEvent_t event = nullptr; // recorded on the node's stream right after its launch
++    std::vector<const ggml_tensor *> waits; // predecessors on other streams
++};
++
++struct ggml_cuda_stream_plan {
++    std::unordered_map<const ggml_tensor *, ggml_cuda_stream_plan_node> nodes;
++    int n_streams = 0; // side streams
++    cudaEvent_t fork_event = nullptr;
++    std::vector<cudaEvent_t> join_events;
++
++    // events are reused across plans: a plan is rebuilt whenever the graph changes
++    std::vector<cudaEvent_t> event_pool;
++    size_t n_events_used = 0;
++
++    bool active() const { return !nodes.empty(); }
++
++    cudaEvent_t next_event() {
++        if (n_events_used == event_pool.size()) {
++            cudaEvent_t e;
++            CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
++            event_pool.push_back(e);
++        }
++        return event_pool[n_events_used++];
++    }
++
++    void clear() {
++        nodes.clear();
++        n_events_used = 0;
++        n_streams = 0;
++    }
++
++    ~ggml_cuda_stream_plan() {
++        for (cudaEvent_t e : event_pool) {
++            CUDA_CHECK(cudaEventDestroy(e));
++        }
++        if (fork_event) {
++            CUDA_CHECK(cudaEventDestroy(fork_event));
++        }
++        for (cudaEvent_t e : join_events) {
++            CUDA_CHECK(cudaEventDestroy(e));
++        }
++    }
++};
++
+ struct ggml_cuda_stream_context {
+     std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
++    ggml_cuda_stream_plan plan;
+ 
+     void reset() {
+         concurrent_events.clear();
++        plan.clear();
+     }
+ };
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6f10428e6..ec700a85a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,5 +1,8 @@
+ #include "mmvq.cuh"
+ #include "quantize.cuh"
++
++#include <algorithm>
++#include <vector>
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+ 
+@@ -1688,3 +1691,255 @@ void ggml_cuda_op_mul_mat_vec_q(
+ 
+     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+ }
++
++
++// ---------------------------------------------------------------------------------------------------------------------
++// LLAMA_INKLING_MK_PROJ: several one-token matrix-vector products in one launch (see mmvq.cuh)
++
++struct mmvq_multi_args {
++    int n;
++    bool debug;
++    const void       * vx[MMVQ_MULTI_MAX];
++    const block_q8_1 * vy[MMVQ_MULTI_MAX];
++    float            * dst[MMVQ_MULTI_MAX];
++    int nrows[MMVQ_MULTI_MAX];
++    int ncols_x[MMVQ_MULTI_MAX];
++    int stride_row_x[MMVQ_MULTI_MAX]; // in blocks
++};
++
++// blockIdx.y: the matrix; blockIdx.x: its row block. The body is the ncols_dst == 1, no-fusion body of mul_mat_vec_q,
++// with the same thread-to-block mapping, accumulation order and reductions.
++template <ggml_type type, bool small_k>
++__launch_bounds__(calc_nwarps(type, 1, get_device_table_id(), small_k, false)*ggml_cuda_get_physical_warp_size(), 1)
++static __global__ void mul_mat_vec_q_multi(const mmvq_multi_args args) {
++    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
++    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
++    constexpr int vdr = get_vdr_mmvq(type);
++    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
++    constexpr int nwarps = calc_nwarps(type, 1, table_id, small_k, false);
++    constexpr int rows_per_cuda_block = calc_rows_per_block(type, 1, table_id, small_k, nwarps);
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
++
++    const int m = blockIdx.y;
++    if (args.debug && (m >= args.n || args.vx[m] == nullptr || args.vy[m] == nullptr || args.dst[m] == nullptr ||
++            args.ncols_x[m] % qk != 0 || args.nrows[m] <= 0)) {
++        if (threadIdx.x == 0 && threadIdx.y == 0) {
++            printf("mul_mat_vec_q_multi: bad matrix %d of %d at block (%u, %u): nrows %d ncols %d\n",
++                   m, args.n, blockIdx.x, blockIdx.y, args.nrows[m], args.ncols_x[m]);
++        }
++        return;
++    }
++    const int nrows = args.nrows[m];
++    const int row0  = rows_per_cuda_block*blockIdx.x;
++    if (row0 >= nrows) {
++        return; // a shorter matrix than the grid, uniform for the block
++    }
++    const void       * GGML_CUDA_RESTRICT vx = args.vx[m];
++    const block_q8_1 * GGML_CUDA_RESTRICT y  = args.vy[m];
++    float            * GGML_CUDA_RESTRICT dst = args.dst[m];
++    const int blocks_per_row_x = args.ncols_x[m] / qk;
++    const int stride_row_x     = args.stride_row_x[m];
++
++    const     int tid = warp_size*threadIdx.y + threadIdx.x;
++    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
++
++    float tmp[rows_per_cuda_block] = {0.0f};
++    const int kbx_offset = row0*stride_row_x;
++    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++        const int kby = kbx * (qk/QK8_1);
++        const int kqs = vdr * (tid % (qi/vdr));
++#pragma unroll
++        for (int i = 0; i < rows_per_cuda_block; ++i) {
++            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++        }
++    }
++
++    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][rows_per_cuda_block][warp_size];
++    if (threadIdx.y > 0) {
++#pragma unroll
++        for (int i = 0; i < rows_per_cuda_block; ++i) {
++            tmp_shared[threadIdx.y-1][i][threadIdx.x] = tmp[i];
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) {
++        return;
++    }
++    dst += row0;
++#pragma unroll
++    for (int i = 0; i < rows_per_cuda_block; ++i) {
++#pragma unroll
++        for (int l = 0; l < nwarps-1; ++l) {
++            tmp[i] += tmp_shared[l][i][threadIdx.x];
++        }
++        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
++        if (threadIdx.x == i && (rows_per_cuda_block == 1 || row0 + i < nrows)) {
++            dst[i] = tmp[i];
++        }
++    }
++}
++
++template <ggml_type type>
++static void mul_mat_vec_q_multi_launch(const mmvq_multi_args & args, bool small_k, int max_nrows, cudaStream_t stream) {
++    const int device = ggml_cuda_get_device();
++    const int warp_size = ggml_cuda_info().devices[device].warp_size;
++    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
++    const int nwarps = calc_nwarps(type, 1, table_id, small_k, false);
++    const int rpb    = calc_rows_per_block(type, 1, table_id, small_k, nwarps);
++    const dim3 block_nums((max_nrows + rpb - 1)/rpb, args.n, 1);
++    const dim3 block_dims(warp_size, nwarps, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
++    if (small_k) {
++        ggml_cuda_kernel_launch(mul_mat_vec_q_multi<type, true>, launch_params, args);
++    } else {
++        ggml_cuda_kernel_launch(mul_mat_vec_q_multi<type, false>, launch_params, args);
++    }
++}
++
++// the same decision as mul_mat_vec_q_switch_ncols_dst for ncols_dst == 1 (halve_iters is GB10-only, never here)
++template <ggml_type type>
++static bool mul_mat_vec_q_multi_small_k(int ncols_x, int cc) {
++    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
++    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
++    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
++    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
++    constexpr int vdr = get_vdr_mmvq(type);
++    const int blocks_per_row_x      = ncols_x / qk;
++    const int blocks_per_iter_1warp = vdr * warp_size / qi;
++    const int nwarps = calc_nwarps(type, 1, table_id);
++    bool use = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
++    const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
++    const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
++    if (is_nvidia_turing_plus) {
++        if (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S) {
++            use = false;
++        }
++    } else if (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
++            type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS ||
++            (is_nvidia_pascal_older && (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K)) ||
++            GGML_CUDA_CC_IS_RDNA(cc)) {
++        use = false;
++    }
++    return use;
++}
++
++bool ggml_cuda_mul_mat_vec_q_multi_supported(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q5_0:
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q3_K:
++        case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
++        case GGML_TYPE_Q6_K:
++        case GGML_TYPE_IQ4_XS:
++        case GGML_TYPE_IQ4_NL:
++            return true;
++        default:
++            return false;
++    }
++}
++
++void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, int n,
++        const ggml_tensor * const * src0, const ggml_tensor * const * src1, ggml_tensor * const * dst, bool debug) {
++    GGML_ASSERT(n >= 1 && n <= MMVQ_MULTI_MAX);
++    cudaStream_t stream = ctx.stream();
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++
++    // each distinct input quantized once, as ggml_cuda_mul_mat_vec_q does it, into slices of ONE pool buffer:
++    // the CUDA pool frees in LIFO order, several live allocations destroyed in vector order would break it
++    int    first[MMVQ_MULTI_MAX];  // the first product with the same input
++    size_t offs [MMVQ_MULTI_MAX] = {};
++    size_t total = 0;
++    for (int i = 0; i < n; ++i) {
++        const ggml_tensor * x = src1[i];
++        GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1);
++        GGML_ASSERT(x->nb[0] == sizeof(float));
++        first[i] = i;
++        for (int j = 0; j < i; ++j) {
++            if (src1[j] == x) {
++                first[i] = first[j];
++                break;
++            }
++        }
++        if (first[i] == i) {
++            const int64_t ne10_padded = GGML_PAD(x->ne[0], MATRIX_ROW_PADDING);
++            offs[i] = total;
++            total  += GGML_PAD(ne10_padded*sizeof(block_q8_1)/QK8_1, 256);
++        }
++    }
++    ggml_cuda_pool_alloc<char> q8(ctx.pool(), total);
++    const block_q8_1 * vy[MMVQ_MULTI_MAX] = {};
++    for (int i = 0; i < n; ++i) {
++        if (first[i] != i) {
++            vy[i] = vy[first[i]];
++            continue;
++        }
++        const ggml_tensor * x = src1[i];
++        const int64_t ne10        = x->ne[0];
++        const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++        char * q8_i = q8.get() + offs[i];
++        quantize_row_q8_1_cuda((const float *) x->data, q8_i, ne10, x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
++                x->nb[3]/sizeof(float), ne10_padded, 1, 1, 1, stream);
++        vy[i] = (const block_q8_1 *) q8_i;
++    }
++
++    // one launch per (type, small_k) group
++    bool done[MMVQ_MULTI_MAX] = {};
++    for (int i = 0; i < n; ++i) {
++        if (done[i]) {
++            continue;
++        }
++        const ggml_type type = src0[i]->type;
++        GGML_ASSERT(ggml_cuda_mul_mat_vec_q_multi_supported(type));
++        const auto small_k_of = [&](int ncols) {
++            switch (type) {
++                case GGML_TYPE_Q4_0:   return mul_mat_vec_q_multi_small_k<GGML_TYPE_Q4_0>(ncols, cc);
++                case GGML_TYPE_Q5_0:   return mul_mat_vec_q_multi_small_k<GGML_TYPE_Q5_0>(ncols, cc);
++                case GGML_TYPE_Q8_0:   return mul_mat_vec_q_multi_small_k<GGML_TYPE_Q8_0>(ncols, cc);
++                case GGML_TYPE_Q3_K:   return mul_mat_vec_q_multi_small_k<GGML_TYPE_Q3_K>(ncols, cc);
++                case GGML_TYPE_Q4_K:   return mul_mat_vec_q_multi_small_k<GGML_TYPE_Q4_K>(ncols, cc);
++                case GGML_TYPE_Q5_K:   return mul_mat_vec_q_multi_small_k<GGML_TYPE_Q5_K>(ncols, cc);
++                case GGML_TYPE_Q6_K:   return mul_mat_vec_q_multi_small_k<GGML_TYPE_Q6_K>(ncols, cc);
++                case GGML_TYPE_IQ4_XS: return mul_mat_vec_q_multi_small_k<GGML_TYPE_IQ4_XS>(ncols, cc);
++                case GGML_TYPE_IQ4_NL: return mul_mat_vec_q_multi_small_k<GGML_TYPE_IQ4_NL>(ncols, cc);
++                default: GGML_ABORT("fatal error");
++            }
++        };
++        const bool small_k = small_k_of(src0[i]->ne[0]);
++        mmvq_multi_args args = {};
++        args.debug = debug;
++        int max_nrows = 0;
++        for (int j = i; j < n; ++j) {
++            if (done[j] || src0[j]->type != type || small_k_of(src0[j]->ne[0]) != small_k) {
++                continue;
++            }
++            const ggml_tensor * w = src0[j];
++            GGML_ASSERT(w->ne[2] == 1 && w->ne[3] == 1 && w->nb[0] == ggml_type_size(type) && w->ne[0] % ggml_blck_size(type) == 0);
++            GGML_ASSERT(w->ne[0] == src1[j]->ne[0] && dst[j]->type == GGML_TYPE_F32 && dst[j]->nb[0] == sizeof(float));
++            GGML_ASSERT(dst[j]->ne[0] == w->ne[1] && dst[j]->ne[1] == 1 && dst[j]->ne[2] == 1 && dst[j]->ne[3] == 1);
++            const int k = args.n++;
++            args.vx[k]           = w->data;
++            args.vy[k]           = vy[j];
++            args.dst[k]          = (float *) dst[j]->data;
++            args.nrows[k]        = (int) w->ne[1];
++            args.ncols_x[k]      = (int) w->ne[0];
++            args.stride_row_x[k] = (int) (w->nb[1] / ggml_type_size(type));
++            max_nrows = std::max(max_nrows, args.nrows[k]);
++            done[j] = true;
++        }
++        switch (type) {
++            case GGML_TYPE_Q4_0:   mul_mat_vec_q_multi_launch<GGML_TYPE_Q4_0>  (args, small_k, max_nrows, stream); break;
++            case GGML_TYPE_Q5_0:   mul_mat_vec_q_multi_launch<GGML_TYPE_Q5_0>  (args, small_k, max_nrows, stream); break;
++            case GGML_TYPE_Q8_0:   mul_mat_vec_q_multi_launch<GGML_TYPE_Q8_0>  (args, small_k, max_nrows, stream); break;
++            case GGML_TYPE_Q3_K:   mul_mat_vec_q_multi_launch<GGML_TYPE_Q3_K>  (args, small_k, max_nrows, stream); break;
++            case GGML_TYPE_Q4_K:   mul_mat_vec_q_multi_launch<GGML_TYPE_Q4_K>  (args, small_k, max_nrows, stream); break;
++            case GGML_TYPE_Q5_K:   mul_mat_vec_q_multi_launch<GGML_TYPE_Q5_K>  (args, small_k, max_nrows, stream); break;
++            case GGML_TYPE_Q6_K:   mul_mat_vec_q_multi_launch<GGML_TYPE_Q6_K>  (args, small_k, max_nrows, stream); break;
++            case GGML_TYPE_IQ4_XS: mul_mat_vec_q_multi_launch<GGML_TYPE_IQ4_XS>(args, small_k, max_nrows, stream); break;
++            case GGML_TYPE_IQ4_NL: mul_mat_vec_q_multi_launch<GGML_TYPE_IQ4_NL>(args, small_k, max_nrows, stream); break;
++            default: GGML_ABORT("fatal error");
++        }
++    }
++}
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 5605bf7a4..f74776c14 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -11,6 +11,16 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
++// Several matrix-vector products (one token each, F32 inputs and outputs, quantized weights with a q8_1 dot product)
++// in one kernel per (type, launch configuration), each distinct input quantized once (Inkling 2 attention projections,
++// LLAMA_INKLING_MK_PROJ). Every row is computed by the code of mul_mat_vec_q, so the results are bit-identical.
++#define MMVQ_MULTI_MAX 8
++
++bool ggml_cuda_mul_mat_vec_q_multi_supported(ggml_type type);
++
++void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, int n,
++    const ggml_tensor * const * src0, const ggml_tensor * const * src1, ggml_tensor * const * dst, bool debug);
++
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index dd774ce58..310f184e5 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -145,6 +145,23 @@ static void llama_graph_log_stats(ggml_cgraph * gf, uint32_t n_tokens) {
+     }
+     LLAMA_LOG_INFO("%s: n_tokens = %u: %d nodes, %d of them views (no kernel), by op:%s\n",
+             __func__, n_tokens, n_nodes, n_views, line.c_str());
++
++    // LLAMA_GRAPH_DUMP=1: every node once per batch size, to design fusions from the real node order
++    static const bool dump = [] {
++        const char * env = getenv("LLAMA_GRAPH_DUMP");
++        return env && atoi(env) != 0;
++    }();
++    if (dump) {
++        for (int i = 0; i < n_nodes; ++i) {
++            const ggml_tensor * node = ggml_graph_node(gf, i);
++            std::string srcs;
++            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
++                srcs += std::string(s ? "," : "") + node->src[s]->name + (node->src[s]->view_src ? "(v)" : "");
++            }
++            LLAMA_LOG_INFO("graph[%5d] %-14s %-36s [%" PRId64 ",%" PRId64 ",%" PRId64 "] %s <- %s\n", i, ggml_op_desc(node), node->name,
++                    node->ne[0], node->ne[1], node->ne[2], node->view_src ? "view" : ggml_type_name(node->type), srcs.c_str());
++        }
++    }
+ }
+ 
+ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index d503e8310..200fb06c5 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -399,8 +399,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+     // self-attention
+     {
++        // the projections first and next to each other in the graph: the quantized ones (Q, R, K, V, gate) form one
++        // run of MUL_MAT nodes that the CUDA backend can serve with a single kernel (LLAMA_INKLING_MK_PROJ), then the
++        // small BF16 ones (sinks, conv taps)
+         ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
+         ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
++        ggml_build_forward_expand(gf, Qcur);
++        ggml_build_forward_expand(gf, Rcur);
+ 
+         // a slot that shares the KV cache of another slot (inkling2_loop, LLAMA_INKLING_SHARE_LOOP_KV) computes
+         // no K and V: build_attn() reads the source slot's cache, which the source stored earlier in this graph
+@@ -411,7 +416,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+             Vcur = build_lora_mm(layer.wv, inputs[2]);
+             cb(Kcur, "Kpre", il);
+             cb(Vcur, "Vpre", il);
++            ggml_build_forward_expand(gf, Kcur);
++            ggml_build_forward_expand(gf, Vcur);
++        }
++        ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, inputs[0]);
++        ggml_build_forward_expand(gf, gate);
++
++        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
++        ggml_build_forward_expand(gf, sinks);
+ 
++        if (Kcur) {
+             Kcur = convolve(Kcur, layer.attn_k_conv,
+                     is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
+             Vcur = convolve(Vcur, layer.attn_v_conv,
+@@ -435,8 +449,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         cb(Qcur, "Qcur", il);
+         cb(Rcur, "Rcur", il);
+ 
+-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+-
+         // the far bin (distance >= extent) is the zero row of the padded table
+         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+ 
+@@ -464,7 +476,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+                 nullptr, nullptr, nullptr,
+                 Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
+ 
+-        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
++        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
+         cb(cur, "attn_out", il);
+     }
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f9dff8bf8..97e9c955a 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -368,6 +368,8 @@ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
+ 
+ llama_build_and_test(test-backend-tensor.cpp LINK ggml)
+ llama_build_and_test(test-flash-attn-indexed-bias.cpp LINK ggml)
++llama_build_and_test(test-sched-streams.cpp LINK ggml)
++llama_build_and_test(test-inkling-megakernel.cpp LINK ggml)
+ llama_build_and_test(test-sleep.cpp LINK ggml)
+ llama_build_and_test(test-backend-sched.cpp LINK ggml)
+ 
+diff --git a/tests/test-flash-attn-indexed-bias.cpp b/tests/test-flash-attn-indexed-bias.cpp
+index 6b8fb1b3a..a41a9460e 100644
+--- a/tests/test-flash-attn-indexed-bias.cpp
++++ b/tests/test-flash-attn-indexed-bias.cpp
+@@ -165,6 +165,160 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows,
+     ggml_free(ctx);
+ }
+ 
++// The real Inkling 2 Mini shapes with random K/V: 24 heads x 128, 8 KV heads, one stream, a 1025-bin table, the
++// cells at positions 0..cells-1, the queries at the last n_query positions. The expected values come from ggml's own
++// dequantization of the quantized K/V (ggml_get_type_traits()->to_float), so that a wrong in-place loader (the bytes a
++// kernel reads from a q8_0 or q4_0 cache) shows up; the test above has exactly representable K/V and cannot catch it.
++// window >= 0: maskless (LLAMA_INKLING_NO_MASK), the mask visibility is otherwise causal from the same positions.
++static void test_inkling_dims(ggml_backend_t backend, ggml_type kv_type, int n_query, int cells, int window) {
++    constexpr int width = 128, heads = 24, kv_heads = 8, bins = 1025;
++    const bool maskless = window >= 0;
++    const int swa = window > 0 ? window : 0;
++
++    ggml_context * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
++    auto * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, n_query, heads, 1);
++    auto * k     = ggml_new_tensor_4d(ctx, kv_type, width, cells, kv_heads, 1);
++    auto * v     = ggml_dup_tensor(ctx, k);
++    auto * mask  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cells, n_query, 1, 1);
++    auto * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, bins, heads, n_query);
++    auto * k_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cells, 1);
++    auto * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_query);
++    auto * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
++    auto * out = ggml_flash_attn_ext(ctx, q, k, v, maskless ? nullptr : mask, 1.0f/sqrtf(width), 0, 0);
++    ggml_flash_attn_ext_add_sinks(out, sinks);
++    if (maskless) {
++        ggml_flash_attn_ext_set_causal_window(out, window);
++    }
++    ggml_flash_attn_ext_add_position_bias(out, table, k_pos, q_pos);
++    ggml_prec_set_acc(out, GGML_PREC_F32);
++    if (!ggml_backend_supports_op(backend, out)) {
++        printf("%s: kv=%s, queries=%d, cells=%d, window=%d: op not supported, skipped\n", ggml_backend_name(backend), ggml_type_name(kv_type), n_query, cells, window);
++        ggml_free(ctx);
++        return;
++    }
++    auto * graph = ggml_new_graph(ctx);
++    ggml_build_forward_expand(graph, out);
++    auto * buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    GGML_ASSERT(buf);
++
++    uint32_t state = 0x1234567u + 7919u*n_query + 31u*cells + (uint32_t) kv_type;
++    const auto frand = [&state]() { state = state*1664525u + 1013904223u; return float(state >> 8)/float(1u << 24) - 0.5f; };
++
++    // K/V: random, quantized with ggml, then dequantized with ggml for the expectation
++    const int64_t n_kv_values = (int64_t) width*cells*kv_heads;
++    std::vector<float> kf(n_kv_values), vf(n_kv_values);
++    for (int64_t i = 0; i < n_kv_values; ++i) {
++        kf[i] = 4.0f*frand();
++        vf[i] = 2.0f*frand();
++    }
++    std::vector<uint8_t> kq(ggml_nbytes(k)), vq(ggml_nbytes(v));
++    ggml_quantize_chunk(kv_type, kf.data(), kq.data(), 0, ggml_nrows(k), width, nullptr);
++    ggml_quantize_chunk(kv_type, vf.data(), vq.data(), 0, ggml_nrows(v), width, nullptr);
++    ggml_backend_tensor_set(k, kq.data(), 0, kq.size());
++    ggml_backend_tensor_set(v, vq.data(), 0, vq.size());
++    std::vector<float> kd(n_kv_values), vd(n_kv_values);
++    if (kv_type == GGML_TYPE_F32) {
++        kd = kf; vd = vf;
++    } else {
++        ggml_get_type_traits(kv_type)->to_float(kq.data(), kd.data(), n_kv_values);
++        ggml_get_type_traits(kv_type)->to_float(vq.data(), vd.data(), n_kv_values);
++    }
++
++    std::vector<float> qf((size_t) width*n_query*heads);
++    for (float & x : qf) {
++        x = 2.0f*frand();
++    }
++    ggml_backend_tensor_set(q, qf.data(), 0, ggml_nbytes(q));
++    std::vector<float> tab((size_t) bins*heads*n_query);
++    for (float & x : tab) {
++        x = 2.0f*frand();
++    }
++    ggml_backend_tensor_set(table, tab.data(), 0, ggml_nbytes(table));
++    std::vector<float> sink(heads);
++    for (float & x : sink) {
++        x = 4.0f*frand();
++    }
++    ggml_backend_tensor_set(sinks, sink.data(), 0, ggml_nbytes(sinks));
++    std::vector<int32_t> kpos(cells), qpos(n_query);
++    for (int c = 0; c < cells; ++c) {
++        kpos[c] = c;
++    }
++    for (int j = 0; j < n_query; ++j) {
++        qpos[j] = cells - n_query + j;
++    }
++    ggml_backend_tensor_set(k_pos, kpos.data(), 0, ggml_nbytes(k_pos));
++    ggml_backend_tensor_set(q_pos, qpos.data(), 0, ggml_nbytes(q_pos));
++    std::vector<ggml_fp16_t> vis((size_t) cells*n_query);
++    for (int j = 0; j < n_query; ++j) {
++        for (int c = 0; c < cells; ++c) {
++            const int d = qpos[j] - kpos[c];
++            vis[(size_t) j*cells + c] = ggml_fp32_to_fp16(d >= 0 && (swa == 0 || d < swa) ? 0.0f : -INFINITY);
++        }
++    }
++    if (!maskless) {
++        ggml_backend_tensor_set(mask, vis.data(), 0, ggml_nbytes(mask));
++    }
++
++    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
++    std::vector<float> output(ggml_nelements(out));
++    ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
++
++    // reference: the F16-rounded mask + bias like the kernels, double accumulation
++    double err2 = 0.0, ref2 = 0.0, max_err = 0.0;
++    std::vector<double> acc(width);
++    for (int j = 0; j < n_query; ++j) {
++        for (int h = 0; h < heads; ++h) {
++            const int kvh = h/(heads/kv_heads);
++            double m = sink[h], sum = 0.0;
++            std::fill(acc.begin(), acc.end(), 0.0);
++            std::vector<double> logit(cells);
++            for (int c = 0; c < cells; ++c) {
++                const int d = qpos[j] - kpos[c];
++                if (!(d >= 0 && (swa == 0 || d < swa))) {
++                    logit[c] = -INFINITY;
++                    continue;
++                }
++                const int bin = d < bins - 1 ? d : bins - 1;
++                double s = 0.0;
++                for (int i = 0; i < width; ++i) {
++                    s += double(qf[((size_t) h*n_query + j)*width + i])*double(kd[((size_t) kvh*cells + c)*width + i]);
++                }
++                s = s/sqrt(double(width)) + double(ggml_fp16_to_fp32(ggml_fp32_to_fp16(tab[((size_t) j*heads + h)*bins + bin])));
++                logit[c] = s;
++                m = std::max(m, s);
++            }
++            sum = exp(sink[h] - m);
++            for (int c = 0; c < cells; ++c) {
++                if (logit[c] == -INFINITY) {
++                    continue;
++                }
++                const double w = exp(logit[c] - m);
++                sum += w;
++                for (int i = 0; i < width; ++i) {
++                    acc[i] += w*double(vd[((size_t) kvh*cells + c)*width + i]);
++                }
++            }
++            for (int i = 0; i < width; ++i) {
++                const double ref = acc[i]/sum;
++                const double got = output[((size_t) j*heads + h)*width + i];
++                GGML_ASSERT(std::isfinite(got));
++                err2 += (got - ref)*(got - ref);
++                ref2 += ref*ref;
++                max_err = std::max(max_err, fabs(got - ref));
++            }
++        }
++    }
++    // the CPU reaches ~1e-5 on a quantized cache (its own q8_0 Q), the tensor-core kernels a little more; a wrong
++    // loader gives ~1
++    const double nmse = err2/std::max(ref2, 1e-30);
++    const bool ok = nmse < 5e-4;
++    printf("%s: inkling dims, kv=%s, queries=%d, cells=%d, window=%d: nmse=%.3g max abs error=%.3g %s\n",
++            ggml_backend_name(backend), ggml_type_name(kv_type), n_query, cells, window, nmse, max_err, ok ? "OK" : "FAIL");
++    GGML_ASSERT(ok);
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
+ int main() {
+     ggml_backend_load_all();
+     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+@@ -195,6 +349,15 @@ int main() {
+                 test_indexed_bias(backend, width, false, n_query, 1024, GGML_TYPE_Q4_0, true);
+             }
+         }
++        // the real shapes with random K/V, expected from ggml's dequantization: decode (vec), DSpark verify, prefill
++        // (tile/MMA with the in-place q8_0/q4_0 loaders), masked and maskless, full-attention and SWA windows
++        for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++            for (int n_query : {1, 4, 128, 512}) {
++                test_inkling_dims(backend, kv_type, n_query, 2048, -1);
++                test_inkling_dims(backend, kv_type, n_query, 2048, 0);
++                test_inkling_dims(backend, kv_type, n_query, 2048, 1024);
++            }
++        }
+         ggml_backend_free(backend);
+     }
+ }
+diff --git a/tests/test-inkling-megakernel.cpp b/tests/test-inkling-megakernel.cpp
+new file mode 100644
+index 000000000..077f1467d
+--- /dev/null
++++ b/tests/test-inkling-megakernel.cpp
+@@ -0,0 +1,188 @@
++// The Inkling 2 decode megakernel stages against the reference CUDA path, on random weights in the quant types of
++// UD-Q3_K_XL, at the real shapes of one layer application. Each stage is toggled through its environment switch
++// between two evaluations of the same graph (CUDA graphs are disabled here so that both evaluations really run),
++// the outputs must be bit-identical, and the wall time per evaluation is printed for both.
++//
++//   /app/test-inkling-megakernel                      all stages, PASS/FAIL per case
++//   LLAMA_INKLING_MK_DEBUG=1 /app/test-inkling-megakernel   device-side bounds checks with printf
++//   CUDA_LAUNCH_BLOCKING=1 ... when a stage crashes, so that the failing kernel is the one reported
++//
++// Stage "proj" (LLAMA_INKLING_MK_PROJ): the run of attention projections (Q, R, K, V, gate) of one token as one
++// kernel per weight type, each distinct input quantized once.
++
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cinttypes>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static uint32_t g_state = 12345u;
++static float frand() {
++    g_state = g_state*1664525u + 1013904223u;
++    return float(g_state >> 8)/float(1u << 24) - 0.5f;
++}
++
++struct proj_spec {
++    const char * name;
++    ggml_type    type;
++    int64_t      rows;
++    int          input; // which of the inputs feeds it
++};
++
++struct proj_case {
++    const char * name;
++    int n_inputs;
++    std::vector<proj_spec> mats;
++};
++
++static void set_env(const char * name, const char * value) {
++    setenv(name, value, 1);
++}
++
++// returns the outputs of one evaluation of the projection graph, and the time per evaluation
++static std::vector<std::vector<float>> run_proj(ggml_backend_t backend, const proj_case & pc, int64_t n_embd,
++        const std::vector<std::vector<uint8_t>> & weights, const std::vector<std::vector<float>> & inputs, int n_rep, double & us) {
++    const size_t n_t = 8 + 2*pc.mats.size() + pc.n_inputs;
++    ggml_context * ctx = ggml_init({ggml_tensor_overhead()*n_t + ggml_graph_overhead(), nullptr, true});
++    std::vector<ggml_tensor *> w(pc.mats.size()), x(pc.n_inputs), y(pc.mats.size());
++    for (size_t i = 0; i < pc.mats.size(); ++i) {
++        w[i] = ggml_new_tensor_2d(ctx, pc.mats[i].type, n_embd, pc.mats[i].rows);
++        ggml_set_name(w[i], pc.mats[i].name);
++    }
++    for (int i = 0; i < pc.n_inputs; ++i) {
++        x[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
++        ggml_set_input(x[i]);
++    }
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    for (size_t i = 0; i < pc.mats.size(); ++i) {
++        y[i] = ggml_mul_mat(ctx, w[i], x[pc.mats[i].input]);
++        ggml_set_output(y[i]);
++        ggml_build_forward_expand(gf, y[i]);
++    }
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    GGML_ASSERT(buf);
++    for (size_t i = 0; i < pc.mats.size(); ++i) {
++        ggml_backend_tensor_set(w[i], weights[i].data(), 0, weights[i].size());
++    }
++    for (int i = 0; i < pc.n_inputs; ++i) {
++        ggml_backend_tensor_set(x[i], inputs[i].data(), 0, inputs[i].size()*sizeof(float));
++    }
++    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
++    ggml_backend_synchronize(backend);
++    const auto t0 = std::chrono::steady_clock::now();
++    for (int r = 0; r < n_rep; ++r) {
++        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
++    }
++    ggml_backend_synchronize(backend);
++    us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()/n_rep;
++    std::vector<std::vector<float>> out(pc.mats.size());
++    for (size_t i = 0; i < pc.mats.size(); ++i) {
++        out[i].resize(ggml_nelements(y[i]));
++        ggml_backend_tensor_get(y[i], out[i].data(), 0, ggml_nbytes(y[i]));
++    }
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++    return out;
++}
++
++static bool test_proj(ggml_backend_t backend, const proj_case & pc) {
++    const int64_t n_embd = 2304;
++    std::vector<std::vector<uint8_t>> weights(pc.mats.size());
++    std::vector<float> wf(n_embd);
++    for (size_t i = 0; i < pc.mats.size(); ++i) {
++        const int64_t rows = pc.mats[i].rows;
++        std::vector<float> full(n_embd*rows);
++        for (float & v : full) {
++            v = frand();
++        }
++        weights[i].resize(ggml_row_size(pc.mats[i].type, n_embd)*rows);
++        ggml_quantize_chunk(pc.mats[i].type, full.data(), weights[i].data(), 0, rows, n_embd, nullptr);
++    }
++    std::vector<std::vector<float>> inputs(pc.n_inputs, std::vector<float>(n_embd));
++    for (auto & in : inputs) {
++        for (float & v : in) {
++            v = 2.0f*frand();
++        }
++    }
++
++    double us_ref = 0.0, us_mk = 0.0;
++    set_env("LLAMA_INKLING_MK_PROJ", "0");
++    const auto ref = run_proj(backend, pc, n_embd, weights, inputs, 50, us_ref);
++    set_env("LLAMA_INKLING_MK_PROJ", "1");
++    const auto mk  = run_proj(backend, pc, n_embd, weights, inputs, 50, us_mk);
++    set_env("LLAMA_INKLING_MK_PROJ", "0");
++
++    bool ok = true;
++    double max_abs = 0.0, max_rel = 0.0;
++    std::string first;
++    for (size_t i = 0; i < pc.mats.size(); ++i) {
++        for (size_t e = 0; e < ref[i].size(); ++e) {
++            const float a = ref[i][e], b = mk[i][e];
++            if (!std::isfinite(b) || a != b) {
++                const double d = fabs(double(a) - double(b));
++                max_abs = std::max(max_abs, d);
++                max_rel = std::max(max_rel, d/std::max(1e-6, fabs(double(a))));
++                if (first.empty()) {
++                    char tmp[256];
++                    snprintf(tmp, sizeof(tmp), "first mismatch: %s[%zu] (%s, %" PRId64 " rows) ref=%.9g fused=%.9g", pc.mats[i].name, e,
++                            ggml_type_name(pc.mats[i].type), pc.mats[i].rows, a, b);
++                    first = tmp;
++                }
++                ok = false;
++            }
++        }
++    }
++    printf("proj %-24s %s  ref %8.1f us  fused %8.1f us  (%d products, %d inputs)%s%s\n", pc.name, ok ? "PASS" : "FAIL",
++            us_ref, us_mk, (int) pc.mats.size(), pc.n_inputs, ok ? "" : "  max abs ", ok ? "" : std::to_string(max_abs).c_str());
++    if (!ok) {
++        printf("    max rel %.3g, %s\n", max_rel, first.c_str());
++    }
++    return ok;
++}
++
++int main() {
++    // both evaluations of a graph must run: a replayed CUDA graph would hide the toggled fusion
++    set_env("GGML_CUDA_DISABLE_GRAPHS", "1");
++    ggml_backend_load_all();
++
++    // the attention projections of a layer application: Q [2304 x 3072], R [2304 x 384], K/V [2304 x 1024],
++    // gate [2304 x 3072]; one input for a SWA pass-1 layer, three (Q/R/gate, K, V) for a loop pass or full layer
++    const std::vector<proj_case> cases = {
++        { "core q8_0, one input",   1, { {"q", GGML_TYPE_Q8_0, 3072, 0}, {"r", GGML_TYPE_Q8_0, 384, 0}, {"k", GGML_TYPE_Q8_0, 1024, 0}, {"v", GGML_TYPE_Q8_0, 1024, 0}, {"gate", GGML_TYPE_Q8_0, 3072, 0} } },
++        { "core q8_0, three inputs", 3, { {"q", GGML_TYPE_Q8_0, 3072, 0}, {"r", GGML_TYPE_Q8_0, 384, 0}, {"k", GGML_TYPE_Q8_0, 1024, 1}, {"v", GGML_TYPE_Q8_0, 1024, 2}, {"gate", GGML_TYPE_Q8_0, 3072, 0} } },
++        { "layer 18 (q6_K, q8_0)",   3, { {"q", GGML_TYPE_Q6_K, 3072, 0}, {"r", GGML_TYPE_Q8_0, 384, 0}, {"k", GGML_TYPE_Q6_K, 1024, 1}, {"v", GGML_TYPE_Q8_0, 1024, 2}, {"gate", GGML_TYPE_Q6_K, 3072, 0} } },
++        { "layer 20 (q5_K, q8_0)",   3, { {"q", GGML_TYPE_Q5_K, 3072, 0}, {"r", GGML_TYPE_Q6_K, 384, 0}, {"k", GGML_TYPE_Q5_K, 1024, 1}, {"v", GGML_TYPE_Q8_0, 1024, 2}, {"gate", GGML_TYPE_Q5_K, 3072, 0} } },
++        { "layer 22 (q4_K, q6_K)",   3, { {"q", GGML_TYPE_Q4_K, 3072, 0}, {"r", GGML_TYPE_Q5_K, 384, 0}, {"k", GGML_TYPE_Q4_K, 1024, 1}, {"v", GGML_TYPE_Q6_K, 1024, 2}, {"gate", GGML_TYPE_Q5_K, 3072, 0} } },
++        { "two products",            1, { {"q", GGML_TYPE_Q8_0, 3072, 0}, {"gate", GGML_TYPE_Q8_0, 3072, 0} } },
++        { "eight products",          2, { {"a", GGML_TYPE_Q8_0, 3072, 0}, {"b", GGML_TYPE_Q8_0, 384, 0}, {"c", GGML_TYPE_Q8_0, 1024, 1}, {"d", GGML_TYPE_Q8_0, 1024, 1}, {"e", GGML_TYPE_Q8_0, 3072, 0}, {"f", GGML_TYPE_Q4_K, 2304, 1}, {"g", GGML_TYPE_Q6_K, 24, 0}, {"h", GGML_TYPE_Q8_0, 32, 1} } },
++    };
++
++    int n_fail = 0, n_run = 0;
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            continue;
++        }
++        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
++        GGML_ASSERT(backend);
++        printf("== %s\n", ggml_backend_name(backend));
++        for (const proj_case & pc : cases) {
++            n_fail += !test_proj(backend, pc);
++            n_run++;
++        }
++        ggml_backend_free(backend);
++    }
++    if (n_run == 0) {
++        printf("no non-CPU backend: nothing to compare\n");
++    }
++    printf("%d of %d cases failed\n", n_fail, n_run);
++    return n_fail == 0 ? 0 : 1;
++}
+diff --git a/tests/test-sched-streams.cpp b/tests/test-sched-streams.cpp
+new file mode 100644
+index 000000000..ed790f54e
+--- /dev/null
++++ b/tests/test-sched-streams.cpp
+@@ -0,0 +1,167 @@
++// Runs a small-batch graph with many independent chains (a decode-like block: norm, sibling projections, in-place
++// cache writes, joins) through ggml_backend_sched on every backend and compares with the CPU. The CUDA backend's
++// GGML_CUDA_GRAPH_OPT=2 stream plan reorders nothing but runs the chains on several streams: this checks that the
++// cross-stream dependencies, the window joins and the pinned allocations give the sequential result.
++//
++//   GGML_CUDA_GRAPH_OPT=2 GGML_CUDA_GRAPH_OPT_DEBUG=1 ./test-sched-streams
++
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++static float frand(uint32_t & state) {
++    state = state*1664525u + 1013904223u;
++    return float(state >> 8)/float(1u << 24) - 0.5f;
++}
++
++struct block_weights {
++    ggml_tensor * norm;
++    ggml_tensor * w[6];
++    ggml_tensor * cache; // [n_embd, n_cells], written in place by the block and read back
++};
++
++// one block: h = rms_norm(x)*norm; six projections of h on independent chains; two of them written into the cache and
++// read back through views; the chains join into the block output x + sum(...)
++static ggml_tensor * build_block(ggml_context * ctx, ggml_tensor * x, const block_weights & bw, int cell) {
++    const int64_t n_embd = x->ne[0];
++    ggml_tensor * h = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), bw.norm);
++
++    ggml_tensor * p[6];
++    for (int i = 0; i < 6; ++i) {
++        p[i] = ggml_mul_mat(ctx, bw.w[i], h);
++    }
++    // chains of different lengths
++    ggml_tensor * a = ggml_mul(ctx, ggml_sigmoid(ctx, p[0]), p[1]);
++    ggml_tensor * b = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, p[2], 0.1f)), 10.0f);
++    // the cache: p[3] is stored in cell `cell`, p[4] in cell + 1, and both are read back (write-after-read hazards
++    // with the reads of the previous block, read-after-write within this one)
++    // (the first token's column of each)
++    ggml_tensor * store3 = ggml_cpy(ctx, ggml_view_1d(ctx, p[3], n_embd, 0), ggml_view_1d(ctx, bw.cache, n_embd, (cell    )*bw.cache->nb[1]));
++    ggml_tensor * store4 = ggml_cpy(ctx, ggml_view_1d(ctx, p[4], n_embd, 0), ggml_view_1d(ctx, bw.cache, n_embd, (cell + 1)*bw.cache->nb[1]));
++    ggml_tensor * window = ggml_view_2d(ctx, bw.cache, n_embd, 2, bw.cache->nb[1], cell*bw.cache->nb[1]);
++    ggml_tensor * c = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, window))); // [2, 1] -> per cell sums
++    // make the reads depend on the stores explicitly, as the KV cache graph does
++    c = ggml_add(ctx, c, ggml_sum_rows(ctx, ggml_reshape_2d(ctx, store3, n_embd, 1)));
++    c = ggml_add(ctx, c, ggml_sum_rows(ctx, ggml_reshape_2d(ctx, store4, n_embd, 1)));
++    ggml_tensor * d = ggml_mul(ctx, ggml_silu(ctx, p[5]), ggml_repeat(ctx, ggml_view_1d(ctx, c, 1, 0), p[5]));
++
++    ggml_tensor * out = ggml_add(ctx, x, a);
++    out = ggml_add(ctx, out, b);
++    out = ggml_add(ctx, out, d);
++    return ggml_scale(ctx, out, 0.5f);
++}
++
++static std::vector<float> run(ggml_backend_t backend, ggml_backend_t cpu, int n_embd, int n_blocks, int n_tokens, uint32_t seed) {
++    const int n_tensors = 16 + n_blocks*64;
++    ggml_context * ctx_w = ggml_init({ggml_tensor_overhead()*(size_t) (8*n_blocks + 8), nullptr, true});
++    ggml_context * ctx   = ggml_init({ggml_tensor_overhead()*(size_t) n_tensors + ggml_graph_overhead_custom(n_tensors, false), nullptr, true});
++
++    std::vector<block_weights> bws(n_blocks);
++    for (int l = 0; l < n_blocks; ++l) {
++        bws[l].norm  = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, n_embd);
++        for (int i = 0; i < 6; ++i) {
++            bws[l].w[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F16, n_embd, n_embd);
++        }
++        bws[l].cache = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, 8);
++    }
++    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
++    GGML_ASSERT(buf_w);
++
++    uint32_t state = seed;
++    std::vector<float>       f32(n_embd*n_embd);
++    std::vector<ggml_fp16_t> f16(n_embd*n_embd);
++    for (int l = 0; l < n_blocks; ++l) {
++        for (int i = 0; i < n_embd; ++i) {
++            f32[i] = 1.0f + 0.1f*frand(state);
++        }
++        ggml_backend_tensor_set(bws[l].norm, f32.data(), 0, n_embd*sizeof(float));
++        for (int w = 0; w < 6; ++w) {
++            for (int i = 0; i < n_embd*n_embd; ++i) {
++                f16[i] = ggml_fp32_to_fp16(frand(state)/sqrtf(float(n_embd)));
++            }
++            ggml_backend_tensor_set(bws[l].w[w], f16.data(), 0, f16.size()*sizeof(ggml_fp16_t));
++        }
++        std::fill(f32.begin(), f32.end(), 0.0f);
++        ggml_backend_tensor_set(bws[l].cache, f32.data(), 0, ggml_nbytes(bws[l].cache));
++    }
++
++    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
++    ggml_set_input(x);
++    ggml_tensor * cur = x;
++    for (int l = 0; l < n_blocks; ++l) {
++        cur = build_block(ctx, cur, bws[l], 2*(l % 3));
++    }
++    ggml_set_output(cur);
++    ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_tensors, false);
++    ggml_build_forward_expand(gf, cur);
++
++    ggml_backend_t backends[2] = { backend, cpu };
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, backend == cpu ? 1 : 2, ggml_graph_n_nodes(gf) + 64, false, true);
++    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, gf));
++
++    std::vector<float> input(n_embd*n_tokens);
++    for (float & v : input) {
++        v = frand(state);
++    }
++    ggml_backend_tensor_set(x, input.data(), 0, input.size()*sizeof(float));
++
++    // twice: the second run reuses the allocation and, on CUDA, replays the captured graph; the cache is state, so
++    // it is cleared again in between
++    std::vector<float> out(n_embd*n_tokens), out2(n_embd*n_tokens);
++    GGML_ASSERT(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
++    ggml_backend_tensor_get(cur, out.data(), 0, out.size()*sizeof(float));
++    ggml_backend_tensor_set(x, input.data(), 0, input.size()*sizeof(float));
++    std::fill(f32.begin(), f32.end(), 0.0f);
++    for (int l = 0; l < n_blocks; ++l) {
++        ggml_backend_tensor_set(bws[l].cache, f32.data(), 0, ggml_nbytes(bws[l].cache));
++    }
++    GGML_ASSERT(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
++    ggml_backend_tensor_get(cur, out2.data(), 0, out2.size()*sizeof(float));
++    for (size_t i = 0; i < out.size(); ++i) {
++        GGML_ASSERT(std::isfinite(out[i]));
++        GGML_ASSERT(out[i] == out2[i] && "the second run differs from the first");
++    }
++
++    ggml_backend_sched_free(sched);
++    ggml_backend_buffer_free(buf_w);
++    ggml_free(ctx);
++    ggml_free(ctx_w);
++    return out;
++}
++
++int main() {
++    ggml_backend_load_all();
++    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    GGML_ASSERT(cpu);
++
++    int n_fail = 0;
++    for (int n_tokens : {1, 4}) {
++        const std::vector<float> ref = run(cpu, cpu, 256, 6, n_tokens, 12345u);
++        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                continue;
++            }
++            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
++            GGML_ASSERT(backend);
++            const std::vector<float> out = run(backend, cpu, 256, 6, n_tokens, 12345u);
++            double max_err = 0.0, max_ref = 0.0;
++            for (size_t k = 0; k < out.size(); ++k) {
++                max_err = std::max(max_err, (double) fabsf(out[k] - ref[k]));
++                max_ref = std::max(max_ref, (double) fabsf(ref[k]));
++            }
++            const bool ok = max_err <= 1e-3*std::max(1.0, max_ref);
++            printf("%s: n_tokens=%d, max |out| = %g, max error vs CPU = %g: %s\n", ggml_backend_name(backend), n_tokens, max_ref, max_err, ok ? "OK" : "FAIL");
++            n_fail += !ok;
++            ggml_backend_free(backend);
++        }
++    }
++    ggml_backend_free(cpu);
++    return n_fail == 0 ? 0 : 1;
++}

@@ -1,0 +1,1424 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 2f466e2e4..dc981f03f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2292,6 +2292,15 @@ extern "C" {
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+ 
++    GGML_API bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a);
++
++    // Add table[indices[key, query], head, query] to the mask before its F16 rounding.
++    // Queries from all streams are flattened in stream order. Indices must be in [0, table->ne[0]).
++    GGML_API void ggml_flash_attn_ext_add_indexed_bias(
++            struct ggml_tensor * a,
++            struct ggml_tensor * table,
++            struct ggml_tensor * indices);
++
+     // TODO: needs to be adapted to ggml_flash_attn_ext
+     GGML_API struct ggml_tensor * ggml_flash_attn_back(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 54d85b597..466ef72a2 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -152,6 +152,10 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
+ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
+ 
+ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
++
+     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
+diff --git a/ggml/src/ggml-cann/ggml-cann.cpp b/ggml/src/ggml-cann/ggml-cann.cpp
+index 0adc8680f..4ea2f216d 100644
+--- a/ggml/src/ggml-cann/ggml-cann.cpp
++++ b/ggml/src/ggml-cann/ggml-cann.cpp
+@@ -2679,8 +2679,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
+             return true;
+         case GGML_OP_FLASH_ATTN_EXT:
+             {
+-                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+-                if (op->src[5] != nullptr) {
++                // K/V row lists and indexed bias are not supported
++                if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
+                     return false;
+                 }
+ #ifdef ASCEND_310P
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index f984f13a6..a46c96ece 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8981,6 +8981,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
+     const ggml_tensor * kv_rows = dst->src[5];
++    const ggml_tensor * bias_table   = dst->src[6];
++    const ggml_tensor * bias_indices = dst->src[7];
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+@@ -9022,6 +9024,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     const int64_t rv2 = neq2/nev2;
+     const int64_t rv3 = neq3/nev3;
+ 
++    const int64_t n_bins = bias_table ? bias_table->ne[0] : 0;
++
+     // parallelize by q rows using ggml_vec_dot_f32
+ 
+     float scale         = 1.0f;
+@@ -9085,12 +9089,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+ 
+         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
+ 
++        // bias rows of this query and head, queries of all streams are flattened
++        const float   * bias = bias_table   ? (const float   *) ((const char *) bias_table->data   + (iq3*neq1 + iq1)*bias_table->nb[2] + iq2*bias_table->nb[1]) : nullptr;
++        const int32_t * bins = bias_indices ? (const int32_t *) ((const char *) bias_indices->data + (iq3*neq1 + iq1)*bias_indices->nb[1]) : nullptr;
++
+         // online softmax / attention
+         // loop over n_kv and n_head_kv
+         // ref: https://arxiv.org/pdf/2112.05682.pdf
+ 
+         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
++            float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
++            if (bias) {
++                GGML_ASSERT(bins[ic] >= 0 && bins[ic] < n_bins);
++                mv = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(mv + bias[bins[ic]]));
++            }
++            mv *= slope;
+             if (mv == -INFINITY) {
+                 continue;
+             }
+@@ -9268,6 +9281,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+     const ggml_tensor * kv_rows = dst->src[5];
+     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
+ 
++    const ggml_tensor * bias_table   = dst->src[6];
++    const ggml_tensor * bias_indices = dst->src[7];
++    const int64_t n_bins = bias_table ? bias_table->ne[0] : 0;
++
+     int ir = ir0;
+     while (ir < ir1) {
+         // q indices for the start of this tile
+@@ -9346,8 +9363,15 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+                 bool can_skip = true;
+                 for (int tq = 0; tq < tile_rows; tq++) {
+                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
++                    const float   * bias = bias_table   ? (const float   *) ((const char *) bias_table->data   + (iq3*neq1 + iq1 + tq)*bias_table->nb[2] + iq2*bias_table->nb[1]) : nullptr;
++                    const int32_t * bins = bias_indices ? (const int32_t *) ((const char *) bias_indices->data + (iq3*neq1 + iq1 + tq)*bias_indices->nb[1]) : nullptr;
+                     for (int tk = 0; tk < kv_tile; tk++) {
+-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
++                        float m = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
++                        if (bias) {
++                            GGML_ASSERT(bins[ic + tk] >= 0 && bins[ic + tk] < n_bins);
++                            m = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(m + bias[bins[ic + tk]]));
++                        }
++                        mask32[tq * KV_TILE_SZ + tk] = slope * m;
+                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                             can_skip = false;
+                         }
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index fc0cc7403..9ed4e7ce2 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -18,6 +18,23 @@
+ // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
+ #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
+ 
++struct fattn_indexed_bias {
++    const float * table;
++    const int32_t * indices;
++    int64_t n_bins;
++    int64_t n_keys;
++    int64_t query_stride;
++
++    __device__ fattn_indexed_bias for_head(int64_t first_query, int head) const {
++        return {table + first_query*query_stride + head*n_bins, indices + first_query*n_keys, n_bins, n_keys, query_stride};
++    }
++
++    __device__ half add(half mask, int query, int key) const {
++        const int bin = indices[query*n_keys + key];
++        return uint32_t(bin) < n_bins ? __float2half(__half2float(mask) + table[query*query_stride + bin]) : mask;
++    }
++};
++
+ typedef void (* fattn_kernel_t)(
+         const char * __restrict__ Q,
+         const char * __restrict__ K,
+@@ -40,7 +57,8 @@ typedef void (* fattn_kernel_t)(
+                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
++        const fattn_indexed_bias bias);
+ 
+ typedef float (*vec_dot_KQ_t)(
+     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
+@@ -1170,7 +1188,7 @@ void launch_fattn(
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
+-    const bool scan_mask = !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
++    const bool scan_mask = !dst->src[6] && !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+     if (scan_mask) {
+         const int64_t s31 = mask->nb[1] / sizeof(half2);
+         const int64_t s33 = mask->nb[3] / sizeof(half2);
+@@ -1324,7 +1342,12 @@ void launch_fattn(
+         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
+         nb21, nb22, nb23,
+         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
++        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
++        fattn_indexed_bias{dst->src[6] ? (const float *) dst->src[6]->data : nullptr,
++                           dst->src[7] ? (const int32_t *) dst->src[7]->data : nullptr,
++                           dst->src[6] ? dst->src[6]->ne[0] : 0,
++                           dst->src[7] ? dst->src[7]->ne[0] : 0,
++                           dst->src[6] ? dst->src[6]->ne[0]*dst->src[6]->ne[1] : 0}
+     );
+     CUDA_CHECK(cudaGetLastError());
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index dea8d2ad3..641cfa3de 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1960,7 +1960,9 @@ static __global__ void flash_attn_ext_f16(
+                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
++        const fattn_indexed_bias bias) {
++    GGML_UNUSED(bias);
+     ggml_cuda_pdl_sync(); // TODO optimize placement
+ #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
+     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 177b2f065..8987cf9b5 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -374,9 +374,9 @@ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ,
+ }
+ 
+ // TODO: deduplicate with mma-f16
+-template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
++template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, bool use_rows>
+ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+-        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
++        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup, const int * rows) {
+     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+     constexpr int cpy_ne = cpy_nb / 4;
+ 
+@@ -400,6 +400,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+             const int i = i0 + threadIdx.y*stride_i + (stride_j == warp_size ? 0 : threadIdx.x / stride_j);
+ 
+             if (i0 + nwarps*stride_i <= I || i < I) {
++                const int row = use_rows && (!oob_check || i < i_sup) ? rows[i] : i;
+ #pragma unroll
+                 for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
+                     const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
+@@ -407,7 +408,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+                     const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
+                     ggml_cuda_memcpy_1<cpy_nb>(
+                         tile_KV + i*(J/2 + J_padding) + j,
+-                        !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
++                        (!oob_check || i < i_sup) && (!use_rows || row >= 0) ? KV + int64_t(row)*stride_KV + j : zero);
+                 }
+             }
+         }
+@@ -424,9 +425,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+     ggml_cuda_unroll<7>{}(load);
+ }
+ 
+-template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
++template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, bool use_rows>
+ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+-        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
++        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup, const int * rows) {
+     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+     constexpr int cpy_ne = cpy_nb / 4;
+ 
+@@ -450,6 +451,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+             const int i = i0 + threadIdx.y*stride_i + (stride_j == warp_size ? 0 : threadIdx.x / stride_j);
+ 
+             if (i0 + nwarps*stride_i <= I || i < I) {
++                const int row = use_rows && (!oob_check || i < i_sup) ? rows[i] : i;
+ #pragma unroll
+                 for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
+                     const int j = j0*(cpy_ne/2) + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*(cpy_ne/2);
+@@ -457,7 +459,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+                     const half2 zero[cpy_ne/2] = {{0.0f, 0.0f}};
+                     __align__(16) half2 tmp_h2[cpy_ne/2];
+                     ggml_cuda_memcpy_1<sizeof(tmp_h2)>(
+-                        tmp_h2, !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
++                        tmp_h2, (!oob_check || i < i_sup) && (!use_rows || row >= 0) ? KV + int64_t(row)*stride_KV + j : zero);
+ 
+                     __align__(16) float2 tmp_f2[cpy_ne/2];
+ #pragma unroll
+@@ -481,16 +483,15 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+ 
+ // Function that performs a single iteration in for the KQ matrix multiplication:
+ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
+-    bool use_logit_softcap, bool oob_check, typename T_vec_dot>
++    bool use_logit_softcap, bool oob_check, bool use_rows, typename T_vec_dot>
+ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+         T_vec_dot   * const Q_tmp,
+         const half2 * const __restrict__ K_h2,
+         T_vec_dot   * const KV_tmp,
+         const int stride_K2,
+-        const int k_VKQ_0,
+         const int k_VKQ_sup,
+         const int k_KQ_0,
+-        float * KQ_acc) {
++        float * KQ_acc, const int * rows) {
+     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+     constexpr int cpy_ne = cpy_nb / 4;
+ 
+@@ -498,8 +499,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
+     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
+ 
+-    flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+-        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
++    flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check, use_rows>
++        (K_h2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup, rows);
+     __syncthreads();
+ 
+ #ifdef FAST_FP16_AVAILABLE
+@@ -556,7 +557,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
+ 
+ // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
+ template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
+-    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc>
++    bool use_logit_softcap, bool oob_check, bool use_rows, bool indexed_bias, typename T_vec_dot, typename T_KQ, typename T_acc>
+ static __device__ __forceinline__ void flash_attn_tile_iter(
+         T_vec_dot * const Q_tmp,
+         const half2 * const __restrict__ K_h2,
+@@ -575,7 +576,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+         T_acc * const VKQ,
+         const int k_VKQ_0,
+         const int k_VKQ_max,
+-        const int col_Q_0) {
++        const int col_Q_0,
++        const fattn_indexed_bias bias, const int * rows) {
+     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+     constexpr int cpy_ne = cpy_nb / 4;
+ 
+@@ -594,6 +596,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+ #endif // FAST_FP16_AVAILABLE
+     static_assert(cpw % KQ_cs == 0, "bad KQ_cs");
+     const int k_VKQ_sup = k_VKQ_max - k_VKQ_0; // k supremum, only smaller k values have valid KV data
++    const half2 * K_tile = use_rows ? K_h2 : K_h2 + int64_t(k_VKQ_0)*stride_K2;
++    const half2 * V_tile = use_rows ? V_h2 : V_h2 + int64_t(k_VKQ_0)*stride_V2;
++    const int * tile_rows = use_rows ? rows + k_VKQ_0 : nullptr;
+ 
+     float KQ_max_new[cpw];
+ #pragma unroll
+@@ -607,13 +612,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     constexpr int nbatch_K_last = DKQ % nbatch_K;
+ #pragma unroll
+     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
+-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>(
+-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
++        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, use_rows>(
++            Q_tmp, K_tile, KV_tmp, stride_K2, k_VKQ_sup, k_KQ_0, KQ_acc, tile_rows);
+     }
+     if (nbatch_K_last > 0) {
+         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
+-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check>(
+-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
++        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, use_rows>(
++            Q_tmp, K_tile, KV_tmp, stride_K2, k_VKQ_sup, k_KQ_0, KQ_acc, tile_rows);
+     }
+ 
+     // Apply logit softcap + mask, update KQ_max:
+@@ -636,8 +641,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+             }
+ 
+             if (!oob_check || i_KQ < k_VKQ_sup) {
+-                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
+-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
++                const int k = k_VKQ_0 + i_KQ;
++                if (ncols2 > 1 || mask) {
++                    half m = mask[int64_t(j)*stride_mask + k];
++                    if constexpr (indexed_bias) {
++                        m = bias.add(m, j, k);
++                    }
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += slope*__half2float(m);
++                }
+ 
+                 KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
+             }
+@@ -718,8 +729,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     static_assert(nbatch_V % np == 0, "bad nbatch_V");
+ #pragma unroll
+     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
+-        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+-            (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
++        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check, use_rows>
++            (use_rows ? V_tile : V_tile + int64_t(k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0, use_rows ? tile_rows + k0 : nullptr);
+         __syncthreads();
+ 
+ #ifdef FAST_FP16_AVAILABLE
+@@ -788,7 +799,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     }
+ }
+ 
+-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
++template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool indexed_bias, bool use_rows> // D == head size
+ __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
+ static __global__ void flash_attn_tile(
+         const char * Q_ptr,
+@@ -812,7 +823,8 @@ static __global__ void flash_attn_tile(
+                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
++        const fattn_indexed_bias bias) {
+ #ifdef FLASH_ATTN_AVAILABLE
+     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+     const char * GGML_CUDA_RESTRICT K        = K_ptr;
+@@ -822,7 +834,6 @@ static __global__ void flash_attn_tile(
+     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
+     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+-    GGML_UNUSED(KV_rows_ptr);
+ 
+     // Skip unused kernel variants for faster compilation:
+ 
+@@ -853,7 +864,9 @@ static __global__ void flash_attn_tile(
+     const int col_Q_0 = blockIdx.x * ncols1; // Index of the first Q column for this CUDA block to work on.
+ 
+     const int sequence = blockIdx.z / (ne02/ncols2);
++    const int * rows = use_rows ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
+     const int head0 = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
++    const auto head_bias = indexed_bias ? bias.for_head(int64_t(sequence)*ne01.z, head0) : bias;
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
+     const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
+@@ -959,24 +972,24 @@ static __global__ void flash_attn_tile(
+         int k_VKQ_0 = blockIdx.y*nbatch_fa;
+         while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
+             constexpr bool oob_check = false;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, use_rows, indexed_bias>
+                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, head_bias, rows);
+             k_VKQ_0 += gridDim.y*nbatch_fa;
+         }
+         if (k_VKQ_0 < k_VKQ_max) {
+             constexpr bool oob_check = true;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, use_rows, indexed_bias>
+                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, head_bias, rows);
+         }
+     } else {
+         // Branch without out-of-bounds checks.
+         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+             constexpr bool oob_check = false;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, use_rows, indexed_bias>
+                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, head_bias, rows);
+         }
+     }
+ 
+@@ -1147,7 +1160,7 @@ static __global__ void flash_attn_tile(
+ #endif // FLASH_ATTN_AVAILABLE
+ }
+ 
+-template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
++template <int DKQ, int DV, int ncols2, bool use_logit_softcap, bool indexed_bias = false, bool use_rows = false>
+ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * Q = dst->src[0];
+ 
+@@ -1163,7 +1176,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 64;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+             return;
+@@ -1179,7 +1192,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 32;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+             return;
+@@ -1191,7 +1204,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 16;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+             return;
+@@ -1203,7 +1216,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 8;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+             return;
+@@ -1215,7 +1228,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 4;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+             return;
+@@ -1226,7 +1239,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         constexpr int cols_per_block = 2;
+         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
++        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows>;
+         launch_fattn<DV, cols_per_block/ncols2, ncols2>
+             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+         return;
+@@ -1255,6 +1268,17 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     // a mask with a head dimension is not shared by the Q heads of a K/V head
+     const bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
++    if constexpr (DKQ == 64 || DKQ == 128) {
++        if (dst->src[6]) {
++            if (dst->src[5]) {
++                launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, true, true>(ctx, dst);
++            } else {
++                launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, true, false>(ctx, dst);
++            }
++            return;
++        }
++    }
++
+     if constexpr (DKQ == 320) {
+         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
+         // On AMD, simply use that GQA ratio with 32 columns / block since we always have enough SRAM.
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 09a46187d..42c0ef1c4 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wpass-failed"
+ #endif // __clang__
+-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
++template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool indexed_bias = false, bool use_rows = false> // D == head size
+ __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+ static __global__ void flash_attn_ext_vec(
+         const char * Q_ptr,
+@@ -40,7 +40,8 @@ static __global__ void flash_attn_ext_vec(
+                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
++        const fattn_indexed_bias bias) {
+     ggml_cuda_pdl_lc();
+ #ifdef FLASH_ATTN_AVAILABLE
+     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+@@ -51,7 +52,6 @@ static __global__ void flash_attn_ext_vec(
+     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
+     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+-    GGML_UNUSED(KV_rows_ptr);
+ 
+     // Skip unused kernel variants for faster compilation:
+     if (use_logit_softcap && !(D == 128 || D == 256)) {
+@@ -107,6 +107,7 @@ static __global__ void flash_attn_ext_vec(
+ 
+     const int sequence = blockIdx.z / ne02;
+     const int head = blockIdx.z - sequence*ne02;
++    const auto head_bias = indexed_bias ? bias.for_head(int64_t(sequence)*ne01.z, head) : bias;
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+     Q += nb03*sequence + nb02* head              + nb01*ic0;
+     K += nb13*sequence + nb12*(head / gqa_ratio);
+@@ -271,12 +272,15 @@ static __global__ void flash_attn_ext_vec(
+     }
+ 
+     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+-    K     += blockIdx.y*nthreads * nb11;
+-    V     += blockIdx.y*nthreads * nb21;
++    const int * rows = use_rows ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
++    if constexpr (!use_rows) {
++        K += blockIdx.y*nthreads * nb11;
++        V += blockIdx.y*nthreads * nb21;
++    }
+     maskh += blockIdx.y*nthreads;
+     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+              // Increment pointers after each loop:
+-             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
++             K += use_rows ? 0 : gridDim.y*nthreads*nb11, V += use_rows ? 0 : gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+ 
+         // Calculate KQ tile and keep track of new maximum KQ values:
+         float KQ_reg[ncols]; // KQ in registers.
+@@ -290,22 +294,24 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
+             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
++            const int row = use_rows ? rows[k_VKQ_0 + i_KQ] : i_KQ;
+ 
+ #pragma unroll
+             for (int j = 0; j < ncols; ++j) {
+-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
++                float sum = vec_dot_KQ(K + (use_rows ? int64_t(max(row, 0))*nb11 : i_KQ*nb11), Q_reg[j], Q_i32[j], Q_ds[j]);
+                 sum = warp_reduce_sum<nthreads_KQ>(sum);
+ 
+                 if (use_logit_softcap) {
+                     sum = logit_softcap*tanhf(sum);
+                 }
+ 
+-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
++                if constexpr (!indexed_bias) {
++                    if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
++                        sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
++                    }
++                    KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+                 }
+ 
+-                KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+-
+                 if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
+                     KQ_reg[j] = sum;
+                 }
+@@ -314,8 +320,14 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+         for (int j = 0; j < ncols; ++j) {
++            if constexpr (indexed_bias) {
++                const int k = k_VKQ_0 + tid;
++                const half m = use_rows && rows[k] < 0 ? half(-INFINITY) : head_bias.add(maskh[j*ne11 + tid], ic0 + j, k);
++                KQ_reg[j] += slope*__half2float(m);
++                KQ_max_new[j] = fmaxf(KQ_max[j], KQ_reg[j] + FATTN_KQ_MAX_OFFSET);
++            }
+ #pragma unroll
+-            for (int offset = nthreads_KQ; offset < WARP_SIZE; offset <<= 1) {
++            for (int offset = indexed_bias ? 1 : nthreads_KQ; offset < WARP_SIZE; offset <<= 1) {
+                 KQ_max_new[j] = fmaxf(KQ_max_new[j], ggml_cuda_shfl_xor(KQ_max_new[j], offset, WARP_SIZE));
+             }
+             const float KQ_max_scale = expf(KQ_max[j] - KQ_max_new[j]);
+@@ -345,6 +357,7 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
+             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
++            const char * V_row = V + (use_rows ? int64_t(max(rows[k_VKQ_0 + k], 0))*nb21 : k*nb21);
+ 
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+             half2 KQ_k[ncols];
+@@ -357,14 +370,14 @@ static __global__ void flash_attn_ext_vec(
+                 half2 tmp[V_rows_per_thread/2];
+                 if constexpr (type_V == GGML_TYPE_BF16) {
+                     float2 tmp_f[V_rows_per_thread/2];
+-                    dequantize_V(V + k*nb21, tmp_f,
++                    dequantize_V(V_row, tmp_f,
+                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+ #pragma unroll
+                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
+                     }
+                 } else {
+-                    dequantize_V(V + k*nb21, tmp,
++                    dequantize_V(V_row, tmp,
+                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                 }
+ #pragma unroll
+@@ -384,7 +397,7 @@ static __global__ void flash_attn_ext_vec(
+ #pragma unroll
+             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                 float2 tmp[V_rows_per_thread/2];
+-                dequantize_V(V + k*nb21, tmp,
++                dequantize_V(V_row, tmp,
+                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+ #pragma unroll
+                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+@@ -545,7 +558,7 @@ static __global__ void flash_attn_ext_vec(
+               nb11, nb12, nb13,
+               nb21, nb22, nb23,
+               ne31, ne32, ne33,
+-              nb31, nb32, nb33);
++              nb31, nb32, nb33, bias);
+     NO_DEVICE_CODE;
+ #endif // FLASH_ATTN_AVAILABLE
+ }
+@@ -560,6 +573,12 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
+     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
+     const int nwarps   = nthreads / WARP_SIZE;
+     fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
++    if constexpr (cols_per_block == 1 && (D == 64 || D == 128) && !use_logit_softcap) {
++        if (dst->src[6]) {
++            fattn_kernel = dst->src[5] ? flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true, true> :
++                                          flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true, false>;
++        }
++    }
+     const bool need_f16_K = type_K == GGML_TYPE_F16;
+     const bool need_f16_V = type_V == GGML_TYPE_F16;
+     constexpr size_t nbytes_shared = 0;
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 10aa5af15..11b8a3e89 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -669,6 +669,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ 
++    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
++        const float softcap = ggml_get_op_params_f32(dst, 2);
++        if (Q->ne[0] != 128 && !(Q->ne[0] == 64 && softcap == 0.0f)) {
++            return BEST_FATTN_KERNEL_NONE;
++        }
++        if (softcap == 0.0f && Q->ne[1] == 1 && n_kv % FATTN_KQ_STRIDE == 0 &&
++                ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type)) {
++            return BEST_FATTN_KERNEL_VEC;
++        }
++        return BEST_FATTN_KERNEL_TILE;
++    }
++
+     if (mask && mask->ne[2] != 1) {
+         // the kv_rows mask is compacted per sequence, it has no head dimension
+         if (kv_rows) {
+diff --git a/ggml/src/ggml-et/ggml-et.cpp b/ggml/src/ggml-et/ggml-et.cpp
+index 53e64b323..e575ee78b 100644
+--- a/ggml/src/ggml-et/ggml-et.cpp
++++ b/ggml/src/ggml-et/ggml-et.cpp
+@@ -1277,6 +1277,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
+             if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->src[1] &&
+                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) && op->src[2] &&
+                 (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) && op->src[4] == nullptr && op->src[5] == nullptr &&
++                !ggml_flash_attn_ext_has_indexed_bias(op) &&
+                 ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(op->src[0])) {
+                 float max_bias      = 0.0f;
+                 float logit_softcap = 0.0f;
+diff --git a/ggml/src/ggml-hexagon/htp-kparams.cpp b/ggml/src/ggml-hexagon/htp-kparams.cpp
+index 6d365b811..4e3c5cb8d 100644
+--- a/ggml/src/ggml-hexagon/htp-kparams.cpp
++++ b/ggml/src/ggml-hexagon/htp-kparams.cpp
+@@ -355,8 +355,8 @@ static bool htp_kparams_solve_flash_attn(
+         return false;
+     }
+ 
+-    // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+-    if (op->src[5] != nullptr) {
++    // K/V row lists and indexed bias are not supported
++    if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 2e085453a..4de1c2d28 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1744,6 +1744,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+         case GGML_OP_ROLL:
+             return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_FLASH_ATTN_EXT:
++            if (ggml_flash_attn_ext_has_indexed_bias(op)) {
++                return false;
++            }
+             // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
+             if (op->src[5] != NULL) {
+                 const struct ggml_tensor * kv_rows = op->src[5];
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index d35c6d047..ef9bc9d54 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -12569,8 +12569,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+         case GGML_OP_MEAN:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT: {
+-            // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+-            if (op->src[5] != nullptr) {
++            // K/V row lists and indexed bias are not supported
++            if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
+                 return false;
+             }
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+diff --git a/ggml/src/ggml-openvino/ggml-openvino.cpp b/ggml/src/ggml-openvino/ggml-openvino.cpp
+index bd49560d8..8325e638a 100644
+--- a/ggml/src/ggml-openvino/ggml-openvino.cpp
++++ b/ggml/src/ggml-openvino/ggml-openvino.cpp
+@@ -1905,6 +1905,10 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
+             return {false, "FLASH_ATTN_EXT gemma3n pattern on GPU is not supported"};
+         }
+ 
++        if (ggml_flash_attn_ext_has_indexed_bias(op)) {
++            return {false, "FLASH_ATTN_EXT with indexed bias is not supported"};
++        }
++
+         // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+         if (op->src[5] != nullptr) {
+             return {false, "FLASH_ATTN_EXT with K/V row lists is not supported"};
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index e4a84cb0c..3ccfa8b9b 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -3113,9 +3113,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
+ 
+ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     GGML_UNUSED(dev);
+-    GGML_UNUSED(op);
+     //TODO: call the remote backend and cache the results
+-    return true;
++    return op->op != GGML_OP_FLASH_ATTN_EXT || !ggml_flash_attn_ext_has_indexed_bias(op);
+ }
+ 
+ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 7dda19dfd..75df12c73 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7741,8 +7741,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+         case GGML_OP_SOLVE_TRI:
+             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
+         case GGML_OP_FLASH_ATTN_EXT:
+-            // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+-            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
++            // K/V row lists and indexed bias are not supported
++            return op->src[5] == nullptr && !ggml_flash_attn_ext_has_indexed_bias(op) && ggml_sycl_flash_attn_ext_supported(device, op);
+         default:
+             return false;
+     }
+diff --git a/ggml/src/ggml-virtgpu/ggml-backend-device.cpp b/ggml/src/ggml-virtgpu/ggml-backend-device.cpp
+index 86df4cc5f..a9e9e1b86 100644
+--- a/ggml/src/ggml-virtgpu/ggml-backend-device.cpp
++++ b/ggml/src/ggml-virtgpu/ggml-backend-device.cpp
+@@ -30,6 +30,10 @@ static void ggml_backend_remoting_device_get_memory(ggml_backend_dev_t dev, size
+ }
+ 
+ static bool ggml_backend_remoting_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
++
+     if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
+         !ggml_rope_get_truncate(op)) {
+         return false;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 60cebe494..0711166f9 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -16774,8 +16774,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+             }
+         case GGML_OP_FLASH_ATTN_EXT:
+             {
+-                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+-                if (op->src[5] != nullptr) {
++                if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
+                     return false;
+                 }
+                 bool coopmat2 = device->coopmat2;
+diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+index 886760849..3f1ce0e10 100644
+--- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -5083,8 +5083,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
+             {
+                 // conservative support checks for whether the more resource-intensive shader paths
+                 // can be used, to avoid cases where flash_attn is assigned to the CPU later on
+-                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+-                supports_op = op->src[5] == nullptr && src0->type == GGML_TYPE_F32 &&
++                // K/V row lists and indexed bias are not supported
++                supports_op = op->src[5] == nullptr && !ggml_flash_attn_ext_has_indexed_bias(op) &&
++                              src0->type == GGML_TYPE_F32 &&
+                               (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 ||
+                                src1->type == GGML_TYPE_Q4_0 || src1->type == GGML_TYPE_Q8_0) &&
+                               (src2->type == GGML_TYPE_F32 || src2->type == GGML_TYPE_F16 ||
+diff --git a/ggml/src/ggml-zdnn/fattn.cpp b/ggml/src/ggml-zdnn/fattn.cpp
+index e6a0c24ca..5e74e67a4 100644
+--- a/ggml/src/ggml-zdnn/fattn.cpp
++++ b/ggml/src/ggml-zdnn/fattn.cpp
+@@ -21,7 +21,7 @@ bool ggml_zdnn_supports_flash_attn_ext(const ggml_backend_zdnn_device_context *
+     memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
+ 
+     // sinks, alibi, softcap, sparse k/v sets and k/v row lists are not implemented
+-    if (op->src[4] != nullptr || op->src[5] != nullptr || max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(op, 4) != 0) {
++    if (op->src[4] != nullptr || op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op) || max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(op, 4) != 0) {
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 3389dcd63..652a7c7d6 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5545,6 +5545,34 @@ void ggml_flash_attn_ext_add_sinks(
+     a->src[4] = sinks;
+ }
+ 
++bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    return ggml_get_op_params_i32(a, 5) != 0;
++}
++
++void ggml_flash_attn_ext_add_indexed_bias(
++        struct ggml_tensor * a,
++        struct ggml_tensor * table,
++        struct ggml_tensor * indices) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT((table == NULL) == (indices == NULL));
++    a->src[6] = table;
++    a->src[7] = indices;
++    ggml_set_op_params_i32(a, 5, table != NULL);
++    if (!table) {
++        return;
++    }
++
++    const struct ggml_tensor * q = a->src[0];
++    const struct ggml_tensor * mask = a->src[3];
++    GGML_ASSERT(mask && mask->ne[0] == (a->src[5] ? a->src[5]->ne[0] : a->src[1]->ne[1]) && mask->ne[1] == q->ne[1]);
++    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
++    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
++    GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[0] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
++    GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices));
++    GGML_ASSERT(indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2]);
++}
++
+ // ggml_flash_attn_back
+ 
+ struct ggml_tensor * ggml_flash_attn_back(
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1bd3f8d0f..6738482c8 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1415,7 +1415,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
+     }
+ 
+     if (self_rel_pos->buffer) {
+-        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
++        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, inp_attn->self_attn_mask.rows, ubatch, extent);
+     }
+ 
+     // swa tensors may not be allocated if there are no SWA attention layers
+@@ -1429,7 +1429,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
+     }
+ 
+     if (self_rel_pos_swa->buffer) {
+-        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
++        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, inp_attn->self_attn_mask_swa.rows, ubatch, extent_swa);
+     }
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+@@ -1454,16 +1454,13 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+ 
+     const auto * attn_ctx = mctx->get_attn();
+ 
+-    // the masks are always dense, see build_inp_mem_hybrid_iswa_rel()
+-
+     // base tensors may not be allocated if there are no non-SWA attention layers
+     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+         res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+     }
+ 
+-    res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
++    res &= can_reuse_attn_mask(inp_attn->self_attn_mask, attn_ctx->get_base(), params.ubatch, params.cparams);
+ 
+-    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+ 
+     // swa tensors may not be allocated if there are no SWA attention layers
+@@ -1471,9 +1468,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+         res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
+     }
+ 
+-    res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
++    res &= can_reuse_attn_mask(inp_attn->self_attn_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+ 
+-    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+ 
+     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+@@ -3114,7 +3110,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * v_mla,
+              int64_t   n_kv_max,
+                float   kq_scale,
+-                 int   il) const {
++                 int   il,
++         ggml_tensor * bias_table,
++         ggml_tensor * bias_indices) const {
+     const bool v_trans = v->nb[1] > v->nb[2];
+ 
+     // split the batch into streams if needed
+@@ -3129,6 +3127,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+ 
++    auto dense_bias_mask = [&]() {
++        ggml_tensor * table = ggml_cont(ctx0, ggml_permute(ctx0, bias_table, 1, 0, 2, 3));
++        ggml_tensor * bias = ggml_get_rows(ctx0, table, bias_indices);
++        bias = ggml_reshape_4d(ctx0, bias, q->ne[2], bias_indices->ne[0], q->ne[1], n_stream);
++        bias = ggml_cont(ctx0, ggml_permute(ctx0, bias, 2, 0, 1, 3));
++        cb(bias, "kq_b", il);
++        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
++        mask = ggml_add(ctx0, bias, mask);
++        if (cparams.flash_attn) {
++            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
++        }
++        cb(mask, "kq_mask_rel_pos", il);
++        return mask;
++    };
++
+     ggml_tensor * cur;
+ 
+     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+@@ -3162,6 +3175,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+         ggml_prec_set_acc(cur, GGML_PREC_F32);
++        if (bias_table) {
++            ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
++            const auto dev = model.dev_layer(il);
++            if (!cparams.offload_kqv || !dev || !ggml_backend_dev_supports_op(dev, cur)) {
++                ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
++                cur->src[3] = dense_bias_mask();
++            } else if (kv_rows) {
++                // Looped layers can project Q and the bias on a different device from their KV cache.
++                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++                    auto backend = ggml_backend_sched_get_backend(sched, i);
++                    if (ggml_backend_get_device(backend) == dev) {
++                        ggml_backend_sched_set_tensor_backend(sched, cur, backend);
++                        break;
++                    }
++                }
++            }
++        }
+ 
+         if (v_mla) {
+ #if 0
+@@ -3182,6 +3212,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+     } else {
++        if (bias_table) {
++            kq_mask = dense_bias_mask();
++        }
+         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+         cb(kq, "kq", il);
+ 
+@@ -3691,7 +3724,9 @@ static ggml_tensor * build_attn_iswa_impl(
+         ggml_tensor * sinks,
+         ggml_tensor * v_mla,
+             float     kq_scale,
+-            int       il) {
++            int       il,
++        ggml_tensor * bias_table = nullptr,
++        ggml_tensor * bias_indices = nullptr) {
+     ggml_context * ctx0 = gctx.ctx0;
+     ggml_cgraph  * gf   = gctx.gf;
+ 
+@@ -3757,7 +3792,7 @@ static ggml_tensor * build_attn_iswa_impl(
+     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+ 
+-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il, bias_table, bias_indices);
+     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+     gctx.cb(cur, "kqv_out", il);
+ 
+@@ -4351,19 +4386,18 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+ 
+     auto inp_attn = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, attn_ctx);
+ 
+-    // dense masks: the bias is gathered by the distance to each cell of the K/V view
+     {
+         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
+         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp_attn->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
++        inp_attn->self_attn_mask = build_attn_inp_attn_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
+     }
+ 
+     {
+         inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
+         inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp_attn->self_attn_mask_swa.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
++        inp_attn->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
+     }
+ 
+     inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
+@@ -4374,11 +4408,11 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+ 
+     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
+ 
+-    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
++    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->get_attn()->self_attn_mask.raw->ne[0], ubatch.n_tokens);
+     ggml_set_input(inp->self_rel_pos);
+     ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+ 
+-    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
++    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->get_attn()->self_attn_mask_swa.raw->ne[0], ubatch.n_tokens);
+     ggml_set_input(inp->self_rel_pos_swa);
+     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+ 
+@@ -4393,7 +4427,7 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_tensor * q_cur,
+         ggml_tensor * k_cur,
+         ggml_tensor * v_cur,
+-        ggml_tensor * kq_b,
++        ggml_tensor * bias_table,
+         ggml_tensor * sinks,
+             float     kq_scale,
+             int       il) const {
+@@ -4403,22 +4437,10 @@ ggml_tensor * llm_graph_context::build_attn(
+ 
+     const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
+ 
+-    // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
+-    //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
+-    GGML_ASSERT(attn_mask.rows == nullptr);
+-
+-    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+-    ggml_tensor * kq_mask = attn_mask.raw;
+-    if (kq_mask->type != GGML_TYPE_F32) {
+-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+-    }
+-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+-    if (cparams.flash_attn) {
+-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+-    }
+-    cb(kq_mask, "kq_mask_rel_pos", il);
++    ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+ 
+-    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
++    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, attn_mask.rows,
++            sinks, nullptr, kq_scale, il, bias_table, indices);
+ }
+ 
+ void llm_graph_context::build_dense_out(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 116b7132a..1acf4461e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -774,8 +774,7 @@ public:
+ };
+ 
+ // hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling)
+-// the KQ masks are always dense (rows == nullptr) and are filled from the same cells as the distances, so that the bias
+-// gathered by distance lines up with the mask
++// The visibility mask and distances use the same cache cell order.
+ class llm_graph_input_mem_hybrid_iswa_rel : public llm_graph_input_i {
+ public:
+     llm_graph_input_mem_hybrid_iswa_rel(
+@@ -1336,7 +1335,9 @@ struct llm_graph_context {
+             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                 int64_t   n_kv_max,
+                   float   kq_scale,
+-                    int   il) const;
++                    int   il,
++            ggml_tensor * bias_table = nullptr,
++            ggml_tensor * bias_indices = nullptr) const;
+ 
+     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+ 
+@@ -1534,7 +1535,7 @@ struct llm_graph_context {
+             uint32_t extent,
+             uint32_t extent_swa) const;
+ 
+-    // kq_b is added to the KQ mask, after the KQ scale
++    // Gather the per-head bias by distance and add it to the visibility mask.
+     ggml_tensor * build_attn(
+             llm_graph_input_mem_hybrid_iswa_rel * inp,
+             ggml_tensor * wo,
+@@ -1543,7 +1544,7 @@ struct llm_graph_context {
+             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
++            ggml_tensor * bias_table, // [n_bins, n_head_q, n_tokens]
+             ggml_tensor * sinks, // [n_head_q]
+                   float   kq_scale,
+                     int   il) const;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index fbe422a27..06b4a8a48 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2007,14 +2007,18 @@ bool llama_kv_cache::has_cell_ext() const {
+     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+ }
+ 
+-void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
++void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const {
+     GGML_ASSERT(dst->type == GGML_TYPE_I32);
+     const int64_t n_kv = dst->ne[0];
++    GGML_ASSERT(!rows || (rows->ne[0] == n_kv && ggml_backend_buffer_is_host(rows->buffer)));
++    const int64_t n_tps = ubatch->n_tokens / (rows ? rows->ne[1] : 1);
+     std::vector<int32_t> data(n_kv * ubatch->n_tokens);
+     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+         const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
++        const int32_t * list = rows ? (const int32_t *) rows->data + (i/n_tps)*n_kv : nullptr;
+         for (int64_t j = 0; j < n_kv; ++j) {
+-            const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
++            const int64_t cell = list ? list[j] : j;
++            const int64_t distance = cell < 0 || cells.is_empty(cell) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(cell);
+             data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
+         }
+     }
+@@ -3124,8 +3128,8 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
+     kv->set_input_pos_bucket(dst, ubatch);
+ }
+ 
+-void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+-    kv->set_input_relative_pos(dst, ubatch, extent);
++void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const {
++    kv->set_input_relative_pos(dst, rows, ubatch, extent);
+ }
+ 
+ void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 1b40f6fc4..1bfccf6aa 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -249,7 +249,7 @@ public:
+ 
+     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+-    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
++    void set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const;
+ 
+     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
+     bool has_cell_ext() const;
+@@ -454,7 +454,7 @@ public:
+     void set_input_k_shift   (ggml_tensor * dst) const;
+     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+-    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
++    void set_input_relative_pos(ggml_tensor * dst, const ggml_tensor * rows, const llama_ubatch * ubatch, uint32_t extent) const;
+ 
+     // see llama_kv_cache::get_prev_tokens()
+     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 45477a69e..a52c3b237 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -250,7 +250,6 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
+ 
+ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
+     inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
+-    attn = inp->get_attn();
+     recr = inp->get_recr();
+ 
+     ggml_tensor * inp_pos = build_inp_pos();
+@@ -347,30 +346,18 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         cb(Vcur, "Vcur", il);
+         cb(Rcur, "Rcur", il);
+ 
+-        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+-
+-        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
+-        const int64_t n_kv     = rel_pos->ne[0];
+-
+         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+ 
+-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+ 
+         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
+         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+-
+-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+-        cb(kq_b, "kq_b", il);
+ 
+         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+ 
+         cur = build_attn(inp,
+                 nullptr, nullptr, nullptr,
+-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
++                Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
+ 
+         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
+diff --git a/src/models/models.h b/src/models/models.h
+index b12642fb9..a728398dd 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2544,7 +2544,6 @@ struct llama_model_inkling2 : public llama_model_base {
+         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+ 
+         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
+-        llm_graph_input_attn_kv_iswa        * attn = nullptr;
+         llm_graph_input_rs                  * recr = nullptr;
+ 
+         ggml_tensor * inp_out_ids = nullptr;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 5b997e91b..f9dff8bf8 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -367,6 +367,7 @@ endif()
+ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
+ 
+ llama_build_and_test(test-backend-tensor.cpp LINK ggml)
++llama_build_and_test(test-flash-attn-indexed-bias.cpp LINK ggml)
+ llama_build_and_test(test-sleep.cpp LINK ggml)
+ llama_build_and_test(test-backend-sched.cpp LINK ggml)
+ 
+diff --git a/tests/test-flash-attn-indexed-bias.cpp b/tests/test-flash-attn-indexed-bias.cpp
+new file mode 100644
+index 000000000..048ea0264
+--- /dev/null
++++ b/tests/test-flash-attn-indexed-bias.cpp
+@@ -0,0 +1,144 @@
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <vector>
++
++static void set_kv(ggml_tensor * t, const std::vector<float> & data) {
++    std::vector<uint8_t> bytes(ggml_nbytes(t));
++    ggml_quantize_chunk(t->type, data.data(), bytes.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
++    ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
++}
++
++static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, int n_query, int cells = 768, ggml_type kv_type = GGML_TYPE_F16) {
++    constexpr int heads = 6, kv_heads = 2, streams = 2, bins = 17;
++    const int cols = use_rows ? std::min(512, cells) : cells;
++
++    ggml_context * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
++    auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, n_query, heads, streams);
++    auto * k = ggml_new_tensor_4d(ctx, kv_type, width, cells, kv_heads, use_rows ? 1 : streams);
++    auto * v = ggml_dup_tensor(ctx, k);
++    auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cols, n_query, 1, streams);
++    auto * rows = use_rows ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, streams) : nullptr;
++    auto * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, bins, heads, n_query*streams);
++    auto * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, n_query*streams);
++    auto * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
++    auto * out = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, rows, 1.0f/sqrtf(width), 0, 0);
++    ggml_flash_attn_ext_add_sinks(out, sinks);
++    const bool supports_plain = ggml_backend_supports_op(backend, out);
++    ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
++    GGML_ASSERT(ggml_flash_attn_ext_has_indexed_bias(out));
++    ggml_flash_attn_ext_add_indexed_bias(out, nullptr, nullptr);
++    GGML_ASSERT(!ggml_flash_attn_ext_has_indexed_bias(out) && !out->src[6] && !out->src[7]);
++    GGML_ASSERT(ggml_backend_supports_op(backend, out) == supports_plain);
++    ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
++    ggml_prec_set_acc(out, GGML_PREC_F32);
++
++    if (!ggml_backend_supports_op(backend, out)) {
++        ggml_free(ctx);
++        return;
++    }
++
++    auto * graph = ggml_new_graph(ctx);
++    ggml_build_forward_expand(graph, out);
++    auto * buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    GGML_ASSERT(buf);
++    ggml_backend_buffer_clear(buf, 0);
++
++    std::vector<int32_t> row(cols*streams), idx(ggml_nelements(indices));
++    std::vector<ggml_fp16_t> visibility(idx.size());
++    std::vector<float> keys(ggml_nelements(k)), values(ggml_nelements(v));
++    std::vector<float> queries(ggml_nelements(q));
++    float sink_logits[heads];
++    for (int h = 0; h < heads; ++h) {
++        sink_logits[h] = float(2*h - 3);
++    }
++    for (size_t i = 0; i < queries.size(); i += width) {
++        queries[i] = 4.0f;
++    }
++    std::vector<float> biases(ggml_nelements(table)), expected(n_query*streams*heads), output(ggml_nelements(out));
++    for (int s = 0; s < v->ne[3]; ++s) {
++        for (int h = 0; h < kv_heads; ++h) {
++            for (int c = 0; c < cells; ++c) {
++                const float x = float((c + 3*h + 5*s) % 23 - 11)/16;
++                const int offset = ((s*kv_heads + h)*cells + c)*width;
++                std::fill_n(values.data() + offset, width, x);
++                keys[offset] = float((7*c + 2*h + 3*s) % 29 - 14)/4;
++            }
++        }
++    }
++    for (int s = 0; s < streams; ++s) {
++        for (int c = 0; c < cols; ++c) {
++            row[s*cols + c] = use_rows ? (c % 19 == 0 ? -1 : (13*c + 73*s) % cells) : c;
++        }
++        for (int j = 0; j < n_query; ++j) {
++            const int query = s*n_query + j;
++            for (int h = 0; h < heads; ++h) {
++                for (int b = 0; b < bins; ++b) {
++                    biases[(query*heads + h)*bins + b] = float((b*(3 + h) + query) % 13 - 6)/2.9f;
++                }
++                double sum = exp(double(sink_logits[h])), weighted = 0.0;
++                for (int c = 0; c < cols; ++c) {
++                    const int cell = row[s*cols + c];
++                    const int i = query*cols + c;
++                    idx[i] = (c + 3*query) % bins;
++                    const bool visible = (s != 1 || j != 0) && cell >= 0 && (c + j) % 7 != 0;
++                    visibility[i] = ggml_fp32_to_fp16(visible ? 0.25f : -INFINITY);
++                    if (visible) {
++                        const int vk = (use_rows ? 0 : s)*kv_heads + h/(heads/kv_heads);
++                        const double qk = 4.0*keys[(vk*cells + cell)*width]/sqrt(width);
++                        const float m = 0.25f + biases[(query*heads + h)*bins + idx[i]];
++                        const double weight = exp(qk + ggml_fp16_to_fp32(ggml_fp32_to_fp16(m)));
++                        weighted += weight*values[(vk*cells + cell)*width];
++                        sum += weight;
++                    }
++                }
++                expected[query*heads + h] = weighted/sum;
++            }
++        }
++    }
++    ggml_backend_tensor_set(q, queries.data(), 0, ggml_nbytes(q));
++    set_kv(k, keys);
++    set_kv(v, values);
++    ggml_backend_tensor_set(mask, visibility.data(), 0, ggml_nbytes(mask));
++    ggml_backend_tensor_set(table, biases.data(), 0, ggml_nbytes(table));
++    ggml_backend_tensor_set(sinks, sink_logits, 0, sizeof(sink_logits));
++    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
++    if (rows) {
++        ggml_backend_tensor_set(rows, row.data(), 0, ggml_nbytes(rows));
++    }
++    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
++    ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
++    float max_error = 0.0f;
++    for (size_t i = 0; i < output.size(); ++i) {
++        GGML_ASSERT(std::isfinite(output[i]));
++        max_error = std::max(max_error, fabsf(output[i] - expected[i/width]));
++    }
++    printf("%s: width=%d, kv=%s, rows=%d, queries=%d, cells=%d, max error=%g\n", ggml_backend_name(backend), width, ggml_type_name(kv_type), use_rows, n_query, cells, max_error);
++    GGML_ASSERT(max_error < 0.001f);
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
++int main() {
++    ggml_backend_load_all();
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        auto dev = ggml_backend_dev_get(i);
++        auto backend = ggml_backend_dev_init(dev, nullptr);
++        GGML_ASSERT(backend);
++        for (int width : {64, 128}) {
++            test_indexed_bias(backend, width, false, 7, 16);
++            test_indexed_bias(backend, width, true, 7, 16);
++            test_indexed_bias(backend, width, false, 1, 768, GGML_TYPE_Q4_0);
++            test_indexed_bias(backend, width, true,  1, 768, GGML_TYPE_Q4_0);
++            for (int n_query : {1, 7, 65}) {
++                test_indexed_bias(backend, width, false, n_query);
++                test_indexed_bias(backend, width, true, n_query);
++            }
++        }
++        ggml_backend_free(backend);
++    }
++}

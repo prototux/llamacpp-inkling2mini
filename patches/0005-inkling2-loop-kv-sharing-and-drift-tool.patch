@@ -1,0 +1,519 @@
+diff --git a/src/llama-memory-hybrid-iswa.cpp b/src/llama-memory-hybrid-iswa.cpp
+index 6d843c76e..47c9425ab 100644
+--- a/src/llama-memory-hybrid-iswa.cpp
++++ b/src/llama-memory-hybrid-iswa.cpp
+@@ -29,7 +29,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
+                      bool   unified,
+                             /* layer filters */
+     const layer_filter_cb & filter_attn,
+-    const layer_filter_cb & filter_recr) :
++    const layer_filter_cb & filter_recr,
++    const  layer_reuse_cb & reuse_attn) :
+     hparams(model.hparams),
+     mem_attn(new llama_kv_cache_iswa(
+         model,
+@@ -47,7 +48,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
+         filter_attn == nullptr ?
+             [&](int32_t il) { return !hparams.is_recr(il); }
+             : filter_attn,
+-        nullptr,
++        reuse_attn,
+         nullptr
+     )),
+     mem_recr(new llama_memory_recurrent(
+diff --git a/src/llama-memory-hybrid-iswa.h b/src/llama-memory-hybrid-iswa.h
+index 52c885ac9..0bd097a84 100644
+--- a/src/llama-memory-hybrid-iswa.h
++++ b/src/llama-memory-hybrid-iswa.h
+@@ -39,7 +39,9 @@ public:
+                      bool   unified,
+                             /* layer filters */
+     const layer_filter_cb & filter_attn = nullptr,
+-    const layer_filter_cb & filter_recr = nullptr);
++    const layer_filter_cb & filter_recr = nullptr,
++                            /* attention layers that read the KV cache of another layer */
++    const  layer_reuse_cb & reuse_attn  = nullptr);
+ 
+     ~llama_memory_hybrid_iswa() = default;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 06eb7c929..0cb02f462 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3470,6 +3470,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     }
+ 
+                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
++                        // inkling2_loop with LLAMA_INKLING_SHARE_LOOP_KV: the full-attention slots of the later passes
++                        // read the KV cache of the first pass (hparams.kv_source), like the shared layers of gemma3n
++                        llama_memory_i::layer_reuse_cb reuse_attn = nullptr;
++                        if (arch == LLM_ARCH_INKLING2_LOOP) {
++                            reuse_attn = [&](int32_t il) -> int32_t {
++                                return hparams.has_kv(il) ? -1 : (int32_t) hparams.kv_source(il);
++                            };
++                        }
++
+                         // Use hybrid-iswa for hybrid models with SWA
+                         res = new llama_memory_hybrid_iswa(
+                             /* model             */ *this,
+@@ -3488,7 +3497,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* offload           */ cparams.offload_kqv,
+                             /* unified           */ cparams.kv_unified,
+                             /* filter_attn       */ std::move(filter_attn),
+-                            /* filter_recr       */ std::move(filter_recr));
++                            /* filter_recr       */ std::move(filter_recr),
++                            /* reuse_attn        */ reuse_attn);
+                     } else if (needs_mem_idx) {
+                         // sparse attention over a per-token indexer cache, in its own memory type
+                         res = new llama_memory_hybrid_idx(
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+index 1b9455b52..f7b1604a5 100644
+--- a/src/models/inkling2-loop.cpp
++++ b/src/models/inkling2-loop.cpp
+@@ -1,5 +1,7 @@
+ #include "models.h"
+ 
++#include <cstdlib>
++
+ int llama_model_inkling2_loop::layer_phys(int il) const {
+     return il < n_phys ? il : core_start + (il - n_phys) % (core_end - core_start);
+ }
+@@ -38,6 +40,23 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
+         hparams.is_swa_impl[il]       = hparams.is_swa_impl[p];
+         hparams.is_recr_impl[il]      = hparams.is_recr_impl[p];
+     }
++
++    // opt-in: a full-attention slot of a later pass reads the K/V that the first pass of its physical layer stored
++    // (for every position, the current tokens included) and stores nothing itself, so the full-attention KV memory
++    // is divided by n_passes; the SWA slots and the convolution states stay per pass
++    const char * share = getenv("LLAMA_INKLING_SHARE_LOOP_KV");
++    share_loop_kv = share && atoi(share) != 0;
++    if (share_loop_kv) {
++        uint32_t n_shared = 0;
++        for (int il = n_phys; il < (int) n_slot; ++il) {
++            if (!hparams.is_swa(il)) {
++                hparams.kv_source_impl[il] = layer_phys(il);
++                n_shared++;
++            }
++        }
++        LLAMA_LOG_INFO("%s: LLAMA_INKLING_SHARE_LOOP_KV: %u full-attention slots of passes 2..%u read the KV cache of pass 1\n",
++                __func__, n_shared, n_passes);
++    }
+ }
+ 
+ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 6c4aa3ce0..15767d441 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -373,15 +373,31 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+     // self-attention
+     {
+         ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
+-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
+-                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
+-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
+-                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
+         ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+ 
++        // a slot that shares the KV cache of another slot (inkling2_loop, LLAMA_INKLING_SHARE_LOOP_KV) computes
++        // no K and V: build_attn() reads the source slot's cache, which the source stored earlier in this graph
++        ggml_tensor * Kcur = nullptr;
++        ggml_tensor * Vcur = nullptr;
++        if (hparams.has_kv(il)) {
++            Kcur = build_lora_mm(layer.wk, inputs[1]);
++            Vcur = build_lora_mm(layer.wv, inputs[2]);
++            cb(Kcur, "Kpre", il);
++            cb(Vcur, "Vpre", il);
++
++            Kcur = convolve(Kcur, layer.attn_k_conv,
++                    is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
++            Vcur = convolve(Vcur, layer.attn_v_conv,
++                    is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
++
++            Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr, hparams.f_qk_clip);
++            Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
++
++            cb(Kcur, "Kcur", il);
++            cb(Vcur, "Vcur", il);
++        }
++
+         Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
+-        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
+-        Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
+         Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
+ 
+         if (!is_swa) {
+@@ -390,8 +406,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         }
+ 
+         cb(Qcur, "Qcur", il);
+-        cb(Kcur, "Kcur", il);
+-        cb(Vcur, "Vcur", il);
+         cb(Rcur, "Rcur", il);
+ 
+         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+diff --git a/src/models/models.h b/src/models/models.h
+index 08447e1a4..e7b6d38a1 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2579,6 +2579,8 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
+     uint32_t n_passes   = 0;
+     uint32_t gate_rank  = 0;
+     bool     varying    = false; // trained for a varying number of passes
++    // LLAMA_INKLING_SHARE_LOOP_KV: the full-attention slots of passes 2.. read the KV cache of pass 1
++    bool     share_loop_kv = false;
+ 
+     // indexed by physical layer - core_start
+     std::vector<loop_layer> loop_layers;
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index 57d53df25..110cedd16 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -42,6 +42,7 @@ else()
+         add_subdirectory(export-lora)
+     endif()
+     add_subdirectory(fit-params)
++    add_subdirectory(inkling-pass-kv)
+     if (GGML_METAL)
+         add_subdirectory(tuning)
+     endif()
+diff --git a/tools/inkling-pass-kv/CMakeLists.txt b/tools/inkling-pass-kv/CMakeLists.txt
+new file mode 100644
+index 000000000..c63478a52
+--- /dev/null
++++ b/tools/inkling-pass-kv/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-inkling-pass-kv)
++add_executable(${TARGET} inkling-pass-kv.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/tools/inkling-pass-kv/inkling-pass-kv.cpp b/tools/inkling-pass-kv/inkling-pass-kv.cpp
+new file mode 100644
+index 000000000..a867a1a57
+--- /dev/null
++++ b/tools/inkling-pass-kv/inkling-pass-kv.cpp
+@@ -0,0 +1,322 @@
++// Measures how much the K and V of an inkling2_loop full-attention layer differ between the passes of the loop.
++//
++// The looped core runs n_passes times; every pass stores its own K/V in its own cache slot. If the K/V of the later
++// passes are close to the K/V of the first pass, the later slots can read the first slot's cache instead
++// (LLAMA_INKLING_SHARE_LOOP_KV=1) and the full-attention KV memory shrinks by n_passes.
++//
++// The tool runs a prompt through the model with the scheduler eval callback, captures the tensors that the graph
++// names "Kpre"/"Vpre" (the K and V projections before their short convolution) and "Kcur"/"Vcur" (after the
++// convolution, clip and norm: exactly what build_attn() stores in the cache), and compares the slots of the same
++// physical layer across the passes. The tensors are copied to the host, so the tool also runs on GPU backends.
++//
++// usage: llama-inkling-pass-kv -m model.gguf -p "prompt" [--swa] [common options]
++//        --swa also lists the SWA layers of the core (full-attention layers are listed by default)
++
++#include "arg.h"
++#include "common.h"
++#include "log.h"
++#include "llama.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "gguf.h"
++
++#include <algorithm>
++#include <clocale>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace {
++
++// the names the inkling2 graph gives to the attention inputs, see src/models/inkling2.cpp
++const char * const KINDS[] = { "Kpre", "Vpre", "Kcur", "Vcur" };
++
++struct capture {
++    // kind -> slot -> values [n_tokens*n_head_kv x n_embd_head] (or [n_tokens x n_embd_k_gqa]), f32, the tokens of every ubatch appended
++    std::map<std::string, std::map<int, std::vector<float>>> data;
++    std::map<std::string, std::map<int, int64_t>>            ne0; // the row size: the head size of Kcur/Vcur
++    std::vector<uint8_t>                                     bytes;
++};
++
++bool parse_name(const char * name, std::string & kind, int & il) {
++    const char * dash = strrchr(name, '-');
++    if (!dash || dash == name) {
++        return false;
++    }
++    kind.assign(name, dash - name);
++    if (std::find_if(std::begin(KINDS), std::end(KINDS), [&](const char * k) { return kind == k; }) == std::end(KINDS)) {
++        return false;
++    }
++    char * end = nullptr;
++    il = (int) strtol(dash + 1, &end, 10);
++    return end && *end == '\0';
++}
++
++// one row of the tensor at the given byte offset, converted to f32
++void row_to_f32(const ggml_tensor * t, const uint8_t * base, size_t offset, float * out) {
++    const int64_t n = t->ne[0];
++    if (t->type == GGML_TYPE_F32) {
++        memcpy(out, base + offset, n*sizeof(float));
++        return;
++    }
++    const auto * traits = ggml_get_type_traits(t->type);
++    GGML_ASSERT(traits->to_float && "unsupported tensor type");
++    traits->to_float(base + offset, out, n);
++}
++
++bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
++    auto * cap = (capture *) user_data;
++
++    std::string kind;
++    int il = -1;
++    if (!parse_name(t->name, kind, il)) {
++        return !ask;
++    }
++    if (ask) {
++        return true;
++    }
++
++    // Kpre/Vpre are [n_embd_k_gqa, n_tokens], Kcur/Vcur [n_embd_head, n_head_kv, n_tokens]
++    GGML_ASSERT(t->ne[3] == 1 && (kind.size() > 3 && kind.compare(1, 3, "pre") == 0 ? t->ne[2] == 1 : true));
++    const int64_t n_rows = ggml_nrows(t);
++
++    const uint8_t * base = (const uint8_t *) t->data;
++    if (!ggml_backend_buffer_is_host(t->buffer)) {
++        cap->bytes.resize(ggml_nbytes(t));
++        ggml_backend_tensor_get(t, cap->bytes.data(), 0, cap->bytes.size());
++        base = cap->bytes.data();
++    }
++
++    auto & vec = cap->data[kind][il];
++    const size_t start = vec.size();
++    vec.resize(start + (size_t) ggml_nelements(t));
++    cap->ne0[kind][il] = t->ne[0];
++
++    // rows in memory order equal rows in (token, head) order for the shapes above
++    float * out = vec.data() + start;
++    for (int64_t r = 0; r < n_rows; ++r) {
++        const int64_t i1 = r % t->ne[1];
++        const int64_t i2 = (r / t->ne[1]) % t->ne[2];
++        const int64_t i3 = r / (t->ne[1]*t->ne[2]);
++        row_to_f32(t, base, i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3], out + r*t->ne[0]);
++    }
++
++    return true;
++}
++
++struct stats {
++    double cos_mean  = 0; // mean cosine similarity over the (token, head) vectors
++    double cos_min   = 1;
++    double rel_l2    = 0; // ||a - b|| / ||a|| over the whole tensor
++    double rel_l2_vec = 0; // mean of ||a_i - b_i|| / ||a_i|| over the (token, head) vectors
++};
++
++// compares b to the reference a, both [n_vec x d]
++stats compare(const std::vector<float> & a, const std::vector<float> & b, int64_t d) {
++    GGML_ASSERT(a.size() == b.size() && d > 0 && a.size() % d == 0);
++    const int64_t n_vec = (int64_t) a.size()/d;
++
++    stats s;
++    double sum_cos = 0, sum_rel = 0, sum_diff2 = 0, sum_a2 = 0;
++    for (int64_t i = 0; i < n_vec; ++i) {
++        const float * x = a.data() + i*d;
++        const float * y = b.data() + i*d;
++        double xx = 0, yy = 0, xy = 0, dd = 0;
++        for (int64_t j = 0; j < d; ++j) {
++            xx += (double) x[j]*x[j];
++            yy += (double) y[j]*y[j];
++            xy += (double) x[j]*y[j];
++            dd += ((double) x[j] - y[j])*((double) x[j] - y[j]);
++        }
++        const double cos = xx > 0 && yy > 0 ? xy/std::sqrt(xx*yy) : 1.0;
++        sum_cos  += cos;
++        sum_rel  += xx > 0 ? std::sqrt(dd/xx) : 0.0;
++        s.cos_min = std::min(s.cos_min, cos);
++        sum_diff2 += dd;
++        sum_a2    += xx;
++    }
++    s.cos_mean   = sum_cos/n_vec;
++    s.rel_l2_vec = sum_rel/n_vec;
++    s.rel_l2     = sum_a2 > 0 ? std::sqrt(sum_diff2/sum_a2) : 0.0;
++    return s;
++}
++
++std::string meta(const llama_model * model, const std::string & key) {
++    char buf[4096];
++    if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf)) < 0) {
++        return "";
++    }
++    return buf;
++}
++
++// which layers use sliding-window attention: "<arch>.attention.sliding_window_pattern" of the GGUF header, a bool/int
++// array per layer or a period; -1 when unknown (array metadata is not exposed by llama_model_meta_val_str)
++std::vector<int> read_swa_pattern(const std::string & path, const std::string & arch, int n_layer) {
++    std::vector<int> swa(n_layer, -1);
++    gguf_init_params ip = { /*no_alloc*/ true, /*ctx*/ nullptr };
++    gguf_context * ctx = gguf_init_from_file(path.c_str(), ip);
++    if (!ctx) {
++        return swa;
++    }
++    const int64_t id = gguf_find_key(ctx, (arch + ".attention.sliding_window_pattern").c_str());
++    if (id >= 0 && gguf_get_kv_type(ctx, id) == GGUF_TYPE_ARRAY) {
++        const gguf_type type = gguf_get_arr_type(ctx, id);
++        const size_t  n     = gguf_get_arr_n(ctx, id);
++        const void  * data  = gguf_get_arr_data(ctx, id);
++        for (int il = 0; il < n_layer && (size_t) il < n; ++il) {
++            switch (type) {
++                case GGUF_TYPE_BOOL:
++                case GGUF_TYPE_UINT8:
++                case GGUF_TYPE_INT8:   swa[il] = ((const uint8_t  *) data)[il] != 0; break;
++                case GGUF_TYPE_UINT32:
++                case GGUF_TYPE_INT32:  swa[il] = ((const uint32_t *) data)[il] != 0; break;
++                default: break;
++            }
++        }
++    } else if (id >= 0 && gguf_get_kv_type(ctx, id) == GGUF_TYPE_UINT32) {
++        // a period: every n-th layer is full attention (llama_hparams::set_swa_pattern)
++        const uint32_t period = gguf_get_val_u32(ctx, id);
++        for (int il = 0; il < n_layer && period > 0; ++il) {
++            swa[il] = (uint32_t) il % period != period - 1;
++        }
++    }
++    gguf_free(ctx);
++    return swa;
++}
++
++} // namespace
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    // the tool's own option, stripped before the common parser sees the arguments
++    bool with_swa = false;
++    std::vector<char *> args;
++    for (int i = 0; i < argc; ++i) {
++        if (strcmp(argv[i], "--swa") == 0) {
++            with_swa = true;
++        } else {
++            args.push_back(argv[i]);
++        }
++    }
++
++    common_params params;
++    common_init();
++    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    capture cap;
++    params.cb_eval           = cb_eval;
++    params.cb_eval_user_data = &cap;
++    params.warmup            = false;
++
++    auto llama_init = common_init_from_params(params);
++    auto * model = llama_init->model();
++    auto * ctx   = llama_init->context();
++    if (model == nullptr || ctx == nullptr) {
++        LOG_ERR("%s : failed to init\n", __func__);
++        return 1;
++    }
++
++    const std::string arch = meta(model, "general.architecture");
++    if (arch != "inkling2_loop") {
++        LOG_ERR("%s : the model is a %s, not an inkling2_loop\n", __func__, arch.c_str());
++        return 1;
++    }
++    const int n_phys     = atoi(meta(model, arch + ".block_count").c_str());
++    const int core_start = atoi(meta(model, arch + ".loop.start").c_str());
++    const int core_end   = atoi(meta(model, arch + ".loop.end").c_str());
++    const int n_passes   = atoi(meta(model, arch + ".loop.count").c_str());
++    if (n_phys <= 0 || core_start < 0 || core_end <= core_start || n_passes < 2) {
++        LOG_ERR("%s : invalid loop metadata: %d layers, core [%d, %d), %d passes\n", __func__, n_phys, core_start, core_end, n_passes);
++        return 1;
++    }
++    const std::vector<int> swa = read_swa_pattern(params.model.path, arch, n_phys);
++    std::string pattern;
++    for (int v : swa) {
++        pattern += v < 0 ? '?' : v ? 's' : 'F';
++    }
++
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, llama_vocab_get_add_bos(vocab), true);
++    if (tokens.empty()) {
++        LOG_ERR("%s : no input tokens, give a prompt with -p or -f\n", __func__);
++        return 1;
++    }
++    LOG_INF("%s: %zu tokens, %d physical layers, core [%d, %d), %d passes, layers %s (s = SWA, F = full)\n", __func__,
++            tokens.size(), n_phys, core_start, core_end, n_passes, pattern.c_str());
++
++    common_batch batch = common_batch_get_one(ctx, tokens);
++    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
++        LOG_ERR("%s : failed to decode\n", __func__);
++        return 1;
++    }
++
++    // a fingerprint of the last logits, to compare runs cheaply
++    {
++        const int n_vocab = llama_vocab_n_tokens(vocab);
++        const float * logits = llama_get_logits_ith(ctx, -1);
++        double sum = 0, abs_sum = 0;
++        bool finite = true;
++        for (int i = 0; i < n_vocab; ++i) {
++            finite = finite && std::isfinite(logits[i]);
++            sum     += logits[i];
++            abs_sum += std::fabs(logits[i]);
++        }
++        LOG("\nlast logits: %s, sum = %.9g, abs sum = %.9g\n", finite ? "finite" : "NOT FINITE", sum, abs_sum);
++    }
++
++    // the cache slot of physical layer ip in the given pass
++    auto slot = [&](int ip, int pass) {
++        return pass == 0 ? ip : n_phys + (pass - 1)*(core_end - core_start) + (ip - core_start);
++    };
++
++    LOG("\npass p vs pass 1 of the same physical layer (reference: pass 1); cos over (token, head) vectors\n");
++    LOG("%5s %5s %5s %5s %6s %6s  %9s %9s %9s %9s\n", "layer", "type", "slotA", "slotB", "pass", "tensor", "cos_mean", "cos_min", "relL2", "relL2vec");
++    bool any = false;
++    for (int ip = core_start; ip < core_end; ++ip) {
++        const bool is_swa = swa[ip] == 1;
++        if (is_swa && !with_swa) {
++            continue;
++        }
++        const char * type = swa[ip] < 0 ? "?" : is_swa ? "swa" : "full";
++        for (int pass = 1; pass < n_passes; ++pass) {
++            const int a = slot(ip, 0);
++            const int b = slot(ip, pass);
++            for (const char * kind : KINDS) {
++                const auto & per_slot = cap.data[kind];
++                auto ia = per_slot.find(a);
++                auto ib = per_slot.find(b);
++                if (ia == per_slot.end() || ib == per_slot.end()) {
++                    LOG("%5d %5s %5d %5d %6d %6s  %s\n", ip, type, a, b, pass + 1, kind, ia == per_slot.end() ? "(slot A not captured)" : "(slot B not captured, shared KV?)");
++                    continue;
++                }
++                // the (token, head) vectors: Kcur/Vcur give the head size, the pre-convolution tensors are flat
++                const std::string cur_kind = kind[0] == 'K' ? "Kcur" : "Vcur";
++                const int64_t head_dim = cap.ne0[cur_kind].count(a) ? cap.ne0[cur_kind][a] : cap.ne0[kind][a];
++                if (ia->second.size() != ib->second.size()) {
++                    LOG("%5d %5s %5d %5d %6d %6s  size mismatch %zu vs %zu\n", ip, type, a, b, pass + 1, kind, ia->second.size(), ib->second.size());
++                    continue;
++                }
++                const stats s = compare(ia->second, ib->second, head_dim);
++                LOG("%5d %5s %5d %5d %6d %6s  %9.5f %9.5f %9.5f %9.5f\n", ip, type, a, b, pass + 1, kind, s.cos_mean, s.cos_min, s.rel_l2, s.rel_l2_vec);
++                any = true;
++            }
++        }
++    }
++    if (!any) {
++        LOG("no layer pair compared (SWA core only? add --swa)\n");
++    }
++
++    LOG("\n");
++    llama_perf_context_print(ctx);
++    llama_backend_free();
++    return 0;
++}

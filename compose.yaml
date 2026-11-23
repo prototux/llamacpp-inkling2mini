@@ -1,0 +1,51 @@
+# Inkling 2 Mini on one NVIDIA GPU, from the prebuilt image.
+#
+#   cp .env.example .env              # optional, every setting has a default
+#   docker compose up -d              # needs the model files in ./models (README, "Model files")
+#   docker compose --profile download run --rm download   # or fetch them (online, ~14 GB)
+#
+# The server listens on 127.0.0.1:8080: OpenAI-compatible API under /v1 and the llama.cpp web UI on /.
+name: inkling
+
+services:
+  inkling:
+    image: ${IMAGE:-ghcr.io/prototux/llamacpp-inkling2mini:latest}
+    pull_policy: missing
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ${MODELS_DIR:-./models}:/models:ro
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8080}:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      # loading 14 GB from a cold disk and sizing the context takes a while
+      start_period: 10m
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # one-shot: fetch and verify the model files into ./models, then exit (needs network)
+  download:
+    profiles: [download]
+    image: docker.io/curlimages/curl:8.17.0
+    user: "${UID:-1000}:${GID:-1000}"
+    entrypoint: ["/bin/sh", "/download-models.sh"]
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+      - ./scripts/download-models.sh:/download-models.sh:ro
+    restart: "no"

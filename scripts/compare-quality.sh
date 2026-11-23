@@ -105,27 +105,32 @@ def tf_stats(name, path):
     return len(blocks), complete, len(text), "..." in text
 
 ref = probs(names[0]) if names else None
-print(f"{'config':<20}{'max |dp|':>10}{'mean KL':>10}   terraform runs: resources/complete (chars)")
+print(f"{'config':<20}{'max |dp|':>10}{'mean KL':>10}{'same':>6}   terraform runs: resources/complete (chars)")
 for n in names:
     p = probs(n)
     if p is None or ref is None:
         dp = kl = float("nan")
+        n_pos = 0
     else:
-        dps, kls = [], []
+        dps, kls, n_pos = [], [], 0
+        # only up to the first different greedy token: after it the two texts differ, so positions do not match
         for a, b in zip(ref, p):
+            if max(a, key=a.get, default=None) != max(b, key=b.get, default=None):
+                break
+            n_pos += 1
             for tok, pa in a.items():
                 pb = b.get(tok, 1e-6)
                 dps.append(abs(pa - pb))
                 if pa > 0:
                     kls.append(pa * math.log(pa / max(pb, 1e-6)))
         dp = max(dps) if dps else float("nan")
-        kl = sum(kls) / max(len(ref), 1)
+        kl = sum(kls) / max(n_pos, 1)
     runs = []
     for f in sorted(os.listdir(out)):
         if f.startswith(n + ".tf") and f.endswith(".json"):
             st = tf_stats(n, os.path.join(out, f))
             runs.append("err" if st is None else f"{st[0]}/{st[1]} ({st[2]}{', ...' if st[3] else ''})")
-    print(f"{n:<20}{dp:>10.4f}{kl:>10.4f}   {'  '.join(runs)}")
-print(f"reference for the probabilities: {names[0] if names else '-'}")
+    print(f"{n:<20}{dp:>10.4f}{kl:>10.4f}{n_pos:>6}   {'  '.join(runs)}")
+print(f"reference for the probabilities: {names[0] if names else '-'}; 'same': greedy tokens before the first different one")
 EOF
 echo "raw answers and logs in $out"

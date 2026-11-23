@@ -187,3 +187,45 @@ first mismatching product, element and values.
   which then needs no quantize launch at all.
 - The whole layer application as one cooperative kernel (grid sync between phases, 82 SMs) once the pieces above
   are each verified on the 3090.
+
+## Branch `megakernel`, iteration 3: self-quantizing products (stages proj, wo, moe)
+
+The common piece: `mul_mat_vec_q_selfq<type, small_k>` (mmvq.cu). A block quantizes the input of its product to q8_1
+in shared memory with the arithmetic of `quantize_q8_1` (one lane per value, warp max and warp sum over 32 lanes,
+`d = amax/127`, `q = roundf(x/d)`, `ds = (d, d*sum)`), optionally after `sigmoid(g)*x` with the expression of the
+fused SIGMOID+MUL kernel, then runs the ncols_dst == 1 body of `mul_mat_vec_q` on it. No quantize launch, no pool
+allocation, bit-identical to quantize + mmvq. Types: Q4_0, Q5_0, Q8_0, Q2_K..Q6_K, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+IQ4_XS, IQ4_NL, NVFP4, MXFP4 (all attention and expert types of UD-Q3_K_XL); inputs up to 3072 values.
+
+| Stage | Switch | Fuses | Launches saved per layer application | Per token |
+|---|---|---|---|---|
+| proj | `LLAMA_INKLING_MK_PROJ=1` (`=2`: the iteration-2 variant with separate quantize launches) | the run of one-token quantized MUL_MATs (Q, R, K, V, gate): one kernel per weight type, inputs quantized in-kernel | pass-1 layers 10 -> 1 (-9), loop layers 10 -> 1 (-9), tail layers one per type group | ~430 |
+| wo | `LLAMA_INKLING_MK_WO=1` | SIGMOID(gate), MUL(attn, .), MUL_MAT(wo, .) as one self-quantizing product (the gate run in `ggml_cuda_try_fuse` before the generic UNARY+MUL fusion) | 3 -> 1 (-2) | ~96 |
+| moe | `LLAMA_INKLING_MK_MOE=1` | a one-token MUL_MAT_ID (gate_up: the token for every expert slot; down: one input per slot) quantizes its slots' inputs in the kernel; taken in `ggml_cuda_mul_mat_id` under exactly the conditions of the mmvq path | 2 x (2 -> 1) (-2) | ~96 |
+
+Estimate for all three on: ~620 launches fewer per token out of ~2500, at ~2-5 us each: -1.5 to -3 ms per token,
+75 -> ~85-95 tok/s. Lossless by construction (same bytes into the same dot-product code).
+
+Rules kept (from the 3090 failures of iterations 1-2): no arithmetic on a possibly-null pointer before its null check
+(`g != nullptr` guards the gate reads); no container of `ggml_cuda_pool_alloc` (the self-quantizing kernels allocate
+nothing; `=2` keeps the coordinator's single-allocation fix).
+
+Self-test `test-inkling-megakernel` (target of the same name), now with CUDA graphs enabled: every run builds a
+fresh graph object, its first evaluation is captured and the 50 timed ones replay it, as llama-server does; the
+timed numbers are therefore replay times. Cases: proj x8 (core one/three inputs, layer 18/20/22 type mixes, two
+products, eight products with eight distinct inputs and with shared inputs = pool stress), proj2 (four inputs,
+the separate-quantize variant), wo x2 (Q8_0, Q6_K), moe gate_up x5 (NVFP4, IQ3_XXS, IQ3_S, IQ2_S, Q3_K; 16
+experts, 8 used) and down x2 (NVFP4, IQ4_NL; one input per slot). Each prints `PASS/FAIL ref <us> fused <us>` and
+on FAIL max abs/rel error and the first mismatching output/element/values.
+
+Commands (compose service):
+```
+docker compose run --rm --no-deps --entrypoint /app/test-inkling-megakernel inkling
+docker compose run --rm --no-deps -e LLAMA_INKLING_MK_DEBUG=1 -e CUDA_LAUNCH_BLOCKING=1 --entrypoint /app/test-inkling-megakernel inkling
+docker compose run --rm --no-deps -e LLAMA_INKLING_MK_PROJ=1 -e LLAMA_INKLING_MK_WO=1 -e LLAMA_INKLING_MK_MOE=1 --entrypoint /app/test-llama-archs inkling -a 'inkling2.*'
+# then greedy identity and bench.py decode with the three switches, one at a time and together
+```
+
+Next: stage "glue" (rs gather + the three norms + the four controllers as one kernel per layer application that also
+emits the q8_1 bytes for the projection kernel; needs the realugbun kernels refactored into device functions to stay
+bit-identical), then the layer application as one cooperative kernel.

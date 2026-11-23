@@ -31,7 +31,10 @@ configs=(
     "vec-gqa|LLAMA_INKLING_FA_VEC_GQA=1"
     "multi-stream|GGML_CUDA_GRAPH_OPT=2"
     "mk-proj|LLAMA_INKLING_MK_PROJ=1"
-    "all-on|LLAMA_INKLING_NO_MASK=1 LLAMA_INKLING_FA_VEC_GQA=1 GGML_CUDA_GRAPH_OPT=2 LLAMA_INKLING_MK_PROJ=1"
+    "mk-proj-nographs|LLAMA_INKLING_MK_PROJ=1 GGML_CUDA_DISABLE_GRAPHS=1"
+    "mk-wo|LLAMA_INKLING_MK_WO=1"
+    "mk-moe|LLAMA_INKLING_MK_MOE=1"
+    "all-on|LLAMA_INKLING_NO_MASK=1 LLAMA_INKLING_FA_VEC_GQA=1 GGML_CUDA_GRAPH_OPT=2 LLAMA_INKLING_MK_WO=1 LLAMA_INKLING_MK_MOE=1"
 )
 
 env_flags() { local f=() w; for w in $1; do f+=(-e "$w"); done; printf '%s\n' "${f[@]}"; }
@@ -78,7 +81,7 @@ if has_step kernels; then
     done
     # megakernel stage self-test: fused vs reference on random weights at the real Inkling shapes, with timings
     if run_tool "$out/megakernel.log" "" /app/test-inkling-megakernel; then
-        note "$(grep -E '^proj ' "$out/megakernel.log" | sed 's/^/  /')"
+        note "$(grep -E '^(proj|proj2|steps|wo|moe)' "$out/megakernel.log" | sed 's/^/  /')"
         if grep -q FAIL "$out/megakernel.log"; then note "FAIL megakernel self-test ($out/megakernel.log)"; else note "PASS megakernel self-test"; fi
     else
         note "FAIL megakernel self-test crashed: rerun with debug ($out/megakernel-debug.log)"
@@ -126,8 +129,19 @@ if has_step bench; then
         stop_server
         note "$name: $(grep -E 'decode code|decode prose' "$out/bench-$name.log" | tr '\n' ' ')"
     done
-    python3 scripts/compare.py "$out"/bench-baseline.json "$out"/bench-defaults.json "$out"/bench-multi-stream.json "$out"/bench-mk-proj.json "$out"/bench-all-on.json \
+    python3 scripts/compare.py "$out"/bench-baseline.json "$out"/bench-defaults.json "$out"/bench-multi-stream.json "$out"/bench-mk-wo.json "$out"/bench-mk-moe.json "$out"/bench-all-on.json \
         > "$out/compare.txt" 2>&1 && tee -a "$summary" < "$out/compare.txt"
+fi
+
+# MK_PROJ run log: the fused runs of a real server, for the bug under investigation (DSpark draft graphs included)
+if has_step identity; then
+    if start_server "CTX=$ctx VISION=off DSPARK=${DSPARK:-off} LLAMA_INKLING_MK_PROJ=1 LLAMA_INKLING_MK_DEBUG=1"; then
+        curl -fs "http://127.0.0.1:$port/completion" -H 'Content-Type: application/json' \
+            -d '{"prompt": "Count from 1 to 20.", "n_predict": 64, "temperature": 0}' > /dev/null
+        docker logs inkling-test > "$out/mk-proj-runs.log" 2>&1
+        note "MK_PROJ run log: $out/mk-proj-runs.log"
+    fi
+    stop_server
 fi
 
 if has_step context; then

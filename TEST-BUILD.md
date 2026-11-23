@@ -1,4 +1,4 @@
-# megakernel test build (rev 4.1)
+# megakernel test build (rev 5)
 
 The GitHub repository (prototux/llamacpp-inkling2mini, build-2) plus two patches that are not published yet:
 

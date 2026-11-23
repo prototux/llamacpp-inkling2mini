@@ -46,12 +46,36 @@ run() {  # run <name> <env words, comma or space separated>
             -e "CTX=$ctx" -e VISION=off -e DSPARK=off "${ef[@]}" inkling >/dev/null; then
         echo "$name: server did not start"; return
     fi
-    for _ in $(seq 1 120); do curl -fs "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 5; done
-    curl -fs "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' -d "$(python3 -c '
+    local ready=0
+    for _ in $(seq 1 120); do
+        if curl -fs "http://127.0.0.1:$port/health" >/dev/null 2>&1; then ready=1; break; fi
+        docker inspect inkling-bisect >/dev/null 2>&1 || break   # the server exited
+        sleep 5
+    done
+    if [[ $ready -eq 0 ]]; then
+        echo "server not ready" > "$out/$name.err"
+    else
+        # keep the raw answer: an HTTP error or an empty message is reported instead of being read as text
+        curl -sS --max-time 3600 "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
+            -o "$out/$name.json" -w '%{http_code}' -d "$(python3 -c '
 import json, sys
 print(json.dumps({"messages": [{"role": "user", "content": sys.argv[1]}], "max_tokens": int(sys.argv[2]),
-                  "temperature": 0, "seed": 1, "cache_prompt": False}))' "$prompt" "$n")" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])' > "$out/$name.txt"
+                  "temperature": 0, "seed": 1, "cache_prompt": False}))' "$prompt" "$n")" > "$out/$name.http" 2> "$out/$name.err"
+        python3 - "$out/$name" <<'PY'
+import json, sys
+base = sys.argv[1]
+try:
+    msg = json.load(open(base + ".json"))["choices"][0]["message"]
+    text = msg.get("content") or ""
+    if not text:
+        text = msg.get("reasoning_content") or ""
+    open(base + ".txt", "w").write(text)
+    if not text:
+        open(base + ".err", "a").write("empty answer\n")
+except Exception as e:
+    open(base + ".err", "a").write(f"no answer: HTTP {open(base + '.http').read().strip()}: {e}: {open(base + '.json').read()[:300] if __import__('os').path.exists(base + '.json') else ''}\n")
+PY
+    fi
     docker logs inkling-bisect > "$out/$name.log" 2>&1
     docker rm -f inkling-bisect >/dev/null 2>&1
 }
@@ -71,14 +95,21 @@ def loop_score(text):
     grams = [tuple(w[i:i + 8]) for i in range(len(w) - 7)]
     return 0.0 if not grams else 1 - len(set(grams)) / len(grams)
 base = open(os.path.join(out, "baseline.txt")).read() if os.path.exists(os.path.join(out, "baseline.txt")) else ""
+if not base.strip():
+    print("WARNING: the baseline produced no text, so the 'first diff' column is meaningless")
 print(f"{'config':<20}{'chars':>7}{'first diff vs baseline':>24}{'loop score':>12}")
-for f in sorted(os.listdir(out)):
-    if not f.endswith(".txt") or f == "report.txt":
+names = sorted({f.rsplit(".", 1)[0] for f in os.listdir(out) if f.endswith((".txt", ".err", ".log")) and f != "report.txt"})
+for name in names:
+    err = open(os.path.join(out, name + ".err")).read().strip() if os.path.exists(os.path.join(out, name + ".err")) else ""
+    t = open(os.path.join(out, name + ".txt")).read() if os.path.exists(os.path.join(out, name + ".txt")) else ""
+    if err or not t.strip():
+        log = os.path.join(out, name + ".log")
+        tail = open(log).read().strip().splitlines()[-3:] if os.path.exists(log) else []
+        print(f"{name:<20} ERROR: {err or 'no text'} | server log: {' / '.join(tail)[:300]}")
         continue
-    t = open(os.path.join(out, f)).read()
     d = next((i for i, (a, b) in enumerate(zip(base, t)) if a != b), min(len(base), len(t)))
     same = "identical" if t == base else f"char {d}"
     flag = "  <-- LOOP" if loop_score(t) > 0.3 else ""
-    print(f"{f[:-4]:<20}{len(t):>7}{same:>24}{loop_score(t):>12.2f}{flag}")
+    print(f"{name:<20}{len(t):>7}{same:>24}{loop_score(t):>12.2f}{flag}")
 EOF
 echo "texts and logs in $out"

@@ -30,7 +30,7 @@ serve() {  # serve <name> <env words>: start, run one long greedy generation, sa
     for w in $2; do ef+=(-e "$w"); done
     docker rm -f inkling-diag >/dev/null 2>&1
     docker compose run -d --rm --name inkling-diag --no-deps -p "127.0.0.1:$port:8080" \
-        -e CTX=32768 -e VISION=off -e DSPARK=off -e GGML_CUDA_DISABLE_GRAPHS=1 "${ef[@]}" inkling >/dev/null || { echo "$name: server did not start" | tee -a "$summary"; return; }
+        -e CTX=32768 -e VISION=off -e DSPARK=off -e GGML_CUDA_DISABLE_GRAPHS=1 -e LLAMA_ARG_LOG_VERBOSITY=4 "${ef[@]}" inkling >/dev/null || { echo "$name: server did not start" | tee -a "$summary"; return; }
     local ok=0
     for _ in $(seq 1 120); do
         if curl -fs "http://127.0.0.1:$port/health" >/dev/null 2>&1; then ok=1; break; fi

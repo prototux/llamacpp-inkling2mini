@@ -158,7 +158,8 @@ fi
 
 # MK_PROJ run log: the fused runs of a real server, for the bug under investigation (DSpark draft graphs included)
 if has_step identity; then
-    if start_server "CTX=$ctx VISION=off DSPARK=${DSPARK:-off} LLAMA_INKLING_MK_PROJ=1 LLAMA_INKLING_MK_DEBUG=1"; then
+    # verbosity 4: llama-server drops ggml's INFO messages (the MK_DEBUG run log) at its default level
+    if start_server "CTX=$ctx VISION=off DSPARK=${DSPARK:-off} LLAMA_INKLING_MK_PROJ=1 LLAMA_INKLING_MK_DEBUG=1 LLAMA_ARG_LOG_VERBOSITY=4"; then
         curl -fs "http://127.0.0.1:$port/completion" -H 'Content-Type: application/json' \
             -d '{"prompt": "Count from 1 to 20.", "n_predict": 64, "temperature": 0}' > /dev/null
         docker logs inkling-test > "$out/mk-proj-runs.log" 2>&1

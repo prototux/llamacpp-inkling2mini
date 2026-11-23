@@ -13,6 +13,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
+# every run gets the code defaults plus its own settings only, not the switches of .env (compose.yaml reads
+# INKLING_ENV_FILE instead of .env for the server's environment; .env still sets MODELS_DIR, IMAGE, ...)
+INKLING_ENV_FILE=$(mktemp)
+export INKLING_ENV_FILE
+trap 'rm -f "$INKLING_ENV_FILE"' EXIT
+
 out=results/megakernel-$(date +%Y%m%d-%H%M)
 mkdir -p "$out"
 summary=$out/summary.txt

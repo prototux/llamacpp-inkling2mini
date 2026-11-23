@@ -1,8 +1,8 @@
 diff --git a/docs/inkling-moonshot.md b/docs/inkling-moonshot.md
-index 23b8fdd52..3bf96b247 100644
+index 23b8fdd52..e9c10be9c 100644
 --- a/docs/inkling-moonshot.md
 +++ b/docs/inkling-moonshot.md
-@@ -95,3 +95,137 @@ All commands through the compose service; `E` stands for the environment of the
+@@ -95,3 +95,188 @@ All commands through the compose service; `E` stands for the environment of the
     `n_ctx`. For q4_0 run `llama-perplexity -c 8192` against the q8_0 cache and decide on the loss.
  6. Configuration experiments without code: `-ub 2048 -b 2048` for prefill (4x more rows per expert GEMM), and
     `--backend-sampling` for decode (no 800 KB logits copy per token).
@@ -140,6 +140,57 @@ index 23b8fdd52..3bf96b247 100644
 +Next: stage "glue" (rs gather + the three norms + the four controllers as one kernel per layer application that also
 +emits the q8_1 bytes for the projection kernel; needs the realugbun kernels refactored into device functions to stay
 +bit-identical), then the layer application as one cooperative kernel.
++
++## Branch `megakernel`, iteration 4
++
++- `LLAMA_INKLING_MK_PROJ` set: the three attention inputs are expanded before the projections (inkling2.cpp), so a
++  loop pass or full-attention layer fuses {Q, R, K, V, gate} as one run instead of {Q, R}, K, {V, gate}. Verified on
++  the CPU: identical op counts with and without the switch, test-llama-archs passes both ways, LLAMA_GRAPH_DUMP shows
++  the five products consecutive (the test model's per-tensor `.scale` MULs between them do not exist in UD-Q3_K_XL).
++- The 3090 repetition loop with MK_PROJ=1 (rev 5) is still open; the `steps` self-test cases, the MK_DEBUG run log
++  and the DSpark-off / graphs-off comparisons decide the next move before more stages are built on this path.
++
++### Stage "glue" (designed, not implemented)
++One kernel per layer application replacing: rs state gather (GET_ROWS), the depth MIX for the attention inputs, the
++three (loop: four) controllers (CTRL_DOWN + CTRL_OUT each), the three input norms, and the q8_1 quantization of the
++three inputs, i.e. ~14 launches per loop layer application. Plan that keeps bit-identity: move the bodies of
++realugbun's `inkling2_mix`, `inkling2_ctrl_down`, `inkling2_ctrl_out` kernels (inkling2.cu) into `__device__`
++functions parameterized by block-local pointers, keep the existing `__global__` wrappers calling them (no change for
++the unfused path), and write one `__global__` glue kernel whose block runs the phases in sequence with
++`__syncthreads()` between them: mix -> controllers (the three Q/K/V controllers are independent: one block each via
++blockIdx.y, or sequential in one block) -> rms_norm*w (replicating rms_norm_f32's 1024x1 vectorized reduction as
++CTRL_DOWN already does) -> q8_1 quantization (quantize_q8_1 arithmetic) into a global q8_1 buffer that the
++projection kernel takes as `vy` (the `=2` variant's entry point, with the quantize launches dropped). The reductions
++in CTRL_DOWN/OUT mirror mul_mat_vec_f per 32-lane warp, so one block of 1024 threads reproduces them exactly as
++the current kernels do (those use one block per token anyway). Matcher: the node run from GET_ROWS(rs) to the
++third norm's MUL, with the same `inkling2_outside()` input rule. Self-test: the loop-layer prologue on random
++weights (ctrl_down [4608 x 64], gain/forget [64 x 2304] F32, msg_query, norms), bit-identity against the unfused
++chain, under CUDA graphs, with the steps pattern.
++
++### Whole layer application (designed, not implemented)
++A cooperative kernel (cudaLaunchCooperativeKernel, grid = SM count, grid.sync() between phases) running: glue ->
++projections (every block takes rows of every product) -> convs + clips (one block per head) -> flash attention
++(the vec kernel's body per (KV head, split), then a combine phase) -> gate/wo -> conv + residual -> FFN mix/ctrl/norm
++-> router + top-8 -> expert gate_up (8 x 2304 rows across the grid) -> SITU -> down -> weighted reduction -> conv +
++residual. Each phase reuses the device-function bodies of the kernels it replaces, so every phase stays
++bit-identical and can be switched in one at a time; cooperative launches are capturable in CUDA graphs on CUDA 12.
++Risk: register/shared pressure of the union of phases limits occupancy (the vec FA alone wants 128-256 threads x
++few blocks per SM); a persistent kernel walking a device-side op list is the same work with a dispatch loop.
++
++### Iteration 5: never slower than the unfused path
++3090 data (coordinator): MK_WO=1 + MK_MOE=1 together 78 -> 64 tok/s. Cause: `mul_mat_vec_q_selfq` re-quantized the
++whole input in every row block (gate_up: 8 slots x 1152 blocks x 2304 values), far more than the launch it saved.
++Now every self-quantizing entry point quantizes in-kernel only when the products have at most 64 rows in total;
++above that it quantizes each distinct (input, gate) once with one launch into one pool allocation (the gated
++variant `quantize_q8_1_gated` computes `sigmoid(g)*x` with the fused kernel's expression) and runs the multi kernel
++(`mul_mat_vec_q_multi`, now with expert ids for MUL_MAT_ID). Launch counts per layer application: proj 10 -> 2
++(pass-1) / 10 -> 4 (loop: Q/R/gate share one input, K and V have their own); wo 3 -> 2; moe 2 -> 2 (parity: a gain
++needs the producer kernel to emit q8_1, which is the glue stage's job). The self-test now flags any case where the
++fused path is more than 5% slower than the reference as `PERF FAIL` (counted separately from correctness), and the
++MoE cases use 128 experts with 8 routed, the real shape.
++
++Stage "glue" (one kernel per loop layer application for the three controllers + three norms, emitting q8_1 once)
++remains designed (above), not implemented at this checkpoint.
 diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
 index 5ad8d9b3c..37c4ab357 100644
 --- a/ggml/src/ggml-cuda/fattn-vec.cuh
@@ -838,7 +889,7 @@ index 7b9c27789..5275a0dbc 100644
      }
  };
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 6f10428e6..a225afa07 100644
+index 6f10428e6..8064f52ce 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,5 +1,8 @@
@@ -850,7 +901,7 @@ index 6f10428e6..a225afa07 100644
  #include "unary.cuh"
  #include "vecdotq.cuh"
  
-@@ -1688,3 +1691,521 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1688,3 +1691,675 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }
@@ -868,6 +919,8 @@ index 6f10428e6..a225afa07 100644
 +    int nrows[MMVQ_MULTI_MAX];
 +    int ncols_x[MMVQ_MULTI_MAX];
 +    int stride_row_x[MMVQ_MULTI_MAX]; // in blocks
++    const int32_t * ids = nullptr;    // MUL_MAT_ID: the matrix of product m is expert ids[m] of vx[m]
++    size_t          expert_nbytes = 0;
 +};
 +
 +// blockIdx.y: the matrix; blockIdx.x: its row block. The body is the ncols_dst == 1, no-fusion body of mul_mat_vec_q,
@@ -900,6 +953,16 @@ index 6f10428e6..a225afa07 100644
 +    }
 +    const void       * GGML_CUDA_RESTRICT vx = args.vx[m];
 +    const block_q8_1 * GGML_CUDA_RESTRICT y  = args.vy[m];
++    if (args.ids != nullptr) {
++        const int32_t expert = args.ids[m];
++        if (args.debug && expert < 0) {
++            if (threadIdx.x == 0 && threadIdx.y == 0) {
++                printf("mul_mat_vec_q_multi: bad expert id %d at slot %d\n", expert, m);
++            }
++            return;
++        }
++        vx = (const char *) vx + (size_t) expert*args.expert_nbytes;
++    }
 +    float            * GGML_CUDA_RESTRICT dst = args.dst[m];
 +    const int blocks_per_row_x = args.ncols_x[m] / qk;
 +    const int stride_row_x     = args.stride_row_x[m];
@@ -1265,6 +1328,43 @@ index 6f10428e6..a225afa07 100644
 +    X(GGML_TYPE_Q6_K) X(GGML_TYPE_IQ2_XS) X(GGML_TYPE_IQ2_S) X(GGML_TYPE_IQ3_XXS) X(GGML_TYPE_IQ3_S) X(GGML_TYPE_IQ4_XS) \
 +    X(GGML_TYPE_IQ4_NL) X(GGML_TYPE_NVFP4) X(GGML_TYPE_MXFP4)
 +
++// quantize_q8_1 of one row of x*sigmoid(g) (the fused SIGMOID+MUL expression), the same lanes, reductions and
++// rounding as quantize_q8_1 for a single row
++static __global__ void quantize_q8_1_gated(const float * x, const float * g, void * vy, const int ne0) {
++    const int i = blockDim.x*blockIdx.x + threadIdx.x;
++    if (i >= ne0) {
++        return;
++    }
++    block_q8_1 * y = (block_q8_1 *) vy;
++    const int ib  = i / QK8_1;
++    const int iqs = i % QK8_1;
++    const float xi = mmvq_selfq_sigmoid(g[i]) * x[i];
++    float amax = fabsf(xi);
++    amax = warp_reduce_max<QK8_1>(amax);
++    const float  d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++    const int sum = warp_reduce_sum<QK8_1>((int) q);
++    y[ib].qs[iqs] = q;
++    if (iqs > 0) {
++        return;
++    }
++    y[ib].ds = make_half2(d, d * sum);
++}
++
++// Products with more rows than this quantize their inputs with one launch per distinct input into one pool
++// allocation and run mul_mat_vec_q_multi: the in-kernel quantization repeats the whole input in every row block,
++// which costs more than the launch it saves once there are more than a few blocks.
++#define MMVQ_SELFQ_MAX_ROWS 64
++
++static void mul_mat_vec_q_multi_launch_type(ggml_type type, const mmvq_multi_args & args, bool small_k, int max_nrows, cudaStream_t stream) {
++    switch (type) {
++#define MMVQ_SELFQ_CASE(T) case T: mul_mat_vec_q_multi_launch<T>(args, small_k, max_nrows, stream); break;
++        MMVQ_SELFQ_TYPES(MMVQ_SELFQ_CASE)
++#undef MMVQ_SELFQ_CASE
++        default: GGML_ABORT("fatal error");
++    }
++}
++
 +bool ggml_cuda_mul_mat_vec_q_selfq_supported(ggml_type type) {
 +    switch (type) {
 +#define MMVQ_SELFQ_CASE(T) case T:
@@ -1299,6 +1399,86 @@ index 6f10428e6..a225afa07 100644
 +    GGML_ASSERT(n >= 1 && n <= MMVQ_MULTI_MAX);
 +    cudaStream_t stream = ctx.stream();
 +    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++
++    int64_t total_rows = 0;
++    for (int i = 0; i < n; ++i) {
++        total_rows += src0[i]->ne[1];
++    }
++    if (total_rows > MMVQ_SELFQ_MAX_ROWS) {
++        // quantize each distinct (input, gate) once, one pool allocation (LIFO), then the multi kernel per group
++        int    first[MMVQ_MULTI_MAX];
++        size_t offs [MMVQ_MULTI_MAX] = {};
++        size_t total = 0;
++        for (int i = 0; i < n; ++i) {
++            const ggml_tensor * x = src1[i];
++            const ggml_tensor * g = gate != nullptr ? gate[i] : nullptr;
++            first[i] = i;
++            for (int j = 0; j < i; ++j) {
++                if (src1[j] == x && (gate != nullptr ? gate[j] : nullptr) == g) {
++                    first[i] = first[j];
++                    break;
++                }
++            }
++            if (first[i] == i) {
++                offs[i] = total;
++                total  += GGML_PAD(GGML_PAD(x->ne[0], MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1, 256);
++            }
++        }
++        ggml_cuda_pool_alloc<char> q8(ctx.pool(), total);
++        const block_q8_1 * vy[MMVQ_MULTI_MAX] = {};
++        for (int i = 0; i < n; ++i) {
++            if (first[i] != i) {
++                vy[i] = vy[first[i]];
++                continue;
++            }
++            const ggml_tensor * x = src1[i];
++            const ggml_tensor * g = gate != nullptr ? gate[i] : nullptr;
++            GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->ne[0] % QK8_1 == 0);
++            char * q8_i = q8.get() + offs[i];
++            if (g == nullptr) {
++                quantize_row_q8_1_cuda((const float *) x->data, q8_i, x->ne[0], x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
++                        x->nb[3]/sizeof(float), GGML_PAD(x->ne[0], MATRIX_ROW_PADDING), 1, 1, 1, stream);
++            } else {
++                GGML_ASSERT(g->type == GGML_TYPE_F32 && g->nb[0] == sizeof(float) && ggml_nelements(g) == x->ne[0]);
++                const dim3 num_blocks((x->ne[0] + CUDA_QUANTIZE_BLOCK_SIZE - 1)/CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
++                const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
++                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
++                ggml_cuda_kernel_launch(quantize_q8_1_gated, launch_params, (const float *) x->data, (const float *) g->data, (void *) q8_i, (int) x->ne[0]);
++            }
++            vy[i] = (const block_q8_1 *) q8_i;
++        }
++        bool done[MMVQ_MULTI_MAX] = {};
++        for (int i = 0; i < n; ++i) {
++            if (done[i]) {
++                continue;
++            }
++            const ggml_type type = src0[i]->type;
++            GGML_ASSERT(ggml_cuda_mul_mat_vec_q_selfq_supported(type));
++            const bool small_k = mul_mat_vec_q_selfq_small_k_of(type, src0[i]->ne[0], cc);
++            mmvq_multi_args args = {};
++            args.debug = debug;
++            int max_nrows = 0;
++            for (int j = i; j < n; ++j) {
++                if (done[j] || src0[j]->type != type || mul_mat_vec_q_selfq_small_k_of(type, src0[j]->ne[0], cc) != small_k) {
++                    continue;
++                }
++                const ggml_tensor * w = src0[j];
++                GGML_ASSERT(w->ne[2] == 1 && w->ne[3] == 1 && w->nb[0] == ggml_type_size(type) && w->ne[0] % ggml_blck_size(type) == 0);
++                GGML_ASSERT(w->ne[0] == src1[j]->ne[0] && dst[j]->type == GGML_TYPE_F32 && dst[j]->nb[0] == sizeof(float) && dst[j]->ne[0] == w->ne[1]);
++                const int k = args.n++;
++                args.vx[k]           = w->data;
++                args.vy[k]           = vy[j];
++                args.dst[k]          = (float *) dst[j]->data;
++                args.nrows[k]        = (int) w->ne[1];
++                args.ncols_x[k]      = (int) w->ne[0];
++                args.stride_row_x[k] = (int) (w->nb[1] / ggml_type_size(type));
++                max_nrows = std::max(max_nrows, args.nrows[k]);
++                done[j] = true;
++            }
++            mul_mat_vec_q_multi_launch_type(type, args, small_k, max_nrows, stream);
++        }
++        return;
++    }
 +
 +    bool done[MMVQ_MULTI_MAX] = {};
 +    for (int i = 0; i < n; ++i) {
@@ -1355,6 +1535,32 @@ index 6f10428e6..a225afa07 100644
 +    GGML_ASSERT(src0->ne[0] <= MMVQ_SELFQ_MAX_COLS && src0->ne[0] == src1->ne[0] && src0->ne[1] == dst->ne[0] && src0->ne[3] == 1);
 +    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
 +
++    const bool small_k = mul_mat_vec_q_selfq_small_k_of(type, (int) src0->ne[0], cc);
++    if ((int64_t) n_used*src0->ne[1] > MMVQ_SELFQ_MAX_ROWS) {
++        // the expert rows are many: one quantize launch for all slot inputs (as ggml_cuda_mul_mat_vec_q), then the
++        // multi kernel with the expert ids; at parity with the unfused path in launches, never slower
++        const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
++        const int64_t n_y = src1->ne[1];
++        ggml_cuda_pool_alloc<char> q8(ctx.pool(), n_y*ne10_padded*sizeof(block_q8_1)/QK8_1);
++        quantize_row_q8_1_cuda((const float *) src1->data, q8.get(), src1->ne[0], src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float),
++                src1->nb[3]/sizeof(float), ne10_padded, n_y, 1, 1, stream);
++        mmvq_multi_args args = {};
++        args.debug         = debug;
++        args.n             = n_used;
++        args.ids           = (const int32_t *) ids->data;
++        args.expert_nbytes = src0->nb[2];
++        for (int c = 0; c < n_used; ++c) {
++            args.vx[c]           = src0->data;
++            args.vy[c]           = (const block_q8_1 *) (q8.get() + (n_y == 1 ? 0 : c*ne10_padded*sizeof(block_q8_1)/QK8_1));
++            args.dst[c]          = (float *) ((char *) dst->data + c*dst->nb[1]);
++            args.nrows[c]        = (int) src0->ne[1];
++            args.ncols_x[c]      = (int) src0->ne[0];
++            args.stride_row_x[c] = (int) (src0->nb[1] / ggml_type_size(type));
++        }
++        mul_mat_vec_q_multi_launch_type(type, args, small_k, (int) src0->ne[1], stream);
++        return;
++    }
++
 +    mmvq_selfq_args args = {};
 +    args.debug         = debug;
 +    args.n             = n_used;
@@ -1369,7 +1575,6 @@ index 6f10428e6..a225afa07 100644
 +        args.ncols_x[c]      = (int) src0->ne[0];
 +        args.stride_row_x[c] = (int) (src0->nb[1] / ggml_type_size(type));
 +    }
-+    const bool small_k = mul_mat_vec_q_selfq_small_k_of(type, (int) src0->ne[0], cc);
 +    mul_mat_vec_q_selfq_launch_type(type, args, small_k, (int) src0->ne[1], stream);
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
@@ -1435,11 +1640,37 @@ index dd774ce58..310f184e5 100644
  
  static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index d503e8310..200fb06c5 100644
+index d503e8310..a14930e99 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -399,8 +399,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -12,6 +12,17 @@ bool llama_model_inkling2::graph::graph_trim_enabled() {
+     return enabled;
+ }
  
++// LLAMA_INKLING_MK_PROJ set (any value): the three attention inputs are expanded before the projections, so that the
++// K and V norms of a loop pass or full-attention layer do not split the run of projections the CUDA backend fuses
++// (ggml_cuda_mk_proj_match); unset, the graph is exactly the one without the fusion
++static bool inkling_mk_proj_order() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_INKLING_MK_PROJ");
++        return env && atoi(env) != 0;
++    }();
++    return enabled;
++}
++
+ // LLAMA_INKLING_DECODE_SINKS=0 folds the sink into the bias table for one-token graphs too (SUB + FILL per layer)
+ bool llama_model_inkling2::graph::decode_sinks_enabled() {
+     static const bool enabled = [] {
+@@ -397,10 +408,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         inputs[2] = build_norm(inputs[2], layer.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
+     }
+ 
++    if (inkling_mk_proj_order()) {
++        for (int j = 0; j < 3; ++j) {
++            ggml_build_forward_expand(gf, inputs[j]);
++        }
++    }
++
      // self-attention
      {
 +        // the projections first and next to each other in the graph: the quantized ones (Q, R, K, V, gate) form one
@@ -1452,7 +1683,7 @@ index d503e8310..200fb06c5 100644
  
          // a slot that shares the KV cache of another slot (inkling2_loop, LLAMA_INKLING_SHARE_LOOP_KV) computes
          // no K and V: build_attn() reads the source slot's cache, which the source stored earlier in this graph
-@@ -411,7 +416,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -411,7 +433,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
              Vcur = build_lora_mm(layer.wv, inputs[2]);
              cb(Kcur, "Kpre", il);
              cb(Vcur, "Vpre", il);
@@ -1461,15 +1692,15 @@ index d503e8310..200fb06c5 100644
 +        }
 +        ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, inputs[0]);
 +        ggml_build_forward_expand(gf, gate);
-+
+ 
 +        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 +        ggml_build_forward_expand(gf, sinks);
- 
++
 +        if (Kcur) {
              Kcur = convolve(Kcur, layer.attn_k_conv,
                      is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
              Vcur = convolve(Vcur, layer.attn_v_conv,
-@@ -435,8 +449,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -435,8 +466,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          cb(Qcur, "Qcur", il);
          cb(Rcur, "Rcur", il);
  
@@ -1478,7 +1709,7 @@ index d503e8310..200fb06c5 100644
          // the far bin (distance >= extent) is the zero row of the padded table
          ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
  
-@@ -464,7 +476,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -464,7 +493,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                  nullptr, nullptr, nullptr,
                  Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
  
@@ -1683,10 +1914,10 @@ index 6b8fb1b3a..a41a9460e 100644
  }
 diff --git a/tests/test-inkling-megakernel.cpp b/tests/test-inkling-megakernel.cpp
 new file mode 100644
-index 000000000..28a359b90
+index 000000000..c78180b30
 --- /dev/null
 +++ b/tests/test-inkling-megakernel.cpp
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,495 @@
 +// The Inkling 2 decode megakernel stages against the reference CUDA path, on random weights in the quant types of
 +// UD-Q3_K_XL, at the real shapes of one layer application. Each stage is toggled through its environment switch
 +// between two evaluations of the same graph; the outputs must be bit-identical; the time per evaluation is printed
@@ -1719,6 +1950,7 @@ index 000000000..28a359b90
 +#include <vector>
 +
 +static uint32_t g_state = 12345u;
++static int g_perf_fail = 0; // cases where the fused path is slower than the reference
 +static float frand() {
 +    g_state = g_state*1664525u + 1013904223u;
 +    return float(g_state >> 8)/float(1u << 24) - 0.5f;
@@ -1812,7 +2044,11 @@ index 000000000..28a359b90
 +            }
 +        }
 +    }
-+    printf("%-5s %-32s %s  ref %8.1f us  fused %8.1f us%s\n", stage, name, ok ? "PASS" : "FAIL", ref.us, mk.us, ok ? "" : "  (bit-identity required)");
++    // never slower than the reference: more than 5% slower is a perf FAIL (counted apart from the correctness result)
++    const bool perf_ok = mk.us <= 1.05*ref.us;
++    g_perf_fail += !perf_ok;
++    printf("%-5s %-32s %s  ref %8.1f us  fused %8.1f us%s%s\n", stage, name, ok ? "PASS" : "FAIL", ref.us, mk.us,
++            ok ? "" : "  (bit-identity required)", perf_ok ? "" : "  PERF FAIL (slower than the reference)");
 +    if (!ok) {
 +        printf("      max abs %.3g, max rel %.3g, %s\n", max_abs, max_rel, first.c_str());
 +    }
@@ -1892,15 +2128,21 @@ index 000000000..28a359b90
 +        printf("moe   %-32s SKIP (%s needs an importance matrix to quantize random weights)\n", name, ggml_type_name(type));
 +        return true;
 +    }
-+    const int n_expert = 16, n_used = 8;
-+    const std::vector<uint8_t> w = random_weights(type, n_in, n_out*n_expert);
++    // the real expert count: 128 experts, 8 used, so that the timing is the one of a layer application
++    const int n_expert = 128, n_used = 8;
++    std::vector<uint8_t> w;
++    w.reserve(ggml_row_size(type, n_in)*n_out*n_expert);
++    for (int e = 0; e < n_expert; ++e) {
++        const std::vector<uint8_t> we = random_weights(type, n_in, n_out);
++        w.insert(w.end(), we.begin(), we.end());
++    }
 +    std::vector<float> x(n_in*(per_slot_inputs ? n_used : 1));
 +    for (float & v : x) {
 +        v = 2.0f*frand();
 +    }
 +    int32_t ids[n_used];
 +    for (int i = 0; i < n_used; ++i) {
-+        ids[i] = (3*i + 5) % n_expert;
++        ids[i] = (37*i + 5) % n_expert; // 8 distinct experts spread over the 128
 +    }
 +    return compare_stage("moe", "LLAMA_INKLING_MK_MOE", name, backend, {"experts"}, [&](ggml_context * ctx, ggml_cgraph * gf, std::vector<ggml_tensor *> & outputs, std::vector<std::pair<ggml_tensor *, const void *>> & data) {
 +        ggml_tensor * tw  = ggml_new_tensor_3d(ctx, type, n_in, n_out, n_expert);
@@ -2168,7 +2410,7 @@ index 000000000..28a359b90
 +    if (n_run == 0) {
 +        printf("no non-CPU backend: nothing to compare\n");
 +    }
-+    printf("%d of %d cases failed\n", n_fail, n_run);
++    printf("%d of %d cases failed, %d slower than the reference\n", n_fail, n_run, g_perf_fail);
 +    return n_fail == 0 ? 0 : 1;
 +}
 diff --git a/tests/test-sched-streams.cpp b/tests/test-sched-streams.cpp

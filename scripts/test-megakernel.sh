@@ -81,7 +81,7 @@ if has_step kernels; then
     done
     # megakernel stage self-test: fused vs reference on random weights at the real Inkling shapes, with timings
     if run_tool "$out/megakernel.log" "" /app/test-inkling-megakernel; then
-        note "$(grep -E '^(proj|proj2|steps|wo|moe)' "$out/megakernel.log" | sed 's/^/  /')"
+        note "$(grep -E '^(proj|proj2|steps|wo|moe)|PERF FAIL|slower than the reference' "$out/megakernel.log" | sed 's/^/  /')"
         if grep -q FAIL "$out/megakernel.log"; then note "FAIL megakernel self-test ($out/megakernel.log)"; else note "PASS megakernel self-test"; fi
     else
         note "FAIL megakernel self-test crashed: rerun with debug ($out/megakernel-debug.log)"

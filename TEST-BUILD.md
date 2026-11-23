@@ -1,4 +1,4 @@
-# megakernel test build (rev 5)
+# megakernel test build (rev 6)
 
 The GitHub repository (prototux/llamacpp-inkling2mini, build-2) plus two patches that are not published yet:
 
@@ -11,6 +11,10 @@ Rev 4 fixes the CUDA pool abort ("GGML_ASSERT(ptr == ... pool_used)") with `LLAM
 (`test-inkling-megakernel`), and attention tests that should pinpoint the `LLAMA_INKLING_KV_TYPE_FULL=q4_0` garbage:
 the q4_0 lines of the bias tests say which kernel is wrong (1 query = vec kernel, 128/512 = tile/MMA loader).
 Design and estimates: [docs/MOONSHOT.md](docs/MOONSHOT.md).
+
+Rev 6: MK_WO and MK_MOE were slower than unfused on the 3090 (78 -> 64 tok/s, every GPU block re-quantized the
+whole input); they now quantize once above 64 rows and the self-test flags any fused case slower than its
+reference as `PERF FAIL`. With MK_PROJ, the K/V norms move before the projections so every layer fuses all 5.
 
 ## Install from ghcr.io (any machine)
 

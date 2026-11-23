@@ -229,3 +229,54 @@ docker compose run --rm --no-deps -e LLAMA_INKLING_MK_PROJ=1 -e LLAMA_INKLING_MK
 Next: stage "glue" (rs gather + the three norms + the four controllers as one kernel per layer application that also
 emits the q8_1 bytes for the projection kernel; needs the realugbun kernels refactored into device functions to stay
 bit-identical), then the layer application as one cooperative kernel.
+
+## Branch `megakernel`, iteration 4
+
+- `LLAMA_INKLING_MK_PROJ` set: the three attention inputs are expanded before the projections (inkling2.cpp), so a
+  loop pass or full-attention layer fuses {Q, R, K, V, gate} as one run instead of {Q, R}, K, {V, gate}. Verified on
+  the CPU: identical op counts with and without the switch, test-llama-archs passes both ways, LLAMA_GRAPH_DUMP shows
+  the five products consecutive (the test model's per-tensor `.scale` MULs between them do not exist in UD-Q3_K_XL).
+- The 3090 repetition loop with MK_PROJ=1 (rev 5) is still open; the `steps` self-test cases, the MK_DEBUG run log
+  and the DSpark-off / graphs-off comparisons decide the next move before more stages are built on this path.
+
+### Stage "glue" (designed, not implemented)
+One kernel per layer application replacing: rs state gather (GET_ROWS), the depth MIX for the attention inputs, the
+three (loop: four) controllers (CTRL_DOWN + CTRL_OUT each), the three input norms, and the q8_1 quantization of the
+three inputs, i.e. ~14 launches per loop layer application. Plan that keeps bit-identity: move the bodies of
+realugbun's `inkling2_mix`, `inkling2_ctrl_down`, `inkling2_ctrl_out` kernels (inkling2.cu) into `__device__`
+functions parameterized by block-local pointers, keep the existing `__global__` wrappers calling them (no change for
+the unfused path), and write one `__global__` glue kernel whose block runs the phases in sequence with
+`__syncthreads()` between them: mix -> controllers (the three Q/K/V controllers are independent: one block each via
+blockIdx.y, or sequential in one block) -> rms_norm*w (replicating rms_norm_f32's 1024x1 vectorized reduction as
+CTRL_DOWN already does) -> q8_1 quantization (quantize_q8_1 arithmetic) into a global q8_1 buffer that the
+projection kernel takes as `vy` (the `=2` variant's entry point, with the quantize launches dropped). The reductions
+in CTRL_DOWN/OUT mirror mul_mat_vec_f per 32-lane warp, so one block of 1024 threads reproduces them exactly as
+the current kernels do (those use one block per token anyway). Matcher: the node run from GET_ROWS(rs) to the
+third norm's MUL, with the same `inkling2_outside()` input rule. Self-test: the loop-layer prologue on random
+weights (ctrl_down [4608 x 64], gain/forget [64 x 2304] F32, msg_query, norms), bit-identity against the unfused
+chain, under CUDA graphs, with the steps pattern.
+
+### Whole layer application (designed, not implemented)
+A cooperative kernel (cudaLaunchCooperativeKernel, grid = SM count, grid.sync() between phases) running: glue ->
+projections (every block takes rows of every product) -> convs + clips (one block per head) -> flash attention
+(the vec kernel's body per (KV head, split), then a combine phase) -> gate/wo -> conv + residual -> FFN mix/ctrl/norm
+-> router + top-8 -> expert gate_up (8 x 2304 rows across the grid) -> SITU -> down -> weighted reduction -> conv +
+residual. Each phase reuses the device-function bodies of the kernels it replaces, so every phase stays
+bit-identical and can be switched in one at a time; cooperative launches are capturable in CUDA graphs on CUDA 12.
+Risk: register/shared pressure of the union of phases limits occupancy (the vec FA alone wants 128-256 threads x
+few blocks per SM); a persistent kernel walking a device-side op list is the same work with a dispatch loop.
+
+### Iteration 5: never slower than the unfused path
+3090 data (coordinator): MK_WO=1 + MK_MOE=1 together 78 -> 64 tok/s. Cause: `mul_mat_vec_q_selfq` re-quantized the
+whole input in every row block (gate_up: 8 slots x 1152 blocks x 2304 values), far more than the launch it saved.
+Now every self-quantizing entry point quantizes in-kernel only when the products have at most 64 rows in total;
+above that it quantizes each distinct (input, gate) once with one launch into one pool allocation (the gated
+variant `quantize_q8_1_gated` computes `sigmoid(g)*x` with the fused kernel's expression) and runs the multi kernel
+(`mul_mat_vec_q_multi`, now with expert ids for MUL_MAT_ID). Launch counts per layer application: proj 10 -> 2
+(pass-1) / 10 -> 4 (loop: Q/R/gate share one input, K and V have their own); wo 3 -> 2; moe 2 -> 2 (parity: a gain
+needs the producer kernel to emit q8_1, which is the glue stage's job). The self-test now flags any case where the
+fused path is more than 5% slower than the reference as `PERF FAIL` (counted separately from correctness), and the
+MoE cases use 128 experts with 8 routed, the real shape.
+
+Stage "glue" (one kernel per loop layer application for the three controllers + three norms, emitting q8_1 once)
+remains designed (above), not implemented at this checkpoint.

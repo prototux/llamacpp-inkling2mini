@@ -1,0 +1,63 @@
+diff --git a/common/parsers/inkling.cpp b/common/parsers/inkling.cpp
+index 9c30cdb87..a8f9fd3e0 100644
+--- a/common/parsers/inkling.cpp
++++ b/common/parsers/inkling.cpp
+@@ -98,6 +98,16 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template &
+     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+     auto use_tools           = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
++
++    // the template has no switch that stops thinking (effort 0 still thinks at length), so with thinking disabled
++    // the answer starts in the text channel: Inkling 1 has the header in the generation prompt, Inkling 2 has an
++    // empty one. not with tools: the first block may be a tool call, which has no content token after the header
++    if (!inputs.enable_thinking && !inputs.has_continuation() && inputs.add_generation_prompt && !use_tools) {
++        const std::string pin = string_ends_with(data.generation_prompt, HEADER) ? TEXT :
++                                data.generation_prompt.empty()                   ? HEADER + TEXT : "";
++        data.generation_prompt += pin;
++        data.prompt.append(pin);
++    }
+     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+ 
+     data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 11fa68f6a..f4e314560 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -5665,6 +5665,21 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .expect(message_assist)
+             .run();
+ 
++        // Thinking disabled: the prompt opens the text block, the model writes only the answer
++        tst.test("Hello, world!\nWhat's up?" + E)
++            .enable_thinking(false)
++            .expect(message_assist)
++            .run();
++
++        // Thinking disabled with tools: nothing is pinned, the first block may be a tool call
++        tst.test(P + CALL)
++            .enable_thinking(false)
++            .tools({ special_function_tool })
++            .expect_tool_calls({
++                { "special_function", R"({"arg1":1})", "" },
++            })
++            .run();
++
+         // Thinking block, then content block
+         tst.test(P + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 95c57f877..bb4daa6d5 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1659,6 +1659,11 @@ json oaicompat_chat_params_parse(
+             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+         }
+     }
++    // a server default of --reasoning-effort none disables thinking as a request "none" does, unless the request
++    // sets enable_thinking; a request with another level replaced it above and keeps thinking on
++    if (enable_thinking_kwarg.empty() && json_value(inputs.chat_template_kwargs, "reasoning_effort", std::string()) == "\"none\"") {
++        inputs.enable_thinking = false;
++    }
+ 
+     inputs.force_pure_content = opt.force_pure_content;
+ 

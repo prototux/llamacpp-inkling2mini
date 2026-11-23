@@ -11,6 +11,7 @@ Applied in file-name order with `git apply` on upstream llama.cpp at the commit 
 | `0004-inkling2-attention-prefill-position-bias-q8-kv.patch` | this repository | tensor-core prefill with the bias, position-mode bias, q8_0 K/V read in place, tests |
 | `0005-inkling2-loop-kv-sharing-and-drift-tool.patch` | this repository | opt-in cross-pass KV sharing, `llama-inkling-pass-kv` |
 | `0006-inkling2-dspark-verify-fixes.patch` | this repository; adaptive drafting ported from [#32773](https://github.com/ggml-org/llama.cpp/pull/32773) by Oxsilaris06 | fusable convolution-state chain with rollback snapshots, vec attention kernel for verification batches, adaptive drafting, `LLAMA_DSPARK_BLOCK`, `LLAMA_SPEC_RS_SEQ` |
+| `0009-inkling2-thinking-off-answers-directly.patch` | this repository | with thinking disabled the Inkling parser opens the text block in the prompt (not with tools), and a server default of `--reasoning-effort none` disables thinking; a parser test |
 
 To update: rebase the changes on a newer upstream commit, regenerate the patches with `git diff --binary` between
 the successive steps, set `LLAMA_CPP_COMMIT`, and check that applying them reproduces the tree you tested

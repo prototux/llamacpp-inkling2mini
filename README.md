@@ -28,9 +28,10 @@ vision encoder on the CPU, thinking off, default settings of this repository. "S
 | 3 | Prefill attention on the tensor cores: the MMA kernel adds the bias to its mask tile | this repo | faster time to first token on long prompts (the bias used to force the CUDA-core tile kernel) | `LLAMA_INKLING_FA_MMA` |
 | 4 | Bias bins computed in the attention kernel from token positions | this repo | removes the `context x batch` index table that the CPU filled and uploaded every batch: less VRAM, faster long prefill | `LLAMA_INKLING_POS_BIAS` |
 | 5 | q8_0 KV cache read in place by the prefill kernels | this repo | no F16 copy of the whole cache per batch: ~4 KiB/token of VRAM back for context | `LLAMA_INKLING_FA_Q8_0` |
-| 6 | Optional sharing of the full-attention KV between the 3 passes of the loop core | this repo | ~2x context, **off**: the model was not trained this way, measure quality first | `LLAMA_INKLING_SHARE_LOOP_KV` |
+| 6 | Optional sharing of the full-attention KV between the 3 passes of the loop core | this repo | ~2x context, **off**: long answers degrade into repetition | `LLAMA_INKLING_SHARE_LOOP_KV` |
 | 7 | DSpark speculative decoding | upstream [#32218](https://github.com/ggml-org/llama.cpp/pull/32218) | **off**: ~50% acceptance on code, measured slower than plain decoding on a 3090 before the fixes of row 8 | `DSPARK` |
 | 8 | Speculative-decoding fixes: the target's rollback snapshots no longer break the fused convolution kernels (~1.2-1.5K extra kernel launches per verify step before), verification batches on the vec attention kernel, adaptive drafting from [#32773](https://github.com/ggml-org/llama.cpp/pull/32773), a shorter draft block option | this repo | DSpark verify steps should get much cheaper; not yet measured, so DSpark stays off by default | `LLAMA_INKLING_FA_VEC_VERIFY`, `LLAMA_SPEC_ADAPT`, `LLAMA_DSPARK_BLOCK` |
+| 9 | With thinking off, the prompt opens the answer block | this repo | Inkling 2 thinks at length even at effort 0 (`none`): the thinking used the token budget and long answers came out cut short | `REASONING_EFFORT` |
 
 And the configuration the image runs by default:
 
@@ -180,8 +181,9 @@ The build clones upstream llama.cpp at the commit pinned in the Dockerfile (`LLA
   acceptance was ~50% on code and decoding dropped from 75 to ~63 tok/s on a 3090. Row 8 fixes the main cause found
   (unfused kernels in verification steps); to try it: convert the draft, set `DSPARK=on` and compare with
   `scripts/bench.py`. Adding `BACKEND_SAMPLING=on` and `LLAMA_SPEC_ADAPT=0.33` may help further.
-- **Loop KV sharing (`LLAMA_INKLING_SHARE_LOOP_KV=1`)** changes what the model attends to; check it with
-  `scripts/quality.sh` and `llama-inkling-pass-kv` before using it.
+- **Loop KV sharing (`LLAMA_INKLING_SHARE_LOOP_KV=1`) makes long answers degrade into repetition**: short tests
+  look fine, but a 3000-token greedy Terraform answer diverges from the default after ~60 characters and ends in
+  a loop (`scripts/bisect-loop.sh`). Leave it off.
 - Tool calls with thinking off can fail with "unexpected empty grammar stack" in some setups
   ([#32818](https://github.com/ggml-org/llama.cpp/issues/32818)); `"reasoning_effort": "minimal"` avoids it.
 - `--reasoning-budget` re-arms on every thinking block ([#32836](https://github.com/ggml-org/llama.cpp/issues/32836));

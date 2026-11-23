@@ -6,3 +6,4 @@
 0006-inkling2-dspark-verify-fixes.patch
 0007-inkling2-moonshot-decode-attention-maskless-q4-kv.patch
 0008-cuda-multi-stream-decode-plan.patch
+0009-inkling2-thinking-off-answers-directly.patch

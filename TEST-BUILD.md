@@ -1,4 +1,4 @@
-# megakernel test build (rev 6)
+# megakernel test build (rev 7)
 
 The GitHub repository (prototux/llamacpp-inkling2mini, build-2) plus two patches that are not published yet:
 
@@ -15,6 +15,10 @@ Design and estimates: [docs/MOONSHOT.md](docs/MOONSHOT.md).
 Rev 6: MK_WO and MK_MOE were slower than unfused on the 3090 (78 -> 64 tok/s, every GPU block re-quantized the
 whole input); they now quantize once above 64 rows and the self-test flags any fused case slower than its
 reference as `PERF FAIL`. With MK_PROJ, the K/V norms move before the projections so every layer fuses all 5.
+
+Rev 7: the glue stage (`LLAMA_INKLING_MK_GLUE=1`): the loop controllers, the input norms and their q8_1 quantization
+of a layer in 1-2 kernels (loop-pass attention 14 launches -> 2), the q8_1 consumed directly by the projections and
+the MoE (so MK_MOE becomes a gain). Estimated ~490 fewer launches per token. Not yet run on a GPU.
 
 ## Install from ghcr.io (any machine)
 

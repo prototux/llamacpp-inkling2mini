@@ -280,3 +280,79 @@ MoE cases use 128 experts with 8 routed, the real shape.
 
 Stage "glue" (one kernel per loop layer application for the three controllers + three norms, emitting q8_1 once)
 remains designed (above), not implemented at this checkpoint.
+
+## Branch `megakernel`, iteration 6: the glue stage (`LLAMA_INKLING_MK_GLUE=1`, default off)
+
+Written blind (no GPU here); the three changed CUDA files and the full `test-inkling-megakernel` target compile for sm_86
+with 0 errors, the CPU tests pass, nothing has run on the 3090 yet.
+
+### What one glue instance replaces
+For one token, at the start of the attention and of the FFN of every layer application, the chain after the depth mix:
+
+| layer kind | per input j (1 or 3) | launches today | glue |
+|---|---|---|---|
+| loop pass 2-3 (24 applications) | CTRL_DOWN_j, CTRL_OUT_j, RMS_NORM_j + MUL_j (fused), then the consumers' q8_1 quantize | 3 x 2 + 3 + 3..5 | 2 kernels |
+| pass-1 / non-loop, full attention (4) | RMS_NORM_j + MUL_j x 3, quantize x 5 | 8 | 1 kernel |
+| pass-1 / non-loop, SWA (20) | RMS_NORM + MUL, quantize x 5 (Q, R, K, V, gate quantize the same input separately) | 6 | 1 kernel |
+| FFN, loop pass | CTRL_DOWN, CTRL_OUT, RMS_NORM + MUL, gate_up quantize | 4 | 2 kernels |
+| FFN, other | RMS_NORM + MUL, gate_up quantize | 2 | 1 kernel |
+| output norm | RMS_NORM + MUL, lm_head quantize | 2 | 1 kernel |
+
+Estimate per token, every other MK switch off: 24 x (12 + 2) + 4 x 8 + 20 x 6 + 1 = ~490 launches fewer out of ~2500,
+roughly -1 to -2 ms of 12.8 ms (78 -> ~85-93 tok/s). With MK_PROJ/MK_MOE on, their remaining quantize launches go too
+(proj: 10 -> 2/4 becomes 10 -> 1; moe gate_up: 2 -> 1), so MK_MOE becomes a real gain instead of parity.
+
+### How (ggml/src/ggml-cuda/inkling2.cu, section GLUE)
+- The bodies of `inkling2_ctrl_down_f32` and `inkling2_ctrl_out_f32` moved into `__device__` functions
+  (`inkling2_ctrl_down_block`, one block of 1024 threads = 1024/mmvf_block outputs; `inkling2_ctrl_out_row`, one warp
+  = one output element); the unfused kernels call them unchanged, so they keep their bits and the glue runs the same code.
+- Kernel A `inkling2_glue_ctrl_down_f32`, grid (16, units): the CTRL_DOWN body per unit into a scratch `h` (the three
+  CTRL_DOWN launches of a loop pass as one). Kernel B `inkling2_glue_norm_f32<ctrl>`, grid (72, units) x 1024: one warp
+  per CTRL_OUT row into a scratch row, then `__threadfence` + one `atomicAdd` ticket per block; the last block of a unit
+  resets the counter and normalizes the row (the float4-per-thread sum and `block_reduce<SUM, 1024>` of rms_norm_f32,
+  `rsqrtf(sum/n + eps)`, `(scale*x)*w` per component, exactly the fused RMS_NORM+MUL launch that rows of 2049..4096
+  floats take), then quantizes it with the arithmetic of `quantize_q8_1` (warp max/sum over 32 lanes, `d = amax/127`,
+  `roundf(x/d)`, zero blocks up to the 512-padded length, as the padded quantization writes them). No controllers: kernel
+  B alone, one block per unit, straight from the input. The ticket pattern (threadFenceReduction) needs no spinning and
+  no co-residency, so it cannot hang; the grid barrier between the CTRL_DOWN and CTRL_OUT phases is the launch boundary.
+- Matcher `ggml_cuda_inkling2_glue_match` (hooked in `ggml_cuda_try_fuse` before the single-chain inkling2 fusions, only
+  when the multi-stream plan is off): from a RMS_NORM, reuses `inkling2_match_ctrl_down` / `inkling2_match_ctrl_out`
+  per controller (so their replicated configurations gate the glue too), checks h and the controller output have no
+  other uses, then one RMS_NORM+MUL per controller in order (or 1..3 independent ones without controllers, taken only if
+  a quantized one-row MUL_MAT/MUL_MAT_ID within the next 48 nodes consumes an output, else the normal fusions do the job).
+  Views between the pieces are part of the run; chain inputs must come from outside it (view sources resolved); outputs
+  must not share memory with other units' inputs/outputs (a unit's own output may sit on its input: read before write).
+- q8_1 hand-off: a per-context buffer (`ggml_cuda_mk_glue_state`, one `cudaMalloc` for the life of the context, 8 slots
+  of 4608 B + scratch; the captured graphs keep its addresses). Each glue output registers (tensor, data, ne0) -> slot;
+  `ggml_cuda_mk_glue_q8(ctx, src1)` in `ggml_cuda_mul_mat_vec_q` (unfused mmvq, also MUL_MAT_ID with one row),
+  `ggml_cuda_mul_mat_vec_q_multi`, `_selfq` (> 64 rows) and `_id_selfq` (> 64 rows) returns it for a one-row src1 that
+  is the output or a reshape of it, and the quantize launch and its pool allocation are skipped. Entries are cleared at
+  the start of every graph evaluation (`ggml_cuda_mk_glue_begin_eval`) and when their slot is reused.
+- `LLAMA_INKLING_MK_GLUE` set also selects the MK_PROJ expansion order in `src/models/inkling2.cpp` (controllers first,
+  then the three norms, then the projections); same ops, verified on the CPU: `LLAMA_GRAPH_DUMP` op/shape multiset
+  identical with and without the switch, `test-llama-archs -a 'inkling2.*'` passes both ways.
+- `LLAMA_INKLING_MK_DEBUG=1`: both kernels check their arguments per block (ranges, alignments, strides, pointers) and
+  print the block and shape on a violation; the host logs each distinct glue instance once.
+
+Not included, on purpose: the depth MIX (already one kernel; for odd state counts the unfused path is cuBLAS and the
+fused MIX is not bit-exact, so folding it in would break the bit-identity rule of this stage) and the rs GET_ROWS (one
+launch, unrelated data). The one-kernel variant (cooperative launch with `grid.sync()` between the CTRL_DOWN and
+CTRL_OUT phases) is the next step: the phase bodies are the device functions above, only the launch wrapper changes.
+
+### Self-test (`test-inkling-megakernel`, lines `glue ...`)
+Per layer kind, each with `proj=0` (the projections quantize their inputs through the unfused mmvq path, which now takes
+the glue bytes) and `proj=1` (the fused projection run takes them): loop pass with three controllers + norms (q8_0),
+pass-1 SWA layer (one norm), full layer (three norms), tail layers (q6_K/q5_K, q4_K/q6_K), FFN with a controller and
+without (router F32 product + expert MUL_MAT_ID q8_0, MK_MOE following MK_PROJ), and two 6-step server-pattern cases
+(graph captured on step 2, replayed after, K/V cache writes). Compared bit-for-bit: every normalized output and every
+consumer product (a differing q8_1 byte changes the dot products), `PERF FAIL` if the fused path is > 5% slower.
+The reference of each line runs with the same MK_PROJ value, so the lines do not depend on the open MK_PROJ bug.
+
+Commands (compose service):
+```
+docker compose run --rm --no-deps -e LLAMA_INKLING_MK_GLUE=1 --entrypoint /app/test-inkling-megakernel inkling
+docker compose run --rm --no-deps -e LLAMA_INKLING_MK_GLUE=1 -e LLAMA_INKLING_MK_DEBUG=1 -e CUDA_LAUNCH_BLOCKING=1 --entrypoint /app/test-inkling-megakernel inkling
+docker compose run --rm --no-deps -e LLAMA_INKLING_MK_GLUE=1 --entrypoint /app/test-llama-archs inkling -a 'inkling2.*'
+# server / bench: LLAMA_INKLING_MK_GLUE=1 alone, then with LLAMA_INKLING_MK_MOE=1, then with MK_PROJ=1 (bug still open):
+# greedy identity against the switch-off run, bench.py decode tok/s, LLAMA_GRAPH_STATS=1 for the node counts
+```

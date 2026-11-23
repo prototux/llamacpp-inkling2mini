@@ -34,6 +34,8 @@ configs=(
     "mk-proj-nographs|LLAMA_INKLING_MK_PROJ=1 GGML_CUDA_DISABLE_GRAPHS=1"
     "mk-wo|LLAMA_INKLING_MK_WO=1"
     "mk-moe|LLAMA_INKLING_MK_MOE=1"
+    "mk-glue|LLAMA_INKLING_MK_GLUE=1"
+    "mk-glue-moe-wo|LLAMA_INKLING_MK_GLUE=1 LLAMA_INKLING_MK_MOE=1 LLAMA_INKLING_MK_WO=1"
     "all-on|LLAMA_INKLING_NO_MASK=1 LLAMA_INKLING_FA_VEC_GQA=1 GGML_CUDA_GRAPH_OPT=2 LLAMA_INKLING_MK_WO=1 LLAMA_INKLING_MK_MOE=1"
 )
 
@@ -87,10 +89,18 @@ if has_step kernels; then
         note "FAIL megakernel self-test crashed: rerun with debug ($out/megakernel-debug.log)"
         run_tool "$out/megakernel-debug.log" "LLAMA_INKLING_MK_DEBUG=1 CUDA_LAUNCH_BLOCKING=1" /app/test-inkling-megakernel
     fi
+    # glue stage self-test (its cases run with the switch set)
+    if run_tool "$out/megakernel-glue.log" "LLAMA_INKLING_MK_GLUE=1" /app/test-inkling-megakernel; then
+        note "$(grep -E '^glue|PERF FAIL' "$out/megakernel-glue.log" | sed 's/^/  /')"
+        if grep -q -E '(^| )FAIL' "$out/megakernel-glue.log"; then note "FAIL glue self-test ($out/megakernel-glue.log)"; else note "PASS glue self-test"; fi
+    else
+        note "FAIL glue self-test crashed: rerun with debug ($out/megakernel-glue-debug.log)"
+        run_tool "$out/megakernel-glue-debug.log" "LLAMA_INKLING_MK_GLUE=1 LLAMA_INKLING_MK_DEBUG=1 CUDA_LAUNCH_BLOCKING=1" /app/test-inkling-megakernel
+    fi
     for s in 3 1 7; do
         if run_tool "$out/streams-$s.log" "GGML_CUDA_GRAPH_OPT=2 GGML_CUDA_GRAPH_OPT_DEBUG=1 GGML_CUDA_GRAPH_OPT_STREAMS=$s" /app/test-sched-streams && grep -q OK "$out/streams-$s.log"; then note "PASS multi-stream plan, $s streams"; else note "FAIL multi-stream plan, $s streams ($out/streams-$s.log)"; fi
     done
-    for v in "default|" "multi-stream|GGML_CUDA_GRAPH_OPT=2" "no-mask|LLAMA_INKLING_NO_MASK=1" "mk-proj|LLAMA_INKLING_MK_PROJ=1" "all-on|LLAMA_INKLING_NO_MASK=1 LLAMA_INKLING_FA_VEC_GQA=1 GGML_CUDA_GRAPH_OPT=2 LLAMA_INKLING_MK_PROJ=1"; do
+    for v in "default|" "multi-stream|GGML_CUDA_GRAPH_OPT=2" "no-mask|LLAMA_INKLING_NO_MASK=1" "mk-proj|LLAMA_INKLING_MK_PROJ=1" "mk-glue|LLAMA_INKLING_MK_GLUE=1" "all-on|LLAMA_INKLING_NO_MASK=1 LLAMA_INKLING_FA_VEC_GQA=1 GGML_CUDA_GRAPH_OPT=2 LLAMA_INKLING_MK_PROJ=1"; do
         name=${v%%|*}; envw=${v#*|}
         if run_tool "$out/archs-$name.log" "$envw" /app/test-llama-archs -a 'inkling2.*' && grep -q 'passed' "$out/archs-$name.log"; then note "PASS tiny-model CUDA vs CPU [$name]"; else note "FAIL tiny-model CUDA vs CPU [$name] ($out/archs-$name.log)"; fi
     done
@@ -129,7 +139,7 @@ if has_step bench; then
         stop_server
         note "$name: $(grep -E 'decode code|decode prose' "$out/bench-$name.log" | tr '\n' ' ')"
     done
-    python3 scripts/compare.py "$out"/bench-baseline.json "$out"/bench-defaults.json "$out"/bench-multi-stream.json "$out"/bench-mk-wo.json "$out"/bench-mk-moe.json "$out"/bench-all-on.json \
+    python3 scripts/compare.py "$out"/bench-baseline.json "$out"/bench-defaults.json "$out"/bench-multi-stream.json "$out"/bench-mk-wo.json "$out"/bench-mk-glue.json "$out"/bench-mk-glue-moe-wo.json "$out"/bench-all-on.json \
         > "$out/compare.txt" 2>&1 && tee -a "$summary" < "$out/compare.txt"
 fi
 

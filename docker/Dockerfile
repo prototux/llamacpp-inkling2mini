@@ -23,7 +23,7 @@ RUN git init -q . \
     && git remote add origin "${LLAMA_CPP_REPO}" \
     && git fetch -q --depth 1 origin "${LLAMA_CPP_COMMIT}" \
     && git checkout -q FETCH_HEAD \
-    && for p in /patches/*.patch; do echo "apply $p"; git apply --whitespace=nowarn "$p"; done \
+    && while read -r p; do [ -n "$p" ] || continue; echo "apply $p"; git apply --whitespace=nowarn "/patches/$p"; done < /patches/series \
     && rm -rf .git
 
 # ---- llama.cpp web UI ----
@@ -43,7 +43,7 @@ FROM docker.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS buil
 ARG CUDA_ARCH=86
 # nvcc needs ~1-2 GB of RAM per job for the flash-attention kernels
 ARG BUILD_JOBS=4
-ARG TARGETS="llama-server llama-perplexity llama-inkling-pass-kv test-flash-attn-indexed-bias test-backend-ops"
+ARG TARGETS="llama-server llama-perplexity llama-inkling-pass-kv test-flash-attn-indexed-bias test-backend-ops test-sched-streams test-llama-archs"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-14 g++-14 build-essential cmake git libssl-dev libgomp1 \
     && rm -rf /var/lib/apt/lists/*

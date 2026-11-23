@@ -1,0 +1,1516 @@
+diff --git a/docs/inkling-moonshot.md b/docs/inkling-moonshot.md
+new file mode 100644
+index 000000000..23b8fdd52
+--- /dev/null
++++ b/docs/inkling-moonshot.md
+@@ -0,0 +1,97 @@
++# Inkling 2 Mini on one RTX 3090: moonshot branch
++
++Branch `moonshot`, on top of `inkling-3090-exp`. Written on a machine without a GPU: the CUDA code here is
++**uncompiled**. Every change sits behind its own environment switch so that it can be A/B'd and disabled alone.
++
++## Where the time goes (derived from the code and the user's measurements, not profiled)
++
++Model facts (HF config + GGUF header of `Inkling-2-Mini-UD-Q3_K_XL`): hidden 2304, 24 heads x 128, 8 KV heads
++(GQA 3), 128 experts / 8 used, expert FFN 1152, loop core layers 6-17 x 3 passes = 48 layer applications per
++token, full attention on layers 5, 11, 17, 23 (8 cache slots), SWA 1024 elsewhere, relative-position bias with
++16 x 1024 tables (+1 far bin), per-query sinks, route scale 8, router norm eps 1e-20. In the UD-Q3_K_XL file the
++core attention weights are Q8_0 (~27 MB per layer), the core experts NVFP4 with per-expert scales (~36 MB per
++layer application for 8 experts), the output head Q5_K (320 MB).
++
++- Weights read per decoded token: ~3 GB (48 x ~63 MB + head) = ~3.3 ms at 936 GB/s. Measured decode: 13.3 ms
++  (75 tok/s) at short context. Decode is bound by the number of kernels per token (estimated 40-60 per layer
++  application after the existing fusions, 2000-3000 per token, ~2-5 us each), not by bandwidth.
++- At deep context the KV read dominates: 8 full-attention slots x 2176 B/token (q8_0) = 17 KiB per context
++  token, 8.7 GB per decoded token at 500K (9 ms). The decode flash-attention kernel (`fattn-vec.cuh`, one CUDA
++  block per *Q head*) reads each KV head 3 times (GQA ratio 3), so the real traffic is up to 3x that unless L2
++  catches the reuse (6 MB L2 against three 1 GB streams: unlikely).
++- Prefill at depth: the f16 attention mask is `n_kv x n_ubatch` per full-attention cache: 1 GiB of compute buffer
++  at 1M context / ubatch 512, filled on the host (`std::copy` per token row) and uploaded every ubatch.
++
++## Ideas, ranked
++
++| # | Idea | Expected gain | Lossless | Effort | Status |
++|---|------|---------------|----------|--------|--------|
++| M1 | Decode FA vec kernel processes the 3 Q heads of a KV head in one block: K/V read once per KV head | deep-context decode: KV traffic /3 (500K: ~9 ms -> ~3 ms per token, ~1.4x at 500K; more at 1M) | same math, split-K differs: not bitwise | medium, CUDA | implemented, uncompiled, `LLAMA_INKLING_FA_VEC_GQA=1` |
++| M2 | Maskless causal attention: in position mode the kernels derive causal/SWA/empty masking from the positions they already have, the f16 mask is not built, filled, uploaded or stored | -1 GiB compute buffer at 1M (~60K more context); deep prefill: no per-ubatch 1 GiB host fill + upload (est. 10-30% TTFT at 500K+) | bitwise | medium, ggml API + CPU + 3 CUDA kernels + kv-cache | implemented, CPU-tested, CUDA uncompiled, `LLAMA_INKLING_NO_MASK=1` |
++| M3 | Router norm written as CLAMP instead of SCALE_BIAS so the existing CUDA top-k MoE fusion covers sum/norm/scale | -4 kernels per layer application, -192 per token (~1 ms, ~5-7% decode) | identical for routing sums > 1.7e-13 (always) | tiny, graph only | implemented, `LLAMA_INKLING_MOE_CLAMP_NORM=0` disables |
++| M4 | Decode graph trims: real sinks instead of a zero fill + padded/shifted table (saves PAD, SUB, FILL per layer), one shared zero-sink tensor for prefill, lm_head over the unpadded vocabulary rows (no CONT) | -3 kernels per layer application for decode (-144 per token, ~3-4%) | sinks path: equivalent, not bitwise; the rest bitwise | small, graph only | implemented, `LLAMA_INKLING_DECODE_SINKS=0`, `LLAMA_INKLING_GRAPH_TRIM=0` disable |
++| M5 | Separate KV type for the full-attention cache (q4_0) while SWA stays q8_0; the tile/MMA prefill kernels read q4_0 in place (no F16 copy) | full-attention KV 17 -> 9 KiB/token: ~2x context, deep decode KV traffic /2 | lossy (perplexity test) | small + CUDA loader | implemented, CUDA uncompiled, `LLAMA_INKLING_KV_TYPE_FULL=q4_0` |
++| M6 | `LLAMA_GRAPH_STATS=1`: node histogram per batch size in the log | diagnostic | - | tiny | implemented |
++| - | Self-speculative decoding with 1-pass drafts of the loop | none | - | - | rejected: a 1-pass draft costs ~0.5 decode steps; with verify at >=1.2 steps the break-even acceptance is ~0.9; DSpark's draft is 10x cheaper and already loses |
++| - | Fused Q/K/V/gate projection weights (one mmvq per layer instead of 4-6) | -2-4 kernels per layer application (~2%) | bitwise | medium (GGUF transform + loader) | deferred: types differ across layers (Q8_0 core, Q4_K-Q6_K tail), small gain |
++| - | GQA-aware MMA prefill kernel (ncols2 = 3) with the per-head bias | prefill attention K/V loads /3 | yes | high | not done: prefill attention is compute-bound, ncols2 must divide the tensor-core tile |
++| - | Persistent megakernel / multi-stream CUDA graph | decode up to 2x | yes | very high | not attempted blind |
++| - | Bigger ubatch (2048) for prefill, `--backend-sampling` | prefill MoE GEMMs 4x more rows per expert; no 800 KB logits D2H per token | yes | config | in the test plan |
++
++## Decisions
++
++- M4 sinks: for a one-token graph the per-query sink logit is passed to flash attention as the `sinks` tensor
++  instead of being folded into the bias table (`table - sink`, zero sink, padded far bin). Same softmax,
++  different rounding path.
++- M2 encodes "no mask" as `mask == NULL` on a position-bias flash attention plus op param 6 (`causal window`:
++  0 none, > 0 masked when `q_pos - k_pos >= window`). The graph uses it only when every stream of the ubatch is
++  exclusively one sequence (O(1) check: the sequence's cell count equals the used cells), the attention is causal
++  and the device supports the op; the masked graph is built otherwise, so multi-sequence batches keep working.
++- M1 keeps `launch_fattn`'s grid logic: `ncols2 = 4` (>= GQA 3) gives one block per KV head; the kernel maps
++  its columns to the Q heads of that KV head, columns past the GQA ratio are idle.
++
++## Switches
++
++| Switch | Default | Effect |
++|---|---|---|
++| `LLAMA_INKLING_MOE_CLAMP_NORM` | on | router norm as CLAMP (fusable); `=0` restores SCALE_BIAS |
++| `LLAMA_INKLING_GRAPH_TRIM` | on | shared zero sinks, lm_head over the real vocabulary; `=0` restores the old graph |
++| `LLAMA_INKLING_DECODE_SINKS` | on | one-token graphs pass the real sink logits to flash attention; `=0` folds them into the table |
++| `LLAMA_INKLING_NO_MASK` | off | `=1`: single-sequence ubatches attend without a mask tensor (position-derived masking) |
++| `LLAMA_INKLING_FA_VEC_GQA` | off | `=1`: decode flash attention reads each KV head once for its 3 Q heads |
++| `LLAMA_INKLING_KV_TYPE_FULL[_K\|_V]` | unset | cell type of the full-attention cache, e.g. `q4_0` (K and V the same type for the in-place prefill loader) |
++| `LLAMA_GRAPH_STATS` | off | `=1`: log the node count by op of each graph shape |
++
++Existing switches from `inkling-3090-exp` keep working: `LLAMA_INKLING_FA_MMA`, `LLAMA_INKLING_POS_BIAS`,
++`LLAMA_INKLING_FA_Q8_0`, `LLAMA_INKLING_FA_VEC_VERIFY`, `LLAMA_INKLING_SHARE_LOOP_KV`. `LLAMA_INKLING_NO_MASK`
++needs `LLAMA_INKLING_POS_BIAS` (the default) and applies only when the device accepts the op.
++
++## 3090 test plan
++
++All commands through the compose service; `E` stands for the environment of the run, e.g.
++`docker compose run --rm --no-deps -e LLAMA_INKLING_NO_MASK=1 --entrypoint /app/<binary> inkling <args>`.
++
++1. Kernel correctness (CUDA against the CPU reference; the maskless, GQA-columns and q4_0 in-place cases are new):
++   - `E=LLAMA_INKLING_FA_VEC_GQA=1 /app/test-flash-attn-indexed-bias` (all cases must print `max error` < 0.001 and exit 0;
++     run it once more with `LLAMA_INKLING_FA_VEC_GQA=0` and once with `LLAMA_INKLING_FA_Q8_0=0`).
++   - `/app/test-backend-ops -o FLASH_ATTN_EXT -b CUDA0` and `/app/test-backend-ops -o MUL_MAT -b CUDA0` (regression only).
++2. Greedy identity (lossless switches). Same prompt, `--temp 0 --seed 1 -n 256`, compare the token streams:
++   - baseline: all new switches off (`LLAMA_INKLING_MOE_CLAMP_NORM=0 LLAMA_INKLING_GRAPH_TRIM=0 LLAMA_INKLING_DECODE_SINKS=0`);
++   - defaults (M3 + M4 on): expected identical tokens; a rare flip can only come from M4's sink rounding path,
++     `LLAMA_INKLING_DECODE_SINKS=0` isolates it;
++   - `LLAMA_INKLING_NO_MASK=1`: expected identical (bit-identical attention);
++   - `LLAMA_INKLING_FA_VEC_GQA=1`: expected identical or a rare late flip (split-K order).
++   Use `llama-perplexity -f <text> -c 4096 --chunks 8` for a numeric check on top: equal to 4 digits for M2, M3,
++   M4; M1 within noise.
++3. Decode speed at short context: `scripts/bench.py` (or `llama-bench -p 0 -n 128 -fa 1`) for: baseline
++   (switches off), defaults, `LLAMA_INKLING_NO_MASK=1`, `LLAMA_INKLING_FA_VEC_GQA=1`. With `LLAMA_GRAPH_STATS=1` the
++   server log shows the node count per token: expect ~190 fewer SUM_ROWS/SCALE/DIV/SCALE_BIAS nodes from M3 and
++   ~100 fewer SUB/FILL/CONT nodes from M4 in the `n_tokens = 1` line.
++4. Deep context (the M1 and M2 targets): fill 300K-500K tokens of context, then measure decode tok/s with
++   `LLAMA_INKLING_FA_VEC_GQA=0` and `=1`; measure prefill tok/s and TTFT on the same prompt with `LLAMA_INKLING_NO_MASK=0`
++   and `=1`, and read the compute buffer size in the startup log (`CUDA0 compute buffer size`): M2 should drop it by
++   `2 * n_kv * n_ubatch` bytes per full-attention cache.
++5. Context (M2, M5): `--fit` with `LLAMA_INKLING_NO_MASK=1`, and with `LLAMA_INKLING_KV_TYPE_FULL=q4_0`; pin the logged
++   `n_ctx`. For q4_0 run `llama-perplexity -c 8192` against the q8_0 cache and decide on the loss.
++6. Configuration experiments without code: `-ub 2048 -b 2048` for prefill (4x more rows per expert GEMM), and
++   `--backend-sampling` for decode (no 800 KB logits copy per token).
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index d21c01587..bc2d46950 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2315,6 +2315,15 @@ extern "C" {
+ 
+     GGML_API bool ggml_flash_attn_ext_has_position_bias(const struct ggml_tensor * a);
+ 
++    // Position mode without a mask (a->src[3] == NULL): the backend hides the keys itself from the positions:
++    // a key is hidden when d = q_pos[query] - k_pos[key] < 0 (future keys, and empty cells at INT32_MAX) and,
++    // when window > 0, when d >= window (sliding window). The bias of the visible keys is added to a zero mask.
++    // The window defaults to 0 and is ignored when a mask is present.
++    GGML_API void    ggml_flash_attn_ext_set_causal_window(struct ggml_tensor * a, int32_t window);
++    GGML_API int32_t ggml_flash_attn_ext_get_causal_window(const struct ggml_tensor * a);
++    // position bias and no mask
++    GGML_API bool    ggml_flash_attn_ext_is_maskless(const struct ggml_tensor * a);
++
+     // TODO: needs to be adapted to ggml_flash_attn_ext
+     GGML_API struct ggml_tensor * ggml_flash_attn_back(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 562372463..0ff8ae699 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8975,6 +8975,9 @@ struct ggml_fa_bias_row {
+     const int32_t * k_pos = nullptr; // position mode
+     int32_t         q_pos = 0;
+     int64_t         n_bins = 0;
++    // maskless position mode (no mask tensor): hide d < 0 and, with a window, d >= window
++    bool            causal = false;
++    int32_t         window = 0;
+ 
+     ggml_fa_bias_row(const ggml_tensor * dst, int64_t iq1, int64_t iq2, int64_t iq3) {
+         const ggml_tensor * table_t = dst->src[6];
+@@ -8985,8 +8988,10 @@ struct ggml_fa_bias_row {
+         n_bins = table_t->ne[0];
+         table  = (const float *) ((const char *) table_t->data + q*table_t->nb[2] + iq2*table_t->nb[1]);
+         if (ggml_flash_attn_ext_has_position_bias(dst)) {
+-            k_pos = (const int32_t *) ((const char *) dst->src[7]->data + iq3*dst->src[7]->nb[1]);
+-            q_pos = ((const int32_t *) dst->src[8]->data)[q];
++            k_pos  = (const int32_t *) ((const char *) dst->src[7]->data + iq3*dst->src[7]->nb[1]);
++            q_pos  = ((const int32_t *) dst->src[8]->data)[q];
++            causal = dst->src[3] == nullptr;
++            window = ggml_flash_attn_ext_get_causal_window(dst);
+         } else {
+             bins = (const int32_t *) ((const char *) dst->src[7]->data + q*dst->src[7]->nb[1]);
+         }
+@@ -9000,6 +9005,9 @@ struct ggml_fa_bias_row {
+             GGML_ASSERT(bin >= 0 && bin < n_bins);
+         } else {
+             const int64_t d = int64_t(q_pos) - k_pos[ic];
++            if (causal && (d < 0 || (window > 0 && d >= window))) {
++                return -INFINITY;
++            }
+             bin = d >= 0 && d < n_bins - 1 ? d : n_bins - 1;
+         }
+         return GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(m + table[bin]));
+@@ -9387,13 +9395,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, n_kv_cols - ic);
+ 
+             // skip the tile entirely if all the masks are -inf
+-            if (mask) {
++            // a maskless position bias (no mask tensor) hides keys itself, so it builds the mask tile too
++            if (mask || dst->src[6]) {
+                 bool can_skip = true;
+                 for (int tq = 0; tq < tile_rows; tq++) {
+-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
++                    const ggml_fp16_t * mp_row = mask ? (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
+                     const ggml_fa_bias_row bias(dst, iq1 + tq, iq2, iq3);
+                     for (int tk = 0; tk < kv_tile; tk++) {
+-                        float m = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
++                        float m = mp_row ? GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]) : 0.0f;
+                         if (bias.table) {
+                             m = bias.apply(m, ic + tk);
+                         }
+@@ -9447,7 +9456,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+                 }
+             }
+ 
+-            if (mask) {
++            if (mask || dst->src[6]) {
+                 ggml_vec_add_f32(tile_rows * KV_TILE_SZ, KQ, KQ, mask32);
+             }
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 9e3a57c66..570b69d2d 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -31,6 +31,9 @@ struct fattn_indexed_bias {
+     int64_t n_keys;
+     int64_t query_stride;
+     int64_t queries_per_stream;
++    // maskless position mode (no mask tensor, ggml_flash_attn_ext_set_causal_window): the keys with
++    // d = q_pos - k_pos < 0 and, when causal_window > 0, d >= causal_window are hidden; -1 with a mask
++    int32_t causal_window;
+ 
+     // first_query is the first query of a stream; query in add() counts from it
+     __device__ fattn_indexed_bias for_head(int64_t first_query, int head) const {
+@@ -38,7 +41,16 @@ struct fattn_indexed_bias {
+                 indices ? indices + first_query*n_keys : nullptr,
+                 k_pos   ? k_pos + (first_query/queries_per_stream)*n_keys : nullptr,
+                 q_pos   ? q_pos + first_query : nullptr,
+-                n_bins, n_keys, query_stride, queries_per_stream};
++                n_bins, n_keys, query_stride, queries_per_stream, causal_window};
++    }
++
++    // maskless: true if the key is hidden; the kernels pass a zero mask value in that mode
++    __device__ __forceinline__ bool hidden(int query, int key) const {
++        if (causal_window < 0) {
++            return false;
++        }
++        const int d = q_pos[query] - k_pos[key];
++        return d < 0 || (causal_window > 0 && d >= causal_window);
+     }
+ 
+     __device__ __forceinline__ int bin(int query, int key) const {
+@@ -50,12 +62,18 @@ struct fattn_indexed_bias {
+     }
+ 
+     __device__ half add(half mask, int query, int key) const {
++        if (hidden(query, key)) {
++            return __float2half(-INFINITY);
++        }
+         const int b = bin(query, key);
+         return uint32_t(b) < n_bins ? __float2half(__half2float(mask) + table[query*query_stride + b]) : mask;
+     }
+ 
+     // same as add() on an F32 value: the mask and the bias are summed in F32 and rounded to F16 like add()
+     __device__ float add_f(float mask, int query, int key) const {
++        if (hidden(query, key)) {
++            return -INFINITY;
++        }
+         const int b = bin(query, key);
+         return uint32_t(b) < n_bins ? __half2float(__float2half(mask + table[query*query_stride + b])) : mask;
+     }
+@@ -66,6 +84,9 @@ struct fattn_indexed_bias {
+ // number of blocks, so an F16 element index maps linearly onto it. fattn_q8_0_ptr stands in for `const half2 *` in
+ // the kernels' pointer arithmetic (offsets in half2 units); fattn_load_chunk dequantizes a chunk on load.
+ struct fattn_q8_0_ptr {
++    using block_t = block_q8_0;
++    static constexpr int qk = QK8_0;
++
+     const block_q8_0 * base;
+     int64_t            i; // element index
+ 
+@@ -74,6 +95,20 @@ struct fattn_q8_0_ptr {
+     }
+ };
+ 
++// the same for a q4_0 cache: 18-byte blocks of 32 values, the low nibbles hold values 0..15 and the high nibbles 16..31
++// (LLAMA_INKLING_KV_TYPE_FULL=q4_0, the full-attention cache at half the q8_0 size)
++struct fattn_q4_0_ptr {
++    using block_t = block_q4_0;
++    static constexpr int qk = QK4_0;
++
++    const block_q4_0 * base;
++    int64_t            i; // element index
++
++    __device__ __forceinline__ fattn_q4_0_ptr operator+(int64_t n_h2) const {
++        return {base, i + 2*n_h2};
++    }
++};
++
+ // load nbytes of F16 values (one chunk of a K/V row) to dst
+ template <int nbytes>
+ static __device__ __forceinline__ void fattn_load_chunk(void * __restrict__ dst, const half2 * __restrict__ src) {
+@@ -97,6 +132,26 @@ static __device__ __forceinline__ void fattn_load_chunk(void * __restrict__ dst,
+     ggml_cuda_memcpy_1<nbytes>(dst, tmp);
+ }
+ 
++template <int nbytes>
++static __device__ __forceinline__ void fattn_load_chunk(void * __restrict__ dst, const fattn_q4_0_ptr src) {
++    constexpr int n = nbytes/sizeof(half); // values in the chunk
++    static_assert((QK4_0/2) % n == 0, "a chunk must not straddle the nibble halves of a q4_0 block");
++    const block_q4_0 * b = src.base + src.i/QK4_0;
++    const float d = __half2float(b->d);
++    const int i0 = src.i % QK4_0;
++    // the chunk is in one nibble half: the low nibbles of qs[i0..] or the high nibbles of qs[i0 - 16..]
++    const uint8_t * qs = b->qs + (i0 < QK4_0/2 ? i0 : i0 - QK4_0/2);
++    const int shift = i0 < QK4_0/2 ? 0 : 4;
++    __align__(16) half2 tmp[n/2];
++#pragma unroll
++    for (int l = 0; l < n/2; ++l) {
++        const int q0 = (qs[2*l    ] >> shift) & 0xF;
++        const int q1 = (qs[2*l + 1] >> shift) & 0xF;
++        tmp[l] = __floats2half2_rn(d*float(q0 - 8), d*float(q1 - 8));
++    }
++    ggml_cuda_memcpy_1<nbytes>(dst, tmp);
++}
++
+ // LLAMA_INKLING_FA_Q8_0=0 converts a q8_0 cache to F16 before the tile/MMA kernels again
+ static bool ggml_cuda_fattn_q8_0_in_place_enabled() {
+     static const bool enabled = [] {
+@@ -115,6 +170,16 @@ static bool ggml_cuda_fattn_vec_verify_enabled() {
+     return enabled;
+ }
+ 
++// LLAMA_INKLING_FA_VEC_GQA=1: the decode vec kernel handles the Q heads of a KV head in one block, so that K and V
++// are read once per KV head instead of once per Q head (GQA ratio 3); off by default, uncompiled on the dev machine
++static bool ggml_cuda_fattn_vec_gqa_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_INKLING_FA_VEC_GQA");
++        return env && atoi(env) != 0;
++    }();
++    return enabled;
++}
++
+ // LLAMA_INKLING_FA_MMA=0 keeps the Inkling 2 prefill on the tile kernel (CUDA cores) instead of the tensor cores
+ static bool ggml_cuda_fattn_mma_bias_enabled() {
+     static const bool enabled = [] {
+@@ -124,14 +189,27 @@ static bool ggml_cuda_fattn_mma_bias_enabled() {
+     return enabled;
+ }
+ 
+-// whether the tile/MMA kernels read this q8_0 K/V in place: only for the indexed-bias (Inkling 2) instances
+-static bool ggml_cuda_fattn_reads_q8_0(const ggml_tensor * dst) {
++// which quantized K/V the tile/MMA kernels read in place, only for the indexed-bias (Inkling 2) instances:
++// 8 (q8_0), 4 (q4_0) or 0 (none: F16, or an F16 copy is made)
++static int ggml_cuda_fattn_in_place_kv(const ggml_tensor * dst) {
+     const ggml_tensor * K = dst->src[1];
+     const ggml_tensor * V = dst->src[2];
+-    return dst->src[6] && !dst->src[5] && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+-        K->ne[0] == 128 && V->ne[0] == 128 && ggml_cuda_fattn_q8_0_in_place_enabled();
++    if (!dst->src[6] || dst->src[5] || K->type != V->type || K->ne[0] != 128 || V->ne[0] != 128 ||
++            !ggml_cuda_fattn_q8_0_in_place_enabled()) {
++        return 0;
++    }
++    return K->type == GGML_TYPE_Q8_0 ? 8 : K->type == GGML_TYPE_Q4_0 ? 4 : 0;
+ }
+ 
++// the in-place pointer type of a kv_quant instance (see ggml_cuda_fattn_in_place_kv)
++template <int kv_quant>
++using fattn_kv_ptr_t = std::conditional_t<kv_quant == 8, fattn_q8_0_ptr, std::conditional_t<kv_quant == 4, fattn_q4_0_ptr, const half2 *>>;
++
++// bytes and values per storage unit of a kv_quant instance: a row of nb bytes holds nb/bs*qk values, nb/bs*qk/2 half2
++template <int kv_quant> struct fattn_kv_traits     { static constexpr int bs = sizeof(half2);      static constexpr int qk = 2;     };
++template <>             struct fattn_kv_traits<8>  { static constexpr int bs = sizeof(block_q8_0); static constexpr int qk = QK8_0; };
++template <>             struct fattn_kv_traits<4>  { static constexpr int bs = sizeof(block_q4_0); static constexpr int qk = QK4_0; };
++
+ typedef void (* fattn_kernel_t)(
+         const char * __restrict__ Q,
+         const char * __restrict__ K,
+@@ -1447,7 +1525,8 @@ void launch_fattn(
+                            dst->src[6] ? dst->src[6]->ne[0] : 0,
+                            dst->src[7] ? dst->src[7]->ne[0] : 0,
+                            dst->src[6] ? dst->src[6]->ne[0]*dst->src[6]->ne[1] : 0,
+-                           Q->ne[1]}
++                           Q->ne[1],
++                           dst->src[8] && !mask ? ggml_get_op_params_i32(KQV, 6) : -1}
+     );
+     CUDA_CHECK(cudaGetLastError());
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index fb8cef10c..67edf8f4a 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -413,7 +413,7 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
+ 
+ // ------------------------------------------------------------------------------------------------------------------
+ 
+-// KV_t: const half2 * (F16 cache) or fattn_q8_0_ptr (q8_0 cache read in place, synchronous loads only)
++// KV_t: const half2 * (F16 cache) or fattn_q8_0_ptr/fattn_q4_0_ptr (quantized cache read in place, synchronous loads only)
+ template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse, typename KV_t>
+ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
+         const KV_t KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
+@@ -557,7 +557,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
+                 const int i = i0 + threadIdx.x;
+                 half m = half(0.0f);
+                 if (!oob_check || i < i_sup) {
+-                    m = bias.add(mask_h[int64_t(j_vram)*stride_mask + k_VKQ_0 + i], j_vram, k_VKQ_0 + i);
++                    // maskless position mode: no mask tensor, the bias hides the keys itself
++                    m = bias.add(mask_h ? mask_h[int64_t(j_vram)*stride_mask + k_VKQ_0 + i] : half(0.0f), j_vram, k_VKQ_0 + i);
+                 }
+                 tile_mask[j_sram*(nbatch_fa + 8) + i] = m;
+             }
+@@ -716,7 +717,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     } else {
+         // the sparse mask values are gathered per element, always load them synchronously
+         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
+-        if (ncols2 > 1 || mask_h) {
++        if (ncols2 > 1 || mask_h || indexed_bias) {
+             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, indexed_bias>
+                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices, bias);
+         }
+@@ -816,7 +817,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     float KQ_rowsum_add[cols_per_thread] = {0.0f};
+ 
+     if constexpr (cols_per_warp == 8) {
+-        if (ncols2 > 1 || mask_h) {
++        if (ncols2 > 1 || mask_h || indexed_bias) {
+ #pragma unroll
+             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
+                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
+@@ -878,7 +879,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+             }
+         }
+     } else { // not Turing mma or T_B_KQ::I > 8
+-        if (ncols2 > 1 || mask_h) {
++        if (ncols2 > 1 || mask_h || indexed_bias) {
+ #pragma unroll
+             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
+                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
+@@ -1975,9 +1976,10 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
+            (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
+ }
+ 
+-// indexed_bias, kv_q8_0: the Inkling 2 instances (DKQ == DV == 128, ncols2 == 1), see ggml_cuda_flash_attn_ext_mma_f16_case
++// indexed_bias, kv_quant: the Inkling 2 instances (DKQ == DV == 128, ncols2 == 1), see ggml_cuda_flash_attn_ext_mma_f16_case;
++// kv_quant 8 reads a q8_0 cache in place, 4 a q4_0 cache, 0 reads F16
+ template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse,
+-    bool indexed_bias = false, bool kv_q8_0 = false>
++    bool indexed_bias = false, int kv_quant = 0>
+ __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
+ static __global__ void flash_attn_ext_f16(
+         const char * Q_ptr,
+@@ -2070,20 +2072,23 @@ static __global__ void flash_attn_ext_f16(
+     const int stride_Q1   = nb01 / sizeof(float2);
+     const int stride_Q2   = nb02 / sizeof(float2);
+     static_assert(!indexed_bias || (ncols2 == 1 && !use_sparse && !V_is_K_view), "bad indexed-bias instance");
+-    static_assert(!kv_q8_0 || indexed_bias, "q8_0 K/V in place is only used for the indexed-bias instances");
+-    using KV_t = std::conditional_t<kv_q8_0, fattn_q8_0_ptr, const half2 *>;
+-    // byte offsets and strides of a q8_0 view are whole blocks: element index = bytes/sizeof(block)*QK8_0
++    static_assert(kv_quant == 0 || indexed_bias, "quantized K/V in place is only used for the indexed-bias instances");
++    using KV_t = fattn_kv_ptr_t<kv_quant>;
++    // byte offsets and strides of a quantized view are whole blocks: element index = bytes/sizeof(block)*qk
++    constexpr int kv_bs = fattn_kv_traits<kv_quant>::bs;
++    constexpr int kv_qk = fattn_kv_traits<kv_quant>::qk;
+     auto kv_ptr = [] __device__ (const char * base, const int64_t offset) -> KV_t {
+-        if constexpr (kv_q8_0) {
+-            return {(const block_q8_0 *) base, offset/int64_t(sizeof(block_q8_0))*QK8_0};
++        if constexpr (kv_quant != 0) {
++            return {(const typename KV_t::block_t *) base, offset/int64_t(kv_bs)*kv_qk};
+         } else {
+             return (const half2 *) (base + offset);
+         }
+     };
+-    const int stride_K    = kv_q8_0 ? nb11/int(sizeof(block_q8_0))*QK8_0/2 : nb11 / int(sizeof(half2));
++    // half2 units per row: a quantized row holds nb11/kv_bs blocks of kv_qk values, an F16 row nb11/4 half2
++    const int stride_K    = nb11/kv_bs*kv_qk/2;
+     const int stride_mask = nb31 / sizeof(half);
+ 
+-    const int stride_V = V_is_K_view ? stride_K : (kv_q8_0 ? nb21/int(sizeof(block_q8_0))*QK8_0/2 : nb21 / int(sizeof(half2)));
++    const int stride_V = V_is_K_view ? stride_K : nb21/kv_bs*kv_qk/2;
+ 
+     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
+     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
+@@ -2274,20 +2279,27 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+     fattn_kernel_t fattn_kernel;
+     bool use_sparse = false;
+ 
+-    // Inkling 2: relative-position bias added to the mask tile, q8_0 K/V optionally read in place
++    // Inkling 2: relative-position bias added to the mask tile, q8_0 or q4_0 K/V optionally read in place
+     if (dst->src[6]) {
+         if constexpr (DKQ == 128 && DV == 128 && ncols2 == 1) {
+             GGML_ASSERT(logit_softcap == 0.0f && !dst->src[5]);
+-            const bool kv_q8_0 = ggml_cuda_fattn_reads_q8_0(dst);
+-            if (kv_q8_0) {
+-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false, false, true, true>;
++            const int kv_quant = ggml_cuda_fattn_in_place_kv(dst);
++            if (kv_quant == 8) {
++                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false, false, true, 8>;
++                static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
++                if (!shared_memory_limit_raised[id]) {
++                    CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
++                    shared_memory_limit_raised[id] = true;
++                }
++            } else if (kv_quant == 4) {
++                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false, false, true, 4>;
+                 static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+                 if (!shared_memory_limit_raised[id]) {
+                     CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+                     shared_memory_limit_raised[id] = true;
+                 }
+             } else {
+-                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false, false, true, false>;
++                fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false, false, true, 0>;
+                 static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+                 if (!shared_memory_limit_raised[id]) {
+                     CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+@@ -2296,7 +2308,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+             }
+             GGML_ASSERT(nstages <= 1 && "the indexed bias needs synchronous loads");
+             launch_fattn<DV, ncols1, ncols2>
+-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, !kv_q8_0, !kv_q8_0, true, false, warp_size_host, false);
++                (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, kv_quant == 0, kv_quant == 0, true, false, warp_size_host, false);
+         } else {
+             GGML_ABORT("the indexed bias needs DKQ == DV == 128 and one Q head per CUDA block");
+         }
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index e74765fbe..25985e805 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -374,7 +374,7 @@ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ,
+ }
+ 
+ // TODO: deduplicate with mma-f16
+-// KV_t: const half2 * (F16 cache) or fattn_q8_0_ptr (q8_0 cache read in place, see fattn-common.cuh)
++// KV_t: const half2 * (F16 cache) or fattn_q8_0_ptr/fattn_q4_0_ptr (quantized cache read in place, see fattn-common.cuh)
+ template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, bool use_rows, typename KV_t>
+ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+         const KV_t KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup, const int * rows) {
+@@ -655,8 +655,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+ 
+             if (!oob_check || i_KQ < k_VKQ_sup) {
+                 const int k = k_VKQ_0 + i_KQ;
+-                if (ncols2 > 1 || mask) {
+-                    half m = mask[int64_t(j)*stride_mask + k];
++                if (ncols2 > 1 || mask || indexed_bias) {
++                    // maskless position mode (indexed_bias without a mask tensor): the bias hides the keys itself
++                    half m = mask ? mask[int64_t(j)*stride_mask + k] : half(0.0f);
+                     if constexpr (indexed_bias) {
+                         m = bias.add(m, j, k);
+                     }
+@@ -812,8 +813,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     }
+ }
+ 
+-// kv_q8_0: K and V are q8_0 and read in place (only the Inkling 2 indexed-bias instances)
+-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool indexed_bias, bool use_rows, bool kv_q8_0 = false> // D == head size
++// kv_quant: K and V are q8_0 (8) or q4_0 (4) and read in place (only the Inkling 2 indexed-bias instances), 0 for F16
++template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool indexed_bias, bool use_rows, int kv_quant = 0> // D == head size
+ __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
+ static __global__ void flash_attn_tile(
+         const char * Q_ptr,
+@@ -883,18 +884,20 @@ static __global__ void flash_attn_tile(
+     const auto head_bias = indexed_bias ? bias.for_head(int64_t(sequence)*ne01.z, head0) : bias;
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
+-    using KV_t = std::conditional_t<kv_q8_0, fattn_q8_0_ptr, const half2 *>;
++    using KV_t = fattn_kv_ptr_t<kv_quant>;
+     KV_t K_h2;
+     KV_t V_h2;
+     int stride_K2;
+     int stride_V2;
+-    if constexpr (kv_q8_0) {
+-        // byte offsets and strides of a q8_0 view are whole blocks: convert them to element indices
+-        constexpr int bs = sizeof(block_q8_0);
+-        K_h2 = {(const block_q8_0 *) K, (nb13*sequence + int64_t(nb12)*(head0 / gqa_ratio))/bs*QK8_0};
+-        V_h2 = {(const block_q8_0 *) V, (nb23*sequence + int64_t(nb22)*(head0 / gqa_ratio))/bs*QK8_0};
+-        stride_K2 = nb11/bs*QK8_0/2;
+-        stride_V2 = nb21/bs*QK8_0/2;
++    if constexpr (kv_quant != 0) {
++        // byte offsets and strides of a quantized view are whole blocks: convert them to element indices
++        using block_t = typename KV_t::block_t;
++        constexpr int bs = fattn_kv_traits<kv_quant>::bs;
++        constexpr int qk = fattn_kv_traits<kv_quant>::qk;
++        K_h2 = {(const block_t *) K, (nb13*sequence + int64_t(nb12)*(head0 / gqa_ratio))/bs*qk};
++        V_h2 = {(const block_t *) V, (nb23*sequence + int64_t(nb22)*(head0 / gqa_ratio))/bs*qk};
++        stride_K2 = nb11/bs*qk/2;
++        stride_V2 = nb21/bs*qk/2;
+     } else {
+         K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
+         V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
+@@ -1188,7 +1191,7 @@ static __global__ void flash_attn_tile(
+ #endif // FLASH_ATTN_AVAILABLE
+ }
+ 
+-template <int DKQ, int DV, int ncols2, bool use_logit_softcap, bool indexed_bias = false, bool use_rows = false, bool kv_q8_0 = false>
++template <int DKQ, int DV, int ncols2, bool use_logit_softcap, bool indexed_bias = false, bool use_rows = false, int kv_quant = 0>
+ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * Q = dst->src[0];
+ 
+@@ -1204,9 +1207,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 64;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_q8_0>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_quant>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q8_0, !kv_q8_0, false, false, warp_size);
++                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, kv_quant == 0, kv_quant == 0, false, false, warp_size);
+             return;
+         }
+     }
+@@ -1220,9 +1223,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 32;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_q8_0>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_quant>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q8_0, !kv_q8_0, false, false, warp_size);
++                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, kv_quant == 0, kv_quant == 0, false, false, warp_size);
+             return;
+         }
+     }
+@@ -1232,9 +1235,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 16;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_q8_0>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_quant>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q8_0, !kv_q8_0, false, false, warp_size);
++                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, kv_quant == 0, kv_quant == 0, false, false, warp_size);
+             return;
+         }
+     }
+@@ -1244,9 +1247,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 8;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_q8_0>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_quant>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q8_0, !kv_q8_0, false, false, warp_size);
++                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, kv_quant == 0, kv_quant == 0, false, false, warp_size);
+             return;
+         }
+     }
+@@ -1256,9 +1259,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+             constexpr int cols_per_block = 4;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_q8_0>;
++            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_quant>;
+             launch_fattn<DV, cols_per_block/ncols2, ncols2>
+-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q8_0, !kv_q8_0, false, false, warp_size);
++                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, kv_quant == 0, kv_quant == 0, false, false, warp_size);
+             return;
+         }
+     }
+@@ -1267,9 +1270,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         constexpr int cols_per_block = 2;
+         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+-        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_q8_0>;
++        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, indexed_bias, use_rows, kv_quant>;
+         launch_fattn<DV, cols_per_block/ncols2, ncols2>
+-            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q8_0, !kv_q8_0, false, false, warp_size);
++            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, kv_quant == 0, kv_quant == 0, false, false, warp_size);
+         return;
+     }
+ 
+@@ -1300,9 +1303,13 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+         if (dst->src[6]) {
+             if (dst->src[5]) {
+                 launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, true, true>(ctx, dst);
+-            } else if (ggml_cuda_fattn_reads_q8_0(dst)) {
++            } else if (const int kv_quant = ggml_cuda_fattn_in_place_kv(dst); kv_quant != 0) {
+                 if constexpr (DKQ == 128) {
+-                    launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, true, false, true>(ctx, dst);
++                    if (kv_quant == 8) {
++                        launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, true, false, 8>(ctx, dst);
++                    } else {
++                        launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap, true, false, 4>(ctx, dst);
++                    }
+                 } else {
+                     GGML_ABORT("fatal error");
+                 }
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index cc31f2d88..5ad8d9b3c 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -16,7 +16,10 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wpass-failed"
+ #endif // __clang__
+-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool indexed_bias = false, bool use_rows = false> // D == head size
++// gqa_cols: the ncols columns of a block are the Q heads of one KV head for a single query (ne01 == 1), so that K and V
++// are read once per KV head instead of once per Q head (Inkling 2 decode at deep context, LLAMA_INKLING_FA_VEC_GQA);
++// columns >= the GQA ratio are idle; launched with ncols2 == ncols so that there is one block per KV head
++template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool indexed_bias = false, bool use_rows = false, bool gqa_cols = false> // D == head size
+ __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+ static __global__ void flash_attn_ext_vec(
+         const char * Q_ptr,
+@@ -103,15 +106,24 @@ static __global__ void flash_attn_ext_vec(
+     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+ #endif // V_DOT2_F32_F16_AVAILABLE
+ 
+-    const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
++    static_assert(!gqa_cols || (indexed_bias && !use_rows && ncols > 1), "the GQA columns are an indexed-bias decode instance");
+ 
+-    const int sequence = blockIdx.z / ne02;
+-    const int head = blockIdx.z - sequence*ne02;
+-    const auto head_bias = indexed_bias ? bias.for_head(int64_t(sequence)*ne01.z, head) : bias;
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
++
++    const int ic0 = gqa_cols ? 0 : blockIdx.x * ncols; // Index of the Q/QKV column to work on.
++
++    // gqa_cols: one block per KV head, head is the first Q head of that KV head and column j is Q head head + j
++    const int sequence = gqa_cols ? blockIdx.z / ne12 : blockIdx.z / ne02;
++    const int head = gqa_cols ? (blockIdx.z - sequence*ne12)*gqa_ratio : blockIdx.z - sequence*ne02;
++    // the columns that hold a query: the others are computed on zeros and not written
++    const int ncols_valid = ncols == 1 ? 1 : (gqa_cols ? gqa_ratio : int(ne01.z) - ic0);
++    const auto head_bias = indexed_bias ? bias.for_head(int64_t(sequence)*ne01.z, head) : bias;
+     Q += nb03*sequence + nb02* head              + nb01*ic0;
+     K += nb13*sequence + nb12*(head / gqa_ratio);
+     V += nb23*sequence + nb22*(head / gqa_ratio);
++    // column j of Q: the next query (nb01) or the next head (nb02); the mask row is shared by the heads (ne32 == 1)
++    const int64_t q_col_stride   = gqa_cols ? nb02 : nb01;
++    const int     mask_col_stride = gqa_cols ? 0 : ne11;
+ 
+     const half * maskh  = mask ? (const half  *) (mask + nb33*(sequence % ne33) + nb32*(head % ne32) + nb31*ic0) : nullptr;
+ 
+@@ -164,7 +176,7 @@ static __global__ void flash_attn_ext_vec(
+             float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
+ 
+             // Set memory to zero if out of bounds:
+-            if (ncols > 1 && ic0 + j >= int(ne01.z)) {
++            if (j >= ncols_valid) {
+ #pragma unroll
+                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += WARP_SIZE) {
+                     const int i = i0 + threadIdx.x;
+@@ -177,7 +189,7 @@ static __global__ void flash_attn_ext_vec(
+                     tmp_q_ds[threadIdx.x] = make_float2(0.0f, 0.0f);
+                 }
+             } else {
+-                const float * Q_f = (const float *) (Q + j*nb01);
++                const float * Q_f = (const float *) (Q + j*q_col_stride);
+                 constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
+ #pragma unroll
+                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
+@@ -207,12 +219,12 @@ static __global__ void flash_attn_ext_vec(
+     } else if constexpr (type_K == GGML_TYPE_F8_E4M3) {
+ #pragma unroll
+         for (int j = 0; j < ncols; ++j) {
+-            const float * Q_j = (const float *) (Q + j*nb01);
++            const float * Q_j = (const float *) (Q + j*q_col_stride);
+ #pragma unroll
+             for (int i0 = 0; i0 < D; i0 += nthreads_KQ*4) {
+                 const int i = i0 + (threadIdx.x % nthreads_KQ)*4;
+                 float4 tmp = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+-                if (ncols == 1 || ic0 + j < int(ne01.z)) {
++                if (j < ncols_valid) {
+                     ggml_cuda_memcpy_1<sizeof(tmp)>(&tmp, Q_j + i);
+                 }
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+@@ -230,13 +242,13 @@ static __global__ void flash_attn_ext_vec(
+         const half2 scale_h2 = make_half2(scale, scale);
+ #pragma unroll
+         for (int j = 0; j < ncols; ++j) {
+-            const float2 * Q_j = (const float2 *) (Q + j*nb01);
++            const float2 * Q_j = (const float2 *) (Q + j*q_col_stride);
+ #pragma unroll
+             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
+                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ)*cpy_ne;
+ 
+                 __align__(16) float2 tmp[cpy_ne] = {{0.0f, 0.0f}};
+-                if (ncols == 1 || ic0 + j < int(ne01.z)) {
++                if (j < ncols_valid) {
+                     ggml_cuda_memcpy_1<cpy_nb>(tmp,            &Q_j[i]);
+                     ggml_cuda_memcpy_1<cpy_nb>(tmp + cpy_ne/2, &Q_j[i + cpy_ne/2]);
+                 }
+@@ -253,11 +265,11 @@ static __global__ void flash_attn_ext_vec(
+ #else
+ #pragma unroll
+         for (int j = 0; j < ncols; ++j) {
+-            const float2 * Q_j = (const float2 *) (Q + j*nb01);
++            const float2 * Q_j = (const float2 *) (Q + j*q_col_stride);
+ #pragma unroll
+             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
+                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ)*cpy_ne;
+-                if (ncols == 1 || ic0 + j < int(ne01.z)) {
++                if (j < ncols_valid) {
+                     ggml_cuda_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ],            &Q_j[i]);
+                     ggml_cuda_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ + cpy_ne/2], &Q_j[i + cpy_ne/2]);
+                 }
+@@ -306,8 +318,8 @@ static __global__ void flash_attn_ext_vec(
+                 }
+ 
+                 if constexpr (!indexed_bias) {
+-                    if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+-                        sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
++                    if (mask && j < ncols_valid) {
++                        sum += slope*__half2float(maskh[j*mask_col_stride + i_KQ]);
+                     }
+                     KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+                 }
+@@ -323,8 +335,11 @@ static __global__ void flash_attn_ext_vec(
+             if constexpr (indexed_bias) {
+                 const int k = k_VKQ_0 + tid;
+                 // columns past the last query (ncols > 1) are computed but not written: keep their reads in bounds
+-                const half m = ncols > 1 && ic0 + j >= int(ne01.z) ? half(0.0f) :
+-                    use_rows && rows[k] < 0 ? half(-INFINITY) : head_bias.add(maskh[j*ne11 + tid], ic0 + j, k);
++                // maskless position mode: no mask tensor, the bias hides the keys itself
++                // gqa_cols: the bias of the column's head, for the one query of the block
++                const half m = j >= ncols_valid ? half(0.0f) :
++                    use_rows && rows[k] < 0 ? half(-INFINITY) :
++                    (gqa_cols ? bias.for_head(int64_t(sequence)*ne01.z, head + j) : head_bias).add(maskh ? maskh[j*mask_col_stride + tid] : half(0.0f), gqa_cols ? 0 : ic0 + j, k);
+                 KQ_reg[j] += slope*__half2float(m);
+                 KQ_max_new[j] = fmaxf(KQ_max[j], KQ_reg[j] + FATTN_KQ_MAX_OFFSET);
+             }
+@@ -417,7 +432,6 @@ static __global__ void flash_attn_ext_vec(
+     }
+ 
+     if (sinks && blockIdx.y == 0) {
+-        const float sink = ((const float *) sinks)[head];
+ 
+ #pragma unroll
+         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+@@ -427,6 +441,8 @@ static __global__ void flash_attn_ext_vec(
+                 break;
+             }
+ 
++            // gqa_cols: the sink of the column's head (idle columns read a valid head and are not written)
++            const float sink = ((const float *) sinks)[gqa_cols ? head + min(j, ncols_valid - 1) : head];
+             const float kqmax_new_j = fmaxf(sink, KQ_max[j]);
+             const float KQ_max_scale = expf(KQ_max[j] - kqmax_new_j);
+             KQ_max[j] = kqmax_new_j;
+@@ -471,7 +487,7 @@ static __global__ void flash_attn_ext_vec(
+ 
+ #pragma unroll
+     for (int j_VKQ = 0; j_VKQ < ncols; ++j_VKQ) {
+-        if (ncols > 1 && ic0 + j_VKQ >= int(ne01.z)) {
++        if (j_VKQ >= ncols_valid) {
+             break;
+         }
+ 
+@@ -538,7 +554,9 @@ static __global__ void flash_attn_ext_vec(
+                 if (gridDim.y == 1) {
+                     dst_val /= KQ_sum[j_VKQ];
+                 }
+-                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
++                // row (sequence, query, head) of the output, the layout flash_attn_combine_results reads
++                const int j_dst = gqa_cols ? (sequence*int(ne01.z) + ic0)*ne02 + head + j_VKQ : (sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head;
++                dst[(j_dst*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+             }
+         }
+ 
+@@ -548,8 +566,9 @@ static __global__ void flash_attn_ext_vec(
+ 
+     }
+ 
+-    if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
+-        dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
++    if (gridDim.y != 1 && tid < ncols && tid < ncols_valid) {
++        const int j_dst = gqa_cols ? (sequence*int(ne01.z) + ic0)*ne02 + head + tid : (sequence*int(ne01.z) + ic0 + tid)*ne02 + head;
++        dst_meta[j_dst*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+     }
+ #else
+     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
+@@ -595,6 +614,40 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
+     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+ }
+ 
++// one block per KV head, its Q heads as the columns (see flash_attn_ext_vec, gqa_cols); instantiated for the K/V types
++// Inkling 2 runs on (q8_0, q4_0, f16 caches) with D == 128
++template <int D, ggml_type type_K, ggml_type type_V>
++static bool ggml_cuda_flash_attn_ext_vec_gqa_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    constexpr int cols_per_block = 4; // >= the GQA ratio
++    if constexpr (D == 128 && type_K == type_V && (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0)) {
++        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++        const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
++        const int nwarps   = nthreads / WARP_SIZE;
++        fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, false, true, false, true>;
++        constexpr size_t nbytes_shared = 0;
++        launch_fattn<D, 1, cols_per_block>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, false, false, false, false);
++        return true;
++    } else {
++        GGML_UNUSED_VARS(ctx, dst);
++        return false;
++    }
++}
++
++// whether the GQA-columns instance applies: one query, the indexed bias, no kv_rows, no softcap, no ALiBi, a mask
++// shared by the heads (or none), and a GQA ratio the 4 columns cover
++static bool ggml_cuda_flash_attn_ext_vec_use_gqa_cols(const ggml_tensor * dst) {
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * mask = dst->src[3];
++    float max_bias      = 0.0f;
++    float logit_softcap = 0.0f;
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    const int gqa_ratio = Q->ne[2] / K->ne[2];
++    return ggml_cuda_fattn_vec_gqa_enabled() && Q->ne[1] == 1 && dst->src[6] && !dst->src[5] && logit_softcap == 0.0f &&
++        max_bias == 0.0f && (!mask || mask->ne[2] == 1) && gqa_ratio >= 2 && gqa_ratio <= 4;
++}
++
+ template <int D, ggml_type type_K, ggml_type type_V>
+ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * KQV = dst;
+@@ -603,6 +656,10 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
+     float logit_softcap;
+     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+ 
++    if (ggml_cuda_flash_attn_ext_vec_use_gqa_cols(dst) && ggml_cuda_flash_attn_ext_vec_gqa_case_impl<D, type_K, type_V>(ctx, dst)) {
++        return;
++    }
++
+     if (Q->ne[1] == 1) {
+         constexpr int cols_per_block = 1;
+         if (logit_softcap == 0.0f) {
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 4fc250ce4..63eea044e 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -695,7 +695,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         // prefill on the tensor cores: the MMA kernel adds the bias of its one Q head to the mask tile
+         if (Q->ne[0] == 128 && V->ne[0] == 128 && softcap == 0.0f && !kv_rows && Q->ne[1] > 8 &&
+                 GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && ggml_cuda_fattn_mma_bias_enabled() &&
+-                (K->type == GGML_TYPE_F16 || ggml_cuda_fattn_reads_q8_0(dst)) && (V->type == GGML_TYPE_F16 || ggml_cuda_fattn_reads_q8_0(dst))) {
++                (K->type == GGML_TYPE_F16 || ggml_cuda_fattn_in_place_kv(dst) != 0) && (V->type == GGML_TYPE_F16 || ggml_cuda_fattn_in_place_kv(dst) != 0)) {
+             return BEST_FATTN_KERNEL_MMA_F16;
+         }
+         return BEST_FATTN_KERNEL_TILE;
+@@ -832,8 +832,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+     switch (kernel) {
+         case BEST_FATTN_KERNEL_TILE:
+         case BEST_FATTN_KERNEL_MMA_F16:
+-            // the Inkling 2 instances read a q8_0 cache in place: no F16 copy of K and V in the compute buffer
+-            need_f16_K = !ggml_cuda_fattn_reads_q8_0(dst);
++            // the Inkling 2 instances read a q8_0 or q4_0 cache in place: no F16 copy of K and V in the compute buffer
++            need_f16_K = ggml_cuda_fattn_in_place_kv(dst) == 0;
+             need_f16_V = need_f16_K;
+             break;
+         case BEST_FATTN_KERNEL_VEC: {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 4a2b2ce82..7201e6522 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5579,6 +5579,22 @@ bool ggml_flash_attn_ext_has_position_bias(const struct ggml_tensor * a) {
+     return ggml_get_op_params_i32(a, 5) == 2;
+ }
+ 
++// op param 6: the window of a maskless position-mode attention, 0 (the default) for causal only; unused with a mask
++void ggml_flash_attn_ext_set_causal_window(struct ggml_tensor * a, int32_t window) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(window >= 0);
++    ggml_set_op_params_i32(a, 6, window);
++}
++
++int32_t ggml_flash_attn_ext_get_causal_window(const struct ggml_tensor * a) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    return ggml_get_op_params_i32(a, 6);
++}
++
++bool ggml_flash_attn_ext_is_maskless(const struct ggml_tensor * a) {
++    return ggml_flash_attn_ext_has_position_bias(a) && a->src[3] == NULL;
++}
++
+ void ggml_flash_attn_ext_add_position_bias(
+         struct ggml_tensor * a,
+         struct ggml_tensor * table,
+@@ -5591,12 +5607,15 @@ void ggml_flash_attn_ext_add_position_bias(
+ 
+     const struct ggml_tensor * q = a->src[0];
+     const struct ggml_tensor * mask = a->src[3];
+-    GGML_ASSERT(mask && mask->ne[0] == a->src[1]->ne[1] && mask->ne[1] == q->ne[1]);
+-    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
++    if (mask) {
++        GGML_ASSERT(mask->ne[0] == a->src[1]->ne[1] && mask->ne[1] == q->ne[1]);
++        GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
++    }
++    // without a mask the keys are hidden from the positions, see ggml_flash_attn_ext_set_causal_window
+     GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
+     GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[0] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
+     GGML_ASSERT(k_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(k_pos) && ggml_is_matrix(k_pos));
+-    GGML_ASSERT(k_pos->ne[0] == mask->ne[0] && k_pos->ne[1] == q->ne[3]);
++    GGML_ASSERT(k_pos->ne[0] == a->src[1]->ne[1] && k_pos->ne[1] == q->ne[3]);
+     GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos) && ggml_is_vector(q_pos));
+     GGML_ASSERT(q_pos->ne[0] == table->ne[2]);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 07a0dbafc..dd774ce58 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -19,6 +19,7 @@
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
++#include <set>
+ #include <stdexcept>
+ #include <string>
+ #include <unordered_map>
+@@ -110,6 +111,42 @@ static void llama_verify_hadamard_graph(
+     }
+ }
+ 
++// LLAMA_GRAPH_STATS=1: log the node count of each graph by op once per batch size, to see what a decoded token costs
++// in kernel launches (the backends fuse some chains, so the launch count is at most this)
++static void llama_graph_log_stats(ggml_cgraph * gf, uint32_t n_tokens) {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_GRAPH_STATS");
++        return env && atoi(env) != 0;
++    }();
++    if (!enabled) {
++        return;
++    }
++    static std::set<uint32_t> logged;
++    if (!logged.insert(n_tokens).second) {
++        return;
++    }
++    std::map<std::string, int> counts;
++    const int n_nodes = ggml_graph_n_nodes(gf);
++    int n_views = 0;
++    for (int i = 0; i < n_nodes; ++i) {
++        const ggml_tensor * node = ggml_graph_node(gf, i);
++        if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
++                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
++            n_views++;
++            continue;
++        }
++        counts[ggml_op_desc(node)]++;
++    }
++    std::vector<std::pair<std::string, int>> sorted(counts.begin(), counts.end());
++    std::sort(sorted.begin(), sorted.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
++    std::string line;
++    for (const auto & [op, n] : sorted) {
++        line += " " + op + "=" + std::to_string(n);
++    }
++    LLAMA_LOG_INFO("%s: n_tokens = %u: %d nodes, %d of them views (no kernel), by op:%s\n",
++            __func__, n_tokens, n_nodes, n_views, line.c_str());
++}
++
+ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
+     switch (ctx_type) {
+         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
+@@ -1859,6 +1896,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+ 
+         gf_res_prev_active = res;
++
++        llama_graph_log_stats(gf, ubatch.n_tokens);
+     }
+ 
+     // set the input data for the input tensors
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ed982dde4..8f2fecab4 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -37,6 +37,37 @@ static bool llama_inkling_position_bias_enabled() {
+     return enabled;
+ }
+ 
++// LLAMA_INKLING_MOE_CLAMP_NORM=0 writes the Inkling router norm as sum + eps again (SCALE_BIAS) instead of the
++// CLAMP form that the CUDA top-k MoE fusion covers; see build_moe_ffn
++static bool llama_inkling_moe_clamp_norm_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_INKLING_MOE_CLAMP_NORM");
++        return !env || atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++// LLAMA_INKLING_NO_MASK=1: the Inkling attention over a single sequence reads no mask tensor, the kernels hide the
++// future, empty and out-of-window keys from the positions they already have (ggml_flash_attn_ext_set_causal_window)
++static bool llama_inkling_maskless_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_INKLING_NO_MASK");
++        return env && atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++// whether this ubatch can attend without a mask tensor: position mode available, causal attention, and every
++// stream of both caches carries the ubatch's sequence only
++static bool inkling_maskless_ubatch(const llama_memory_hybrid_iswa_context * mctx, const llama_ubatch & ubatch,
++        const llama_cparams & cparams, bool have_positions) {
++    if (!have_positions || !cparams.causal_attn || !llama_inkling_maskless_enabled()) {
++        return false;
++    }
++    const auto * attn_ctx = mctx->get_attn();
++    return attn_ctx->get_base()->is_seq_exclusive(ubatch) && attn_ctx->get_swa()->is_seq_exclusive(ubatch);
++}
++
+ // dedup helpers
+ 
+ static ggml_tensor * build_attn_inp_kq_mask(
+@@ -1501,6 +1532,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+         res &= self_kv_pos_swa->ne[1] == inp_attn->self_attn_mask_swa.raw->ne[3];
+     }
+ 
++    // a graph without mask tensors cannot serve a ubatch that needs them, and the other way round
++    res &= maskless == inkling_maskless_ubatch(mctx, params.ubatch, params.cparams, self_q_pos != nullptr);
++
+     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+ 
+     res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+@@ -2499,7 +2533,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
+             weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+         } else if (hparams.expert_weights_norm_eps > 0.0f) {
+-            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, hparams.expert_weights_norm_eps);
++            // Inkling 2: sum + 1e-20 equals max(sum, 1e-20) bit for bit whenever sum >= 1e-20 * 2^24 (1.7e-13),
++            // and the sum of 8 sigmoid routing weights never gets near that. The CLAMP form matches the CUDA
++            // top-k MoE fusion (ggml_cuda_topk_moe_fusion), which saves the SUM_ROWS, SCALE_BIAS, DIV and SCALE
++            // kernels of every layer application (192 per token).
++            const bool clamp_form = (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) &&
++                llama_inkling_moe_clamp_norm_enabled();
++            if (clamp_form) {
++                weights_sum = ggml_clamp(ctx0, weights_sum, hparams.expert_weights_norm_eps, INFINITY);
++            } else {
++                weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, hparams.expert_weights_norm_eps);
++            }
+         } else {
+             // Avoid division by zero, clamp to smallest number representable by F16
+             weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+@@ -3143,7 +3187,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * bias_table,
+          ggml_tensor * bias_indices,
+          ggml_tensor * bias_k_pos,
+-         ggml_tensor * bias_q_pos) const {
++         ggml_tensor * bias_q_pos,
++             int32_t   causal_window) const {
+     const bool v_trans = v->nb[1] > v->nb[2];
+ 
+     // split the batch into streams if needed
+@@ -3212,8 +3257,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             // prefer the position mode: no [n_kv, n_tokens] index tensor to fill, upload and keep in memory
+             bool attached = false;
+             if (offload && bias_k_pos && !kv_rows && llama_inkling_position_bias_enabled()) {
+-                ggml_flash_attn_ext_add_position_bias(cur, bias_table, bias_k_pos, bias_q_pos);
+-                attached = ggml_backend_dev_supports_op(dev, cur);
++                if (causal_window >= 0) {
++                    // maskless: no [n_kv, n_tokens] mask to fill, upload or keep; the kernels hide the keys from the
++                    // positions (LLAMA_INKLING_NO_MASK). The mask tensor stays unused and unallocated.
++                    cur->src[3] = nullptr;
++                    ggml_flash_attn_ext_set_causal_window(cur, causal_window);
++                    ggml_flash_attn_ext_add_position_bias(cur, bias_table, bias_k_pos, bias_q_pos);
++                    attached = ggml_backend_dev_supports_op(dev, cur);
++                    if (!attached) {
++                        cur->src[3] = kq_mask;
++                        ggml_flash_attn_ext_set_causal_window(cur, 0);
++                    }
++                }
++                if (!attached) {
++                    ggml_flash_attn_ext_add_position_bias(cur, bias_table, bias_k_pos, bias_q_pos);
++                    attached = ggml_backend_dev_supports_op(dev, cur);
++                }
+             }
+             if (!attached) {
+                 ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
+@@ -3768,7 +3827,8 @@ static ggml_tensor * build_attn_iswa_impl(
+         ggml_tensor * bias_table = nullptr,
+         ggml_tensor * bias_indices = nullptr,
+         ggml_tensor * bias_k_pos = nullptr,
+-        ggml_tensor * bias_q_pos = nullptr) {
++        ggml_tensor * bias_q_pos = nullptr,
++            int32_t   causal_window = -1) {
+     ggml_context * ctx0 = gctx.ctx0;
+     ggml_cgraph  * gf   = gctx.gf;
+ 
+@@ -3834,7 +3894,7 @@ static ggml_tensor * build_attn_iswa_impl(
+     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+ 
+-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il, bias_table, bias_indices, bias_k_pos, bias_q_pos);
++    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il, bias_table, bias_indices, bias_k_pos, bias_q_pos, causal_window);
+     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
+     gctx.cb(cur, "kqv_out", il);
+ 
+@@ -4503,6 +4563,8 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+         ggml_set_name(inp->self_q_pos, "attn_inp_q_pos");
+     }
+ 
++    inp->maskless = inkling_maskless_ubatch(mctx_cur, ubatch, cparams, inp->self_q_pos != nullptr);
++
+     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
+ }
+ 
+@@ -4527,8 +4589,11 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+     ggml_tensor * k_pos   = is_swa ? inp->self_kv_pos_swa  : inp->self_kv_pos;
+ 
++    // maskless: the SWA cache hides the keys at a distance of n_swa or more, the full cache the future keys only
++    const int32_t causal_window = inp->maskless ? (is_swa ? (int32_t) hparams.n_swa : 0) : -1;
++
+     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, attn_mask.rows,
+-            sinks, nullptr, kq_scale, il, bias_table, indices, k_pos, inp->self_q_pos);
++            sinks, nullptr, kq_scale, il, bias_table, indices, k_pos, inp->self_q_pos, causal_window);
+ }
+ 
+ void llm_graph_context::build_dense_out(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index afd39e3a6..b5cf8f4ac 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -812,6 +812,10 @@ public:
+     ggml_tensor * self_kv_pos_swa = nullptr; // I32 [n_kv_swa, n_stream]
+     ggml_tensor * self_q_pos      = nullptr; // I32 [n_batch]
+ 
++    // LLAMA_INKLING_NO_MASK: the attention of this ubatch hides the keys from the positions and reads no mask tensor
++    // (every stream holds one sequence only, see llama_kv_cache::is_seq_exclusive); part of the reuse check
++    bool maskless = false;
++
+     const uint32_t extent;
+     const uint32_t extent_swa;
+ 
+@@ -1348,7 +1352,8 @@ struct llm_graph_context {
+             ggml_tensor * bias_table = nullptr,
+             ggml_tensor * bias_indices = nullptr,
+             ggml_tensor * bias_k_pos = nullptr,  // position mode of the bias, see ggml_flash_attn_ext_add_position_bias
+-            ggml_tensor * bias_q_pos = nullptr) const;
++            ggml_tensor * bias_q_pos = nullptr,
++                int32_t   causal_window = -1) const; // >= 0: try the maskless position bias first (window 0: causal only)
+ 
+     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+ 
+diff --git a/src/llama-kv-cache-iswa.cpp b/src/llama-kv-cache-iswa.cpp
+index 8ce8e0165..5749283d6 100644
+--- a/src/llama-kv-cache-iswa.cpp
++++ b/src/llama-kv-cache-iswa.cpp
+@@ -6,6 +6,10 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
+ 
+ //
+ // llama_kv_cache_iswa
+@@ -92,8 +96,37 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
+         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
+     }
+ 
++    // LLAMA_INKLING_KV_TYPE_FULL[_K|_V]: another cell type for the full-attention cache only (Inkling 2). Its 8 slots
++    // are the whole KV cost at depth (17 KiB per token at q8_0, 9 KiB at q4_0) while the 40 SWA slots stay small
++    // and keep their type. Lossy: compare perplexity before adopting it.
++    ggml_type type_k_base = type_k;
++    ggml_type type_v_base = type_v;
++    if (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) {
++        const auto type_from_env = [](const char * name, ggml_type fallback) {
++            const char * env = getenv(name);
++            if (!env || !*env) {
++                return fallback;
++            }
++            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
++                const char * tname = ggml_type_name((ggml_type) t);
++                if (tname && strcmp(tname, env) == 0) {
++                    return (ggml_type) t;
++                }
++            }
++            throw std::runtime_error(std::string(name) + ": unknown ggml type '" + env + "'");
++        };
++        type_k_base = type_from_env("LLAMA_INKLING_KV_TYPE_FULL",   type_k);
++        type_v_base = type_from_env("LLAMA_INKLING_KV_TYPE_FULL",   type_v);
++        type_k_base = type_from_env("LLAMA_INKLING_KV_TYPE_FULL_K", type_k_base);
++        type_v_base = type_from_env("LLAMA_INKLING_KV_TYPE_FULL_V", type_v_base);
++        if (type_k_base != type_k || type_v_base != type_v) {
++            LLAMA_LOG_INFO("%s: LLAMA_INKLING_KV_TYPE_FULL: full-attention cache K = %s, V = %s (SWA cache K = %s, V = %s)\n",
++                    __func__, ggml_type_name(type_k_base), ggml_type_name(type_v_base), ggml_type_name(type_k), ggml_type_name(type_v));
++        }
++    }
++
+     kv_base = std::make_unique<llama_kv_cache>(
+-            model, no_alloc, hparams, type_k, type_v,
++            model, no_alloc, hparams, type_k_base, type_v_base,
+             v_trans, offload, unified, size_base, n_seq_max,
+             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 350bd518e..a13eaed08 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1310,6 +1310,18 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     return result;
+ }
+ 
++bool llama_kv_cache::is_seq_exclusive(const llama_ubatch & ubatch) const {
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        const llama_seq_id seq_id = ubatch.seq_id[i][0];
++        const auto & cells = v_cells.at(seq_to_stream.at(seq_id));
++        // the mask reads the primary sequence of a token only, so the cells of its stream must all carry it
++        if (cells.seq_n_cells(seq_id) != cells.get_used()) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
+     if (ubatch.n_seqs_unq == 1) {
+         return 1;
+@@ -3078,6 +3090,10 @@ uint32_t llama_kv_cache_context::get_n_kv_rows() const {
+     return n_kv_rows;
+ }
+ 
++bool llama_kv_cache_context::is_seq_exclusive(const llama_ubatch & ubatch) const {
++    return kv->is_seq_exclusive(ubatch);
++}
++
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 16a07fe69..61a6e030c 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -194,6 +194,10 @@ public:
+ 
+     uint32_t get_n_kv(const slot_info & sinfo) const;
+ 
++    // true if every used cell of the stream of each ubatch token carries that token's sequence: a causal mask over
++    // those cells is then a function of the positions alone (ggml_flash_attn_ext_set_causal_window)
++    bool is_seq_exclusive(const llama_ubatch & ubatch) const;
++
+     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
+     // the ubatch splits into n_slices groups of tokens with one sequence each
+     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
+@@ -421,6 +425,7 @@ public:
+ 
+     uint32_t get_n_kv() const;
+     uint32_t get_n_kv_rows() const;
++    bool is_seq_exclusive(const llama_ubatch & ubatch) const;
+ 
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 4cb102bf5..d503e8310 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -1,6 +1,26 @@
+ #include "models.h"
+ #include "../llama-memory-hybrid-iswa.h"
+ 
++#include <cstdlib>
++
++// LLAMA_INKLING_GRAPH_TRIM=0 restores the per-layer zero-sink fill and the lm_head over the padded vocabulary
++bool llama_model_inkling2::graph::graph_trim_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_INKLING_GRAPH_TRIM");
++        return !env || atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++// LLAMA_INKLING_DECODE_SINKS=0 folds the sink into the bias table for one-token graphs too (SUB + FILL per layer)
++bool llama_model_inkling2::graph::decode_sinks_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_INKLING_DECODE_SINKS");
++        return !env || atoi(env) != 0;
++    }();
++    return enabled;
++}
++
+ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
+@@ -417,12 +437,28 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+ 
++        // the far bin (distance >= extent) is the zero row of the padded table
+         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+ 
+-        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
+-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+-
+-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
++        if (n_tokens == 1 && decode_sinks_enabled()) {
++            // one query: its sink logit goes to the attention as the per-head sink, no shift of the table (saves
++            // the SUB and FILL kernels of every layer application; same softmax, rounded along another path)
++            sinks = ggml_reshape_1d(ctx0, sinks, n_head);
++        } else {
++            // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
++            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
++
++            if (graph_trim_enabled()) {
++                // the zero sink is the same for every layer: one FILL per graph instead of one per layer application
++                if (!zero_sinks) {
++                    zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
++                }
++                GGML_ASSERT(zero_sinks->ne[0] == n_head);
++                sinks = zero_sinks;
++            } else {
++                sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
++            }
++        }
+ 
+         cur = build_attn(inp,
+                 nullptr, nullptr, nullptr,
+@@ -492,7 +528,16 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
+     res->t_embd = cur;
+ 
+     // lm_head
+-    cur = build_lora_mm(model.output, cur);
++    if (graph_trim_enabled() && hparams.n_vocab_unpadded < hparams.n_vocab_padded && loras->empty() &&
++            !model.get_w_scale(model.output) && !(hdmd && hdmd->rot.count(model.output))) {
++        // only the rows of the real vocabulary: a leading-row view of a quantized matrix is a contiguous matrix of
++        // whole rows, each output row is the same dot product, and the result needs no CONT below
++        ggml_tensor * output = ggml_view_2d(ctx0, model.output, model.output->ne[0], hparams.n_vocab_unpadded, model.output->nb[1], 0);
++        cur = ggml_mul_mat(ctx0, output, cur);
++        ggml_prec_set_acc(cur, GGML_PREC_F32); // what load_arch_tensors asks for model.output
++    } else {
++        cur = build_lora_mm(model.output, cur);
++    }
+ 
+     if (hparams.f_final_logit_softcapping != 0.0f) {
+         const float cap = hparams.f_final_logit_softcapping;
+@@ -501,7 +546,9 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
+     }
+ 
+     // drop the padded vocabulary
+-    cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
++    if ((int64_t) hparams.n_vocab_unpadded != cur->ne[0]) {
++        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
++    }
+ 
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+diff --git a/src/models/models.h b/src/models/models.h
+index e7b6d38a1..06a701eca 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2551,6 +2551,11 @@ struct llama_model_inkling2 : public llama_model_base {
+ 
+         ggml_tensor * inp_out_ids = nullptr;
+         ggml_tensor * tau         = nullptr; // log-scaled positions
++        ggml_tensor * zero_sinks  = nullptr; // [n_head] zeros shared by every layer (LLAMA_INKLING_GRAPH_TRIM)
++
++        // graph-level switches, read once
++        static bool graph_trim_enabled();  // LLAMA_INKLING_GRAPH_TRIM, default on
++        static bool decode_sinks_enabled(); // LLAMA_INKLING_DECODE_SINKS, default on
+ 
+     private:
+         // the normalized depth states of blocks[0, n), latest first, shared by every mix over the same blocks
+diff --git a/tests/test-flash-attn-indexed-bias.cpp b/tests/test-flash-attn-indexed-bias.cpp
+index d953312a1..6b8fb1b3a 100644
+--- a/tests/test-flash-attn-indexed-bias.cpp
++++ b/tests/test-flash-attn-indexed-bias.cpp
+@@ -14,9 +14,12 @@ static void set_kv(ggml_tensor * t, const std::vector<float> & data) {
+ }
+ 
+ // use_pos: position mode (ggml_flash_attn_ext_add_position_bias), the backend derives the bins from positions
++// window >= 0: maskless position mode, no mask tensor, the backend hides d < 0 and (window > 0) d >= window itself
+ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows, int n_query, int cells = 768, ggml_type kv_type = GGML_TYPE_F16,
+-                              bool use_pos = false) {
++                              bool use_pos = false, int window = -1) {
+     GGML_ASSERT(!(use_pos && use_rows));
++    GGML_ASSERT(window < 0 || use_pos);
++    const bool maskless = window >= 0;
+     constexpr int heads = 6, kv_heads = 2, streams = 2, bins = 17;
+     const int cols = use_rows ? std::min(512, cells) : cells;
+ 
+@@ -31,17 +34,24 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows,
+     auto * k_pos = use_pos ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, streams) : nullptr;
+     auto * q_pos = use_pos ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_query*streams) : nullptr;
+     auto * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
+-    auto * out = ggml_flash_attn_ext_rows(ctx, q, k, v, mask, rows, 1.0f/sqrtf(width), 0, 0);
++    auto * out = ggml_flash_attn_ext_rows(ctx, q, k, v, maskless ? nullptr : mask, rows, 1.0f/sqrtf(width), 0, 0);
+     ggml_flash_attn_ext_add_sinks(out, sinks);
+-    const bool supports_plain = ggml_backend_supports_op(backend, out);
+-    ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
+-    GGML_ASSERT(ggml_flash_attn_ext_has_indexed_bias(out));
+-    ggml_flash_attn_ext_add_indexed_bias(out, nullptr, nullptr);
+-    GGML_ASSERT(!ggml_flash_attn_ext_has_indexed_bias(out) && !out->src[6] && !out->src[7]);
+-    GGML_ASSERT(ggml_backend_supports_op(backend, out) == supports_plain);
++    if (!maskless) {
++        const bool supports_plain = ggml_backend_supports_op(backend, out);
++        ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
++        GGML_ASSERT(ggml_flash_attn_ext_has_indexed_bias(out));
++        ggml_flash_attn_ext_add_indexed_bias(out, nullptr, nullptr);
++        GGML_ASSERT(!ggml_flash_attn_ext_has_indexed_bias(out) && !out->src[6] && !out->src[7]);
++        GGML_ASSERT(ggml_backend_supports_op(backend, out) == supports_plain);
++    }
+     if (use_pos) {
++        if (maskless) {
++            ggml_flash_attn_ext_set_causal_window(out, window);
++            GGML_ASSERT(ggml_flash_attn_ext_get_causal_window(out) == window);
++        }
+         ggml_flash_attn_ext_add_position_bias(out, table, k_pos, q_pos);
+         GGML_ASSERT(ggml_flash_attn_ext_has_indexed_bias(out) && ggml_flash_attn_ext_has_position_bias(out));
++        GGML_ASSERT(ggml_flash_attn_ext_is_maskless(out) == maskless);
+     } else {
+         ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
+     }
+@@ -104,18 +114,20 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows,
+                 for (int c = 0; c < cols; ++c) {
+                     const int cell = row[s*cols + c];
+                     const int i = query*cols + c;
++                    const int64_t d = int64_t(qpos[query]) - kpos[s*cols + c];
+                     if (use_pos) {
+-                        const int64_t d = int64_t(qpos[query]) - kpos[s*cols + c];
+                         idx[i] = d >= 0 && d < bins - 1 ? int32_t(d) : bins - 1;
+                     } else {
+                         idx[i] = (c + 3*query) % bins;
+                     }
+-                    const bool visible = (s != 1 || j != 0) && cell >= 0 && (c + j) % 7 != 0;
++                    // maskless: the backend hides the future and empty keys (d < 0) and the keys at or past the window
++                    const bool visible = maskless ? (d >= 0 && (window == 0 || d < window)) :
++                        (s != 1 || j != 0) && cell >= 0 && (c + j) % 7 != 0;
+                     visibility[i] = ggml_fp32_to_fp16(visible ? 0.25f : -INFINITY);
+                     if (visible) {
+                         const int vk = (use_rows ? 0 : s)*kv_heads + h/(heads/kv_heads);
+                         const double qk = 4.0*keys[(vk*cells + cell)*width]/sqrt(width);
+-                        const float m = 0.25f + biases[(query*heads + h)*bins + idx[i]];
++                        const float m = (maskless ? 0.0f : 0.25f) + biases[(query*heads + h)*bins + idx[i]];
+                         const double weight = exp(qk + ggml_fp16_to_fp32(ggml_fp32_to_fp16(m)));
+                         weighted += weight*values[(vk*cells + cell)*width];
+                         sum += weight;
+@@ -147,7 +159,7 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows,
+         GGML_ASSERT(std::isfinite(output[i]));
+         max_error = std::max(max_error, fabsf(output[i] - expected[i/width]));
+     }
+-    printf("%s: width=%d, kv=%s, rows=%d, pos=%d, queries=%d, cells=%d, max error=%g\n", ggml_backend_name(backend), width, ggml_type_name(kv_type), use_rows, use_pos, n_query, cells, max_error);
++    printf("%s: width=%d, kv=%s, rows=%d, pos=%d, window=%d, queries=%d, cells=%d, max error=%g\n", ggml_backend_name(backend), width, ggml_type_name(kv_type), use_rows, use_pos, window, n_query, cells, max_error);
+     GGML_ASSERT(max_error < 0.001f);
+     ggml_backend_buffer_free(buf);
+     ggml_free(ctx);
+@@ -168,11 +180,19 @@ int main() {
+                 test_indexed_bias(backend, width, false, n_query);
+                 test_indexed_bias(backend, width, true, n_query);
+                 test_indexed_bias(backend, width, false, n_query, 768, GGML_TYPE_F16, true);
++                // maskless: causal only, and with a sliding window (LLAMA_INKLING_NO_MASK)
++                test_indexed_bias(backend, width, false, n_query, 768, GGML_TYPE_F16, true, 0);
++                test_indexed_bias(backend, width, false, n_query, 768, GGML_TYPE_F16, true, 40);
+             }
+             // the shapes Inkling 2 Mini runs on a q8_0 cache: decode, DSpark verify, prefill ubatches
+             for (int n_query : {1, 4, 128, 512}) {
+                 test_indexed_bias(backend, width, false, n_query, 1024, GGML_TYPE_Q8_0);
+                 test_indexed_bias(backend, width, false, n_query, 1024, GGML_TYPE_Q8_0, true);
++                test_indexed_bias(backend, width, false, n_query, 1024, GGML_TYPE_Q8_0, true, 0);
++                test_indexed_bias(backend, width, false, n_query, 1024, GGML_TYPE_Q8_0, true, 16);
++                // a q4_0 full-attention cache (LLAMA_INKLING_KV_TYPE_FULL=q4_0): the in-place q4_0 loader of the tile/MMA kernels
++                test_indexed_bias(backend, width, false, n_query, 1024, GGML_TYPE_Q4_0);
++                test_indexed_bias(backend, width, false, n_query, 1024, GGML_TYPE_Q4_0, true);
+             }
+         }
+         ggml_backend_free(backend);

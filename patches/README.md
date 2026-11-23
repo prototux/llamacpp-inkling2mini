@@ -12,6 +12,11 @@ Applied in file-name order with `git apply` on upstream llama.cpp at the commit 
 | `0005-inkling2-loop-kv-sharing-and-drift-tool.patch` | this repository | opt-in cross-pass KV sharing, `llama-inkling-pass-kv` |
 | `0006-inkling2-dspark-verify-fixes.patch` | this repository; adaptive drafting ported from [#32773](https://github.com/ggml-org/llama.cpp/pull/32773) by Oxsilaris06 | fusable convolution-state chain with rollback snapshots, vec attention kernel for verification batches, adaptive drafting, `LLAMA_DSPARK_BLOCK`, `LLAMA_SPEC_RS_SEQ` |
 
+| `0007-inkling2-moonshot-decode-attention-maskless-q4-kv.patch` | this repository | fewer one-token kernels (router norm, sinks, graph trim), decode attention per KV head, attention without a mask tensor, q4_0 full-attention cache (known bug), graph statistics |
+| `0008-cuda-multi-stream-decode-plan.patch` | this repository | multi-stream plan for small-batch CUDA graphs (`GGML_CUDA_GRAPH_OPT=2`), fix for the vec kernel with a NULL mask, flash-attention tests at the Inkling 2 shapes |
+
+The build applies the patches listed in `series`, in that order.
+
 To update: rebase the changes on a newer upstream commit, regenerate the patches with `git diff --binary` between
 the successive steps, set `LLAMA_CPP_COMMIT`, and check that applying them reproduces the tree you tested
 (`git write-tree`).

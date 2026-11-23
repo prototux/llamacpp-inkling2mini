@@ -1,0 +1,8 @@
+0001-cuda-indexed-bias-flash-attention.patch
+0002-inkling2-dspark-speculative-decoding.patch
+0003-inkling2-fused-cuda-glue-kernels.patch
+0004-inkling2-attention-prefill-position-bias-q8-kv.patch
+0005-inkling2-loop-kv-sharing-and-drift-tool.patch
+0006-inkling2-dspark-verify-fixes.patch
+0007-inkling2-moonshot-decode-attention-maskless-q4-kv.patch
+0008-cuda-multi-stream-decode-plan.patch

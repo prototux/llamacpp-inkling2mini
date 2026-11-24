@@ -67,6 +67,10 @@ The API is on `http://127.0.0.1:8080` (OpenAI-compatible under `/v1`), the llama
 The log line `n_ctx = ...` shows the context `--fit` chose; to make restarts reproducible, copy `.env.example` to
 `.env` and set `CTX` to that value.
 
+To update: `git pull && docker compose pull --policy always && docker compose up -d`. The compose file sets
+`pull_policy: missing` so that a machine without network starts from its local image, which also makes a plain
+`docker compose pull` skip an image that is already present.
+
 ## Model files
 
 Put these files in `./models` (or the directory `MODELS_DIR` points to). Download them once, on any machine;

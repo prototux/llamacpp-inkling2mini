@@ -1,8 +1,16 @@
 diff --git a/docs/inkling-moonshot.md b/docs/inkling-moonshot.md
-index 23b8fdd52..687ddb16c 100644
+index 23b8fdd52..01001b720 100644
 --- a/docs/inkling-moonshot.md
 +++ b/docs/inkling-moonshot.md
-@@ -95,3 +95,437 @@ All commands through the compose service; `E` stands for the environment of the
+@@ -61,6 +61,7 @@ layer application for 8 experts), the output head Q5_K (320 MB).
+ | `LLAMA_INKLING_FA_VEC_GQA` | off | `=1`: decode flash attention reads each KV head once for its 3 Q heads |
+ | `LLAMA_INKLING_KV_TYPE_FULL[_K\|_V]` | unset | cell type of the full-attention cache, e.g. `q4_0` (K and V the same type for the in-place prefill loader) |
+ | `LLAMA_GRAPH_STATS` | off | `=1`: log the node count by op of each graph shape |
++| `LLAMA_INKLING_GEMV` | off | `=1`: one-token Q8_0/Q6_K attention projections through mmvq-inkling.cu (bit-identical, branch `gemv`) |
+ 
+ Existing switches from `inkling-3090-exp` keep working: `LLAMA_INKLING_FA_MMA`, `LLAMA_INKLING_POS_BIAS`,
+ `LLAMA_INKLING_FA_Q8_0`, `LLAMA_INKLING_FA_VEC_VERIFY`, `LLAMA_INKLING_SHARE_LOOP_KV`. `LLAMA_INKLING_NO_MASK`
+@@ -95,3 +96,618 @@ All commands through the compose service; `E` stands for the environment of the
     `n_ctx`. For q4_0 run `llama-perplexity -c 8192` against the q8_0 cache and decide on the loss.
  6. Configuration experiments without code: `-ub 2048 -b 2048` for prefill (4x more rows per expert GEMM), and
     `--backend-sampling` for decode (no 800 KB logits copy per token).
@@ -440,6 +448,187 @@ index 23b8fdd52..687ddb16c 100644
 +   as mmvq (or a documented bound).
 +Not worth more work: MK_MOE (parity in launches, kernel 3-8% slower), MK_WO (neutral), MK_GLUE=2 (slower than =1),
 +multi-stream (no gain: the graph is a dependency chain).
++
++### The layer-kernel premise, measured (scripts/inkling-launch-costs.cu on the 3090)
++| cost | us |
++|---|---|
++| kernel launch inside a replayed CUDA graph (82 x 1024 threads) | 1.30 (empty 1-block kernel: 0.73; outside a graph: 2.03) |
++| cooperative launch, same kernel | 1.30 (no extra cost) |
++| cooperative-groups grid barrier | 1.02 |
++| hand-rolled atomic barrier (nanosleep spin) | 2.05 |
++| resident 1024-thread blocks per SM | 1 |
++
++Merging two phases saves a launch (1.3 us) and costs a barrier (1.0 us): ~0.3 us per boundary, so a whole-layer
++kernel of ~40 launches and ~12 barriers would save ~15 us per layer application, ~0.7 ms per token (+7%) at best, not
++the +35-45% estimated in iteration 8 (which assumed ~1.9 us per launch and free barriers). The measured glue2 case adds
++the other cost: one cooperative grid distributing 48 + 216 blocks' work itself took 25 us where two hardware-scheduled
++launches took 20 us. Phase 1 as planned (glue + 5 projections + sinks/taps in one launch: -4-5 launches, +2-3 barriers,
++plus the distribution penalty) nets about zero per layer application and was not built.
++
++Where the 10.5 ms/token go with glue on: ~2080 launches x 1.3 us = 2.7 ms of launch cost; ~7.8 ms of kernel time, of
++which 3.3 ms is weight traffic at peak bandwidth, the MoE products run at 80% of it, the projections at 56-66%, and
++~1400 small kernels take 1.5-2.5 us each (a latency floor independent of the launch). Options on the table: hardware-
++scheduled fusions without barriers on the remaining chains of a layer application (~15-20 launches less per
++application, ~+10%, incremental and bit-exact by body replication); the deep-context attention switches
++(`LLAMA_INKLING_FA_VEC_GQA`, `LLAMA_INKLING_NO_MASK`: the bench loses 20% from short to 54K context and neither was
++ever benchmarked); the layer kernel for the architecture's sake (~+7% at the end).
++
++Deep-context attention switches, measured (mk-bench, glue on in every row; short / 54K tok/s): glue 94.7 / 75.6;
++`LLAMA_INKLING_FA_VEC_GQA=1` 92.3 / 77.3 (+2.3% at 54K, -2.5% at short context); `LLAMA_INKLING_NO_MASK=1` 96.0 / 75.7
++(+1% short, 0 at depth); both 92.1 / 77.4. The short-to-54K loss (~2.5 ms/token) is attention time, but the KV read
++at 54K is only ~0.9 GB (~1 ms at peak): the decode attention kernel runs at ~40% of bandwidth at depth, and reading
++K/V once per KV head recovers 0.3 ms of it. Recommended set: `LLAMA_INKLING_MK_GLUE=1`, `LLAMA_INKLING_NO_MASK=1`
++after a greedy-identity pass; FA_VEC_GQA only as a deep-context choice.
++
++## Branch `megakernel`, iteration 9: NO_MASK verified, GQA attention by context depth, towards barrier-free fusions
++
++### `LLAMA_INKLING_NO_MASK=1` is bit-identical (3090, glue on, dev image)
++- `scripts/bisect-loop.sh` (1500 greedy tokens of the Terraform prompt): `glue` and `glue-nomask` produce the same text
++  (both differ from the all-off baseline at char 124 as expected, since the baseline runs M3/M4 off), loop score 0.00.
++- `scripts/compare-quality.sh`: top-10 probabilities over 128 tokens: max |dp| 0.0000, mean KL 0, 128/128 greedy tokens
++  identical; Terraform completeness 26/26 resources in both. MK_CHECK does not apply (NO_MASK changes the graph, not a
++  fusion). Verdict: yes, identical; recommended on.
++
++### `LLAMA_INKLING_FA_VEC_GQA`: `auto` by KV length (default now)
++Depth sweep (`/data/inkling/dev-image/depth-sweep.sh`, glue on, 256 greedy tokens after a filler prompt):
++
++| prompt tokens | 3603 | 14432 | 28796 | 48540 | 89782 |
++|---|---|---|---|---|---|
++| tok/s, GQA off | 81.6 | 79.5 | 75.0 | 70.4 | 61.7 |
++| tok/s, GQA on | 80.3 | 78.0 | 74.9 | 71.3 | 64.6 |
++
++Crossover ~30K cells, but at 54K repeated benches differ by +-1.5% (one run +2.3%, one -1.4%), more than the gain, so
++`auto` is NOT the default: `LLAMA_INKLING_FA_VEC_GQA=auto` (or `auto:<cells>`) takes the GQA kernel for a flash-attention
++node whose K view has >= 65536 cells (the depth where the gain is clear, +4.7% at 90K), `1` always, unset or `0` never. The choice depends on a node property (the K
++view's length), so a captured CUDA graph is re-captured when it changes; the SWA slots (1024-cell windows) never take it.
++Numerics: the two kernels split the KV range differently and are NOT bit-identical. Before the first differing greedy
++token (identical for 13-126 tokens depending on depth) the top-10 probabilities differ by max |dp| 0.02-0.16 and mean
++KL 2e-4 to 4e-3 per token on the filler prompt (a flat distribution, the most sensitive case); after it the texts
++diverge as any rounding change does at temperature 0. The attention test (`test-flash-attn-indexed-bias`) reports the
++same max errors against the CPU reference with GQA on and off at its 1024-cell shapes.
++
++### Option A, step 1: `LLAMA_INKLING_MK_RELTAB=1` (committed 4dc4af30b)
++The relative-position bias table of one token's attention cost three launches per layer application: PAD of the constant
++table (its zero far-bin row), the CLIP fusion of R and a cublasSgemm (k 16, n 24, m 1025; 6.1 us). One kernel computes
++the clip for its head with the CLIP body (the block size of the unfused launch) and the dot as an FMA chain over k in
++ascending order, which is exactly what cublasSgemm produces for this shape on the 3090 (0 differing elements in 4.9 M
++random trials; a mul+add chain, a descending chain, pairwise and 2/4-way split chains all differ). The self-test compares
++the fused kernel with cuBLAS at every run. 3090: MK_CHECK 0 mismatching (200 steps, every stage on); mk-bench A/B/A/B
++glue 95.1/95.0, 95.6/94.7 -> glue+reltab 97.1/96.8, 96.3/96.3 tok/s (+1.6% short), 74.7/75.0 -> 75.3/75.3 at 54K;
++MK_PROFILE (graphs off) 2078 -> 1974 launched groups, -0.5 ms wall per token.
++
++Decode launch inventory (one token, glue on, from the real graph dump and the MK_DEBUG decline log; ~44 per layer
++application): rs GET_ROWS 1, MIX 1, glue 2, projections 5 + sinks 1, K/V conv_state 2, Q/K/R clips 3, FWHT rotations 4
++(Q, K, V, out), V rms_norm 1, SET_ROWS 2, [PAD + rel table 2 -> reltab 1], flash attention + split-K combine 2,
++sigmoid*gate 1, wo quantize 1, wo 1, post conv 1, FFN: mix 1, glue 2, router 1, top-k 1, gate_up 1, SITU 1 (+ down-scale
++REPEAT/GET_ROWS/MUL 3 where the experts carry scales), down quantize 1, down 1, weighted reduction 1, post conv 1.
++Remaining barrier-free candidates (bit-exact by body replication), each ~0.5-1.5%: the down-scale chain into the
++weighted reduction (-3), SITU emitting the down product's q8_1 (-1), the gated wo input quantized in one kernel and
++handed to mmvq (-1), K/V clip + FWHT + SET_ROWS epilogues (-2 each), Q clip + FWHT (-1).
++
++### The attention-input reorder changes the output distribution (open)
++compare-quality (dev image, graphs on, reference = code defaults): MK_GLUE=1 differs by max |dp| 0.0261, mean KL 0.0013
++on the 128-token probe (greedy tokens identical); MK_PROJ=1 the same numbers; glue with GGML_CUDA_DISABLE_GRAPHS=1 the
++same; and `LLAMA_INKLING_MK_ORDER=1` (new: the 3b0fb785c expansion order alone, no fused kernel) the same. The fused
++kernels are bit-exact against the unfused ops (MK_CHECK), so the node order itself changes the result: the two graphs
++have the same ops (dump diff: only the norm/projection positions move within each layer), so the suspects are
++ggml-alloc's placement (an aliasing or in-place assumption in some kernel) or a backend fusion that matches
++differently. Being checked with the CUDA fusions disabled and on the CPU backend.
++
++Resolved: compare-quality with `GGML_CUDA_DISABLE_FUSION=1` shows no order effect (0.0000), and `LLAMA_INKLING_FUSION_SKIP`
++(new: a comma list of this file's fusions to leave unfused, for diagnosis) bisects it to the MIX fusion alone: with
++`mix` skipped the two orders are identical, with any other group skipped the 0.0261 remains. The MK_DEBUG log of the
++mix matcher shows the same shapes and kernel choices in both orders except one odd-state-count instance that the
++matcher declines in the default order because ggml-alloc placed its output over an input (the overlap check), so that
++instance runs the unfused path (cublasSgemm for the second product) in one order and the single-pass MIX kernel in the
++other. Both are the known inexact MIX for odd state counts; 0.026 max |dp| / 1.3e-3 KL is the size of that
++non-bit-exactness in the output distribution. No stage is at fault. cuBLAS's order for the odd-count product is a
++multiply-then-add chain in ascending k for n_q = 3 and 4 (0 of 7 M elements differ, k 3..11, `mixblas-exp.cu`), but
++for n_q = 1 (the SWA attention mixes and every FFN mix) its gemv kernel reduces in an order none of the simple chains
++reproduce; an exact odd-count MIX is therefore only possible for the 8 full-attention mixes of a token.
++
++## Branch `gemv`: a faster one-token Q8_0 / Q6_K GEMV for the attention projections (`LLAMA_INKLING_GEMV=1`, default off)
++
++Branched from `megakernel` at 325b71f3d. New files only (`ggml/src/ggml-cuda/mmvq-inkling.{cu,cuh}`,
++`tests/test-inkling-gemv.cpp`, `scripts/inkling-gemv-bwprobe.cu`) plus a 3-line hook in `ggml_cuda_mul_mat` in front of
++`ggml_cuda_mul_mat_vec_q`; mmvq.cu and inkling2.cu are untouched. The switch is read on every call (test toggling),
++`LLAMA_INKLING_GEMV_DEBUG=1` logs the first launch of each shape (server: with `LLAMA_ARG_LOG_VERBOSITY=4`).
++
++### Where the time went
++Decode profile (llama-bench tg48 under nsys, graphs on, `MK_GLUE=1`): the one-token Q8_0/Q6_K products are 2.18 ms
++of the ~10.9 ms per token, all plain `mul_mat_vec_q<type, 1, false>` launches (no fusion variant), 4 warps x 1 row per
++block. A plain read kernel (`scripts/inkling-gemv-bwprobe.cu`, 16-byte loads, no compute) sets the floor for a single
++kernel on this GPU: time = 1.3 us + bytes / 892 GB/s, i.e. 9.7 us for 7.5 MB (83% of 936 GB/s), 4.1 us for 2.5 MB
++(65%), 2.3 us for 0.94 MB (42%). **The 85% target is above that floor for every one of these shapes**; it would need
++the next kernel's loads to overlap this one's tail (PDL is Hopper+; cross-kernel L2 prefetch is a graph-level change).
++
++### What limits mul_mat_vec_q here, and the kernel
++Its K loop has a run-time trip count, so a thread issues the loads of iteration it+1 only after using those of
++iteration it: 3 dependent rounds of DRAM latency on 2304-wide Q8_0 rows. `inkling_gemv<type, ncols>` is the same
++kernel (same threads, the same `vec_dot_q8_0_q8_1` / `vec_dot_q6_K_q8_1` calls on the same slices, the same
++cross-warp and warp reduction) with ncols as a template parameter: the loop unrolls and all loads go out at once.
++Bit-identical by construction; dispatched only for (Q8_0 | Q6_K) x {2304 -> 3072, 1024, 384; 3072 -> 2304}, NVIDIA
++Ampere/Ada except Orin (mmvq's generic parameter table), weights not in a compute buffer; it takes the glue's q8_1 when
++there is one.
++
++Tried first and dropped (commit 553a43e6c has the first): staging the rows in shared memory to replace the 2-byte
++loads by 16-byte ones, bit-exact by recomputing mmvq's 128 per-thread partial sums from a conflict-free layout (pairs of
++blocks, 17 words, half warp per row) and reducing them in mmvq's order. Per-warp cp.async rings: 11.1 us; all loads in
++registers up front (one wave), then slice by slice through a shared-memory window: 11.15 us; 8 rows per block in one
++stage: 11.5 us (vs 11.65 for mmvq, 10.2 for the final kernel). Probes: without the compute the staging kernels took
++10.3-10.5 us, without the loads 5+ us: the computation from shared memory came after the last bytes arrived. The 2-byte
++loads are not the bottleneck on the 3090; the dependent load rounds are. More rows per block in the final kernel
++(2 or 4, sharing the activation loads) was slower too (11.0 / 11.0 us on 3072 rows).
++
++### Results (RTX 3090, evira)
++Per shape, kernel time in the decode graph (nsys, llama-bench tg48, `MK_GLUE=1`), before -> after; % of 936 GB/s:
++
++| type, shape (cols x rows) | calls/token | bytes | us before | us after | % before | % after | floor (plain read) | bit-identical |
++|---|---|---|---|---|---|---|---|---|
++| q8_0 2304 x 3072 (Q, gate) | 76 | 7.52 MB | 11.80 | 10.37 | 68% | 77% | 9.7 us | yes |
++| q8_0 3072 x 2304 (output) | 44 | 7.52 MB | 11.22 | 10.50 | 72% | 77% | 9.7 us | yes |
++| q8_0 2304 x 1024 (K, V) | 87 | 2.51 MB | 5.32 | 4.55 | 50% | 59% | 4.1 us | yes |
++| q8_0 2304 x 384 (R) | 34 | 0.94 MB | 3.28 | 2.95 | 31% | 34% | 2.3 us | yes |
++| q6_K 2304 x 3072 | 13 | 5.81 MB | 9.13 | 8.59 | 68% | 72% | 7.8 us | yes |
++| q6_K 3072 x 2304 | 4 | 5.81 MB | 8.93 | 8.65 | 69% | 72% | 7.8 us | yes |
++| q6_K 2304 x 1024 | 6 | 1.94 MB | 4.48 | 4.06 | 46% | 51% | 3.5 us | yes |
++| q6_K 2304 x 384 | 11 | 0.73 MB | 3.15 | 2.93 | 25% | 26% | 2.1 us | yes |
++
++Sum: 2.18 -> 1.95 ms per token (-232 us). test-inkling-gemv (random weights, 160 MB of copies per case so that L2
++does not help): 8/8 bit-identical to mul_mat_vec_q, NMSE vs a double-precision product 1.2-1.6e-5 for both.
++test-inkling-megakernel with `LLAMA_INKLING_GEMV=1`: 70/70 PASS (glue q8_1 consumed by the new kernel).
++
++mk-bench (`IMAGE=llamacpp-inkling2mini:gemv`, graphs on, 131072 ctx, greedy 512 tokens; short-1 / short-2 / after a
++54K prompt, tok/s):
++
++| config | short-1 | short-2 | 54K |
++|---|---|---|---|
++| off | 90.5 | 90.6 | 72.1 |
++| gemv | 91.6 | 91.5 | 73.2 |
++| glue (round a / b) | 95.4 / 94.9 | 95.1 / 94.9 | 76.2 / 74.7 |
++| gemv + glue (round a / b) | 97.8 / 97.0 | 97.4 / 96.6 | 76.9 / 76.1 |
++
+++2.0-2.5% short, +1-2% at 54K on top of `MK_GLUE=1` (+1.2% without glue). compare-quality (greedy top-10 over 128
++tokens): gemv+glue vs glue and gemv vs off both max |dp| 0, KL 0, 128/128 tokens the same, as bit identity implies.
++
++### Next
++The remaining gap to the floor is ~0.5 us per 7.5 MB product; past the floor only cross-kernel overlap helps: one
++launch for the 5 projections of a layer application (MK_PROJ's multi kernel with this unrolled body: the fixed
++1.3 us is paid once instead of 5 times, ~5 x 48 x 1 us = up to 0.25 ms/token), or the layer-application kernel.
++
++### Option A, steps 2-3 (committed c8474e171, b87a58dfa), the gemv merge (3e959ba0b)
++| step | what | MK_CHECK | mk-bench short / 54K | 
++|---|---|---|---|
++| 2 `LLAMA_INKLING_MK_MOESCALE=1` | the REPEAT + GET_ROWS of the per-expert scale table (2 launches per application) folded into upstream's fused MoE weighted reduction, which gathers the scale by the routed id and rounds every step as the unfused MUL/MUL/ADD do (upstream's `sum += (e*s)*w` contracts into an FMA, 1 ulp off the unfused graph; the switched variant is bit-identical to it) | 100-200 steps: 0 mismatching | glue+reltab 96.3-96.7 / 75.2-76.5 -> +moescale 96.7-97.3 / 75.8-76.4 (inside the noise); 1974 -> 1922 launched groups |
++| 3 SITU for the scale-less chain | the MK_DEBUG decline log showed the SITU fusion matching only 10 of 48 applications: the NVFP4 expert layers apply the scale inside the product kernel, so their chain has no MUL and neither matcher form fit; a third form (explicit subgraph indices: the gate/up views are not constants) fuses the 10 ops of the other 38 applications; always on | 100 steps: 0 mismatching | glue+reltab+moescale 96.7-97.3 / 75.8-76.4 -> 99.6-100.9 / 77.6-78.8 (+3%) |
++| gemv (merged) | `LLAMA_INKLING_GEMV=1`: the unrolled Q8_0/Q6_K one-token GEMV of branch `gemv`, bit-identical to mmvq, takes the glue's q8_1 | self-test and test-inkling-gemv (rerun after the merge pending) | stages 99.6-100.9 / 77.6-78.8 -> stages+gemv 101.3-102.4 / 79.2-79.6 (+2%) |
++
++Launch inventory after these: ~1920 groups per token (from 2078 with glue alone). The remaining barrier-free candidates
++(each ~0.5-1%): the gated wo input quantized in one kernel and handed to mmvq, SITU emitting the down product's q8_1
++(needs the hand-off to carry 8 rows), K/V clip + FWHT + SET_ROWS epilogues, Q clip + FWHT.
++
++Recommended production set now: `LLAMA_INKLING_MK_GLUE=1 LLAMA_INKLING_MK_RELTAB=1 LLAMA_INKLING_MK_MOESCALE=1
++LLAMA_INKLING_GEMV=1 LLAMA_INKLING_NO_MASK=1` (each bit-identical to the unfused graph; MK_CHECK 0 with all of them).
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 5b3c32858..4aa490c55 100644
 --- a/ggml/src/ggml-cuda/common.cuh
@@ -454,8 +643,56 @@ index 5b3c32858..4aa490c55 100644
      ~ggml_backend_cuda_context();
  
      cudaStream_t stream(int device, int stream) {
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 570b69d2d..98d847b7b 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1,6 +1,9 @@
+ #pragma once
+ 
+ #include "common.cuh"
++
++#include <climits>
++#include <cstring>
+ #include "convert.cuh"
+ #include "vecdotq.cuh"
+ 
+@@ -170,14 +173,27 @@ static bool ggml_cuda_fattn_vec_verify_enabled() {
+     return enabled;
+ }
+ 
+-// LLAMA_INKLING_FA_VEC_GQA=1: the decode vec kernel handles the Q heads of a KV head in one block, so that K and V
+-// are read once per KV head instead of once per Q head (GQA ratio 3); off by default, uncompiled on the dev machine
+-static bool ggml_cuda_fattn_vec_gqa_enabled() {
+-    static const bool enabled = [] {
++// LLAMA_INKLING_FA_VEC_GQA: the decode vec kernel handles the Q heads of a KV head in one block, so that K and V are
++// read once per KV head instead of once per Q head (GQA ratio 3). On the 3090 it pays only at depth (tok/s at 3.6K /
++// 14K / 29K / 49K / 90K context: 81.6 / 79.5 / 75.0 / 70.4 / 61.7 without, 80.3 / 78.0 / 74.9 / 71.3 / 64.6 with; at 54K
++// repeated benches differ by +-1.5%, more than the gain). `auto` (or `auto:<cells>`) takes it for flash-attention nodes
++// whose K view has at least 65536 cells (the depth where the gain is clear), `1` always, unset or `0` never. The choice
++// depends on the K view's length, a node property: a captured CUDA graph is re-captured when it changes. The two kernels
++// split the KV range differently, so their results are not bit-identical (greedy texts at depth diverge after a few
++// dozen tokens; see docs/inkling-moonshot.md), which is why it is not the default.
++static int ggml_cuda_fattn_vec_gqa_threshold() {
++    static const int threshold = [] {
+         const char * env = getenv("LLAMA_INKLING_FA_VEC_GQA");
+-        return env && atoi(env) != 0;
++        if (env && strncmp(env, "auto", 4) == 0) {
++            return env[4] == ':' ? atoi(env + 5) : 65536;
++        }
++        return env && atoi(env) != 0 ? 0 : INT_MAX; // 1: always, unset/0: never
+     }();
+-    return enabled;
++    return threshold;
++}
++
++static bool ggml_cuda_fattn_vec_gqa_enabled(int64_t n_kv) {
++    return n_kv >= ggml_cuda_fattn_vec_gqa_threshold();
+ }
+ 
+ // LLAMA_INKLING_FA_MMA=0 keeps the Inkling 2 prefill on the tile kernel (CUDA cores) instead of the tensor cores
 diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
-index 5ad8d9b3c..37c4ab357 100644
+index 5ad8d9b3c..a5d647383 100644
 --- a/ggml/src/ggml-cuda/fattn-vec.cuh
 +++ b/ggml/src/ggml-cuda/fattn-vec.cuh
 @@ -289,10 +289,12 @@ static __global__ void flash_attn_ext_vec(
@@ -473,11 +710,28 @@ index 5ad8d9b3c..37c4ab357 100644
  
          // Calculate KQ tile and keep track of new maximum KQ values:
          float KQ_reg[ncols]; // KQ in registers.
+@@ -644,7 +646,7 @@ static bool ggml_cuda_flash_attn_ext_vec_use_gqa_cols(const ggml_tensor * dst) {
+     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+     const int gqa_ratio = Q->ne[2] / K->ne[2];
+-    return ggml_cuda_fattn_vec_gqa_enabled() && Q->ne[1] == 1 && dst->src[6] && !dst->src[5] && logit_softcap == 0.0f &&
++    return ggml_cuda_fattn_vec_gqa_enabled(K->ne[1]) && Q->ne[1] == 1 && dst->src[6] && !dst->src[5] && logit_softcap == 0.0f &&
+         max_bias == 0.0f && (!mask || mask->ne[2] == 1) && gqa_ratio >= 2 && gqa_ratio <= 4;
+ }
+ 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 75ff9afc8..0438c22b5 100644
+index 75ff9afc8..b96b90ddf 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -79,6 +79,8 @@
+@@ -36,6 +36,7 @@
+ #include "ggml-cuda/mmq-few.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
++#include "ggml-cuda/mmvq-inkling.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -79,6 +80,8 @@
  #include "ggml.h"
  
  #include <algorithm>
@@ -486,7 +740,7 @@ index 75ff9afc8..0438c22b5 100644
  #include <array>
  #include <atomic>
  #include <charconv>
-@@ -95,6 +97,7 @@
+@@ -95,6 +98,7 @@
  #include <cstdarg>
  #include <cstdio>
  #include <cstdlib>
@@ -494,7 +748,7 @@ index 75ff9afc8..0438c22b5 100644
  #include <string>
  #include <vector>
  
-@@ -995,6 +998,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -995,6 +999,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      if (copy_event != nullptr) {
          CUDA_CHECK(cudaEventDestroy(copy_event));
      }
@@ -502,7 +756,17 @@ index 75ff9afc8..0438c22b5 100644
      for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
          for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
              if (streams[i][j] != nullptr) {
-@@ -2636,7 +2640,13 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+@@ -2580,6 +2585,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
+     const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, nullptr, cc);
+     if (!use_mmq_few && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
++        if (ggml_cuda_inkling_gemv(ctx, src0, src1, dst)) { // LLAMA_INKLING_GEMV, bit-identical to the line below
++            return;
++        }
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+@@ -2636,7 +2644,13 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
      return true;
  }
  
@@ -516,7 +780,7 @@ index 75ff9afc8..0438c22b5 100644
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
      const ggml_tensor * ids  = dst->src[2];
-@@ -4507,16 +4517,648 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4507,18 +4521,695 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -553,6 +817,7 @@ index 75ff9afc8..0438c22b5 100644
 +
 +struct ggml_cuda_mk_check_state {
 +    std::vector<ggml_cuda_mk_check_pending> pendings;
++    int    skip_upstream_at = -1; // the node where a declined stage's chain starts: upstream's fusion of it must not match
 +    char * arena      = nullptr; // one allocation for the shadows, bump-allocated per pending, reset when none is pending
 +    size_t arena_size = 0;
 +    size_t arena_used = 0;
@@ -779,9 +1044,11 @@ index 75ff9afc8..0438c22b5 100644
 +}
 +
 +struct ggml_cuda_mk_profile_state {
++    std::map<std::string, std::pair<long, double>> by_op; // "class/op[+n]" -> (groups, ms) over the evaluations
 +    std::vector<cudaEvent_t> events;       // 2 per launched group
 +    std::vector<int>         classes;      // per group
 +    std::vector<int>         counts;       // nodes per group
++    std::vector<std::string> labels;       // per group: op name and fused node count
 +    int    n_groups = 0;
 +    double total_ms[MK_CLASS_COUNT] = {};
 +    long   total_groups[MK_CLASS_COUNT] = {};
@@ -823,6 +1090,13 @@ index 75ff9afc8..0438c22b5 100644
 +    }
 +    st.classes[st.n_groups] = ggml_cuda_mk_classify(node, n_fused);
 +    st.counts[st.n_groups]  = n_fused;
++    if ((int) st.labels.size() <= st.n_groups) {
++        st.labels.resize(st.n_groups + 1);
++    }
++    char label[96];
++    snprintf(label, sizeof(label), "%s/%s%s%d", ggml_cuda_mk_class_name(st.classes[st.n_groups]), ggml_op_name(node->op),
++            node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : "", n_fused);
++    st.labels[st.n_groups] = label;
 +    st.n_groups++;
 +}
 +
@@ -845,6 +1119,9 @@ index 75ff9afc8..0438c22b5 100644
 +        eval_ms[st.classes[g]] += ms;
 +        eval_groups[st.classes[g]]++;
 +        gpu_ms += ms;
++        auto & e = st.by_op[st.labels[g]];
++        e.first++;
++        e.second += ms;
 +    }
 +    st.n_evals++;
 +    st.total_wall_ms += wall_ms;
@@ -864,6 +1141,13 @@ index 75ff9afc8..0438c22b5 100644
 +                    st.total_ms[c]/st.n_evals, (double) st.total_groups[c]/st.n_evals, 1000.0*st.total_ms[c]/st.total_groups[c]);
 +        }
 +        GGML_LOG_INFO("mk_profile:   %-52s %7.3f ms wall, %7.3f ms GPU\n", "total per evaluation", st.total_wall_ms/st.n_evals, st.total_gpu_ms/st.n_evals);
++        // the launched groups by op (the op of their first node, and the node count they fuse), most frequent first
++        std::vector<std::pair<std::string, std::pair<long, double>>> ops(st.by_op.begin(), st.by_op.end());
++        std::sort(ops.begin(), ops.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
++        for (size_t k = 0; k < ops.size() && k < 40; ++k) {
++            GGML_LOG_INFO("mk_profile:     %-60s %6.1f groups/eval %7.3f ms/eval\n", ops[k].first.c_str(),
++                    (double) ops[k].second.first/st.n_evals, ops[k].second.second/st.n_evals);
++        }
 +    }
 +}
 +
@@ -891,6 +1175,17 @@ index 75ff9afc8..0438c22b5 100644
 +static int ggml_cuda_mk_moe_mode() {
 +    const char * env = getenv("LLAMA_INKLING_MK_MOE");
 +    return env ? atoi(env) : 0;
++}
++
++// LLAMA_INKLING_MK_MOESCALE=1: the REPEAT + GET_ROWS of the per-expert scale table folded into the weighted reduction
++static int ggml_cuda_mk_moescale_mode() {
++    static const bool test = getenv("LLAMA_INKLING_MK_TEST") != nullptr;
++    static const int  fixed = [] { const char * e = getenv("LLAMA_INKLING_MK_MOESCALE"); return e ? atoi(e) : 0; }();
++    if (!test) {
++        return fixed;
++    }
++    const char * e = getenv("LLAMA_INKLING_MK_MOESCALE");
++    return e ? atoi(e) : 0;
 +}
 +
 +// LLAMA_INKLING_MK_GLUE=1: the loop controllers, the input norms and the q8_1 of the normalized inputs of a layer
@@ -1165,8 +1460,70 @@ index 75ff9afc8..0438c22b5 100644
 +        }
          ggml_cuda_inkling2_args inkling2;
          if (ggml_cuda_inkling2_match(cgraph, i, inkling2)) {
++            if (mk_check && ggml_cuda_inkling2_is_mk_stage(inkling2.type) && ggml_cuda_mk_check_active(*cuda_ctx)) {
++                // LLAMA_INKLING_MK_CHECK: the stage's kernel into a shadow of its output, then the unfused nodes
++                void * shadow = ggml_cuda_mk_check_alloc(ggml_nbytes(inkling2.dst));
++                if (shadow != nullptr) {
++                    ggml_tensor copy = *inkling2.dst;
++                    copy.data = shadow;
++                    ggml_cuda_inkling2_args shadow_args = inkling2;
++                    shadow_args.dst = &copy;
++                    ggml_cuda_inkling2_fused(*cuda_ctx, shadow_args);
++                    const ggml_tensor * outs[1] = { inkling2.dst };
++                    ggml_cuda_mk_check_add("reltab", i + inkling2.n_nodes - 1, 1, outs, &shadow, nullptr, 0);
++                }
++                return 0;
++            }
              ggml_cuda_inkling2_fused(*cuda_ctx, inkling2);
-@@ -5363,6 +6005,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             return inkling2.n_nodes - 1;
+         }
+@@ -4544,7 +5235,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
+-    if (node->op == GGML_OP_MUL) {
++    // LLAMA_INKLING_MK_MOESCALE=1: REPEAT(scale table [1, n_expert]) GET_ROWS(., ids) ahead of the weighted reduction
++    // whose expert_scale that gather is: the kernel gathers the scales itself (the same values, so the same bits)
++    if (node->op == GGML_OP_REPEAT && ggml_cuda_mk_moescale_mode() != 0 && i + 3 < cgraph->n_nodes &&
++            cgraph->nodes[i + 1]->op == GGML_OP_GET_ROWS && cgraph->nodes[i + 1]->src[0] == node) {
++        const ggml_tensor * rep   = node;
++        const ggml_tensor * table = rep->src[0];
++        const ggml_tensor * gath  = cgraph->nodes[i + 1];
++        const ggml_tensor * ids   = gath->src[1];
++        ggml_cuda_moe_weighted_reduction_match match;
++        if (table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && table->ne[0] == 1 && table->ne[2] == 1 && table->ne[3] == 1 &&
++                rep->ne[0] == 1 && rep->ne[1] == table->ne[1] && rep->ne[3] == 1 && ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) &&
++                gath->type == GGML_TYPE_F32 && gath->ne[0] == 1 && gath->ne[1] == ids->ne[0] && gath->ne[2] == ids->ne[1] && rep->ne[2] == ids->ne[1] &&
++                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
++                !(rep->flags & GGML_TENSOR_FLAG_OUTPUT) && !(gath->flags & GGML_TENSOR_FLAG_OUTPUT) &&
++                table->buffer != nullptr && ggml_backend_buffer_get_usage(table->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++                ggml_cuda_match_moe_weighted_reduction(cgraph, i + 2, match) && match.expert_scale == gath) {
++            const int output_idx = i + 2 + match.node_count - 1;
++            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count + 2, &output_idx, 1)) {
++                if (mk_check && ggml_cuda_mk_check_active(*cuda_ctx)) {
++                    // LLAMA_INKLING_MK_CHECK: the fused reduction into a shadow, then the unfused nodes
++                    void * shadow = ggml_cuda_mk_check_alloc(ggml_nbytes(match.dst));
++                    if (shadow != nullptr) {
++                        ggml_tensor copy = *match.dst;
++                        copy.data = shadow;
++                        ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, table, match.weights, &copy, ids);
++                        const ggml_tensor * outs[1] = { match.dst };
++                        ggml_cuda_mk_check_add("moescale", output_idx, 1, outs, &shadow, nullptr, 0);
++                        ggml_cuda_mk_check().skip_upstream_at = i + 2; // the unfused MUL/MUL/ADD chain must run
++                    }
++                    return 0;
++                }
++                ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, table, match.weights, match.dst, ids);
++                return match.node_count + 2 - 1;
++            }
++        }
++    }
++
++    if (node->op == GGML_OP_MUL && !(mk_check && ggml_cuda_mk_check().skip_upstream_at == i)) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+             const int output_idx = i + match.node_count - 1;
+@@ -5363,6 +6091,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -1178,7 +1535,7 @@ index 75ff9afc8..0438c22b5 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -5371,6 +6018,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5371,6 +6104,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      ggml_cuda_concurrent_event * concurrent_event           = nullptr;
      bool                         should_launch_concurrent_events = false;
  
@@ -1237,7 +1594,7 @@ index 75ff9afc8..0438c22b5 100644
  #ifdef USE_CUDA_GRAPH
      ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
      const int         chunk_size = ggml_cuda_graph_chunk_size();
-@@ -5470,7 +6169,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5470,7 +6255,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  #ifdef USE_CUDA_GRAPH
                  // fused nodes are skipped together, so a cut never splits a fusion
                  // a concurrent region must join before its capture can end
@@ -1246,7 +1603,7 @@ index 75ff9afc8..0438c22b5 100644
                      ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                      CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
                      chunk_end = i + chunk_size;
-@@ -5512,12 +6211,40 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5512,12 +6297,40 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -1287,7 +1644,7 @@ index 75ff9afc8..0438c22b5 100644
                  if (nodes_to_skip != 0) {
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
-@@ -5525,6 +6252,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5525,6 +6338,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                              nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                              ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
  #endif
@@ -1297,7 +1654,7 @@ index 75ff9afc8..0438c22b5 100644
                      i += nodes_to_skip;
                      continue;
                  }
-@@ -5550,6 +6280,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5550,6 +6366,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
@@ -1311,7 +1668,7 @@ index 75ff9afc8..0438c22b5 100644
  
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
-@@ -5575,6 +6312,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5575,6 +6398,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          } else {
              graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
          }
@@ -1322,7 +1679,7 @@ index 75ff9afc8..0438c22b5 100644
      }
  
      if (use_cuda_graph && !cuda_graph_update_required) {
-@@ -5696,6 +6437,253 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -5696,6 +6523,253 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
      }
  }
  
@@ -1576,7 +1933,7 @@ index 75ff9afc8..0438c22b5 100644
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
-@@ -5858,12 +6846,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5858,12 +6932,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      GGML_UNUSED(cgraph);
  #endif
  
@@ -1591,7 +1948,7 @@ index 75ff9afc8..0438c22b5 100644
          return;
      }
  
-@@ -5874,6 +6858,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5874,6 +6944,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          return;
      }
  
@@ -1675,10 +2032,10 @@ index 7b9c27789..5275a0dbc 100644
      }
  };
 diff --git a/ggml/src/ggml-cuda/inkling2.cu b/ggml/src/ggml-cuda/inkling2.cu
-index abdffb8d4..cb78b616f 100644
+index abdffb8d4..761bfe5a8 100644
 --- a/ggml/src/ggml-cuda/inkling2.cu
 +++ b/ggml/src/ggml-cuda/inkling2.cu
-@@ -4,10 +4,17 @@
+@@ -4,15 +4,65 @@
  #include "../ggml-impl.h"
  
  #include <algorithm>
@@ -1697,7 +2054,351 @@ index abdffb8d4..cb78b616f 100644
  // kernels (reduce_row_f32, rms_norm_f32, mul_mat_vec_f, soft_max_f32) for the configurations those pick. The fusions
  // that contain a reduction are only taken for the shapes they replicate. The exception is the single-pass MIX kernel
  // for the depth mixes that the unfused graph runs through cuBLAS (odd state counts, 4 queries, large batches): there
-@@ -1105,7 +1112,7 @@ static __global__ void __launch_bounds__(INKLING2_MIX_EXACT_BLOCK) inkling2_mix_
+ // it differs in the last bits.
+ 
++// LLAMA_INKLING_MK_DEBUG: why a matcher declined a chain whose op pattern matched, once per (matcher, reason)
++static void inkling2_declined(const char * matcher, const char * reason, const ggml_tensor * t) {
++    static const bool enabled = getenv("LLAMA_INKLING_MK_DEBUG") != nullptr;
++    if (!enabled) {
++        return;
++    }
++    static std::set<std::string> logged;
++    if (logged.insert(std::string(matcher) + "|" + reason + "|" + (t ? t->name : "?")).second) {
++        GGML_LOG_INFO("inkling2 %s: not fused at %s: %s\n", matcher, t ? t->name : "?", reason);
++    }
++}
++
++// LLAMA_INKLING_MK_DEBUG: the nodes of a declined chain (op, flags, uses), once per matcher
++static void inkling2_dump_chain(const char * matcher, const ggml_cgraph * cgraph, int i, int n) {
++    static const bool enabled = getenv("LLAMA_INKLING_MK_DEBUG") != nullptr;
++    if (!enabled) {
++        return;
++    }
++    static std::set<std::string> logged;
++    if (!logged.insert(matcher).second) {
++        return;
++    }
++    for (int k = i; k < i + n && k < cgraph->n_nodes; ++k) {
++        const ggml_tensor * t = cgraph->nodes[k];
++        GGML_LOG_INFO("inkling2 %s chain [%d] %-10s %-28s flags %d uses %d view_src %s\n", matcher, k - i, ggml_op_name(t->op), t->name,
++                t->flags, ggml_node_get_use_count(cgraph, k), t->view_src ? t->view_src->name : "-");
++    }
++}
++
++// LLAMA_INKLING_MK_RELTAB=1: the relative-position bias table of a token as one kernel (read per call for the tests)
++int inkling2_mk_reltab_mode() {
++    static const bool test = getenv("LLAMA_INKLING_MK_TEST") != nullptr;
++    static const int  fixed = [] { const char * e = getenv("LLAMA_INKLING_MK_RELTAB"); return e ? atoi(e) : 0; }();
++    if (!test) {
++        return fixed;
++    }
++    const char * e = getenv("LLAMA_INKLING_MK_RELTAB");
++    return e ? atoi(e) : 0;
++}
++
++// defined with the glue matcher below: the chain inputs come from outside a run of n nodes (view sources resolved)
++static bool inkling2_glue_outside(const ggml_cgraph * cgraph, int i, int n, std::initializer_list<const ggml_tensor *> tensors);
++
+ static bool inkling2_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+     const char * a0 = (const char *) a->data;
+     const char * b0 = (const char *) b->data;
+@@ -81,19 +131,12 @@ static __device__ __forceinline__ float inkling2_rms_norm_partial(const float *
+ // ---------------------------------------------------------------------------------------------------------------------
+ // CLIP: y = a * clamp(c / (sqrt(sum(a^2))*s0 + s1), lo, hi), a = x * w (w optional, broadcast over rows)
+ 
++// the CLIP of one row of ncols values by the whole block (blockDim.x threads, the block size of sum_rows_f32_cuda for
++// the shape): dst may be x. Shared by the CLIP kernel and the RELTAB kernel.
+ template <bool has_w>
+-static __global__ void inkling2_clip_f32(const float * x_ptr, const float * w_ptr, float * dst_ptr, const int ncols,
+-        const int64_t ne1, const int64_t w_ne1, const int64_t w_s1,
+-        const float s0, const float s1, const float c, const float lo, const float hi) {
+-    ggml_cuda_pdl_lc();
+-    const int64_t row = blockIdx.x;
+-    const int     col = threadIdx.x;
+-
+-    const float * x   = x_ptr + row*ncols;
+-    const float * w   = has_w ? w_ptr + ((row % ne1) % w_ne1)*w_s1 : nullptr;
+-    float       * dst = dst_ptr + row*ncols;
+-
+-    ggml_cuda_pdl_sync();
++static __device__ __forceinline__ void inkling2_clip_row(const float * x, const float * w, float * dst, const int ncols,
++        const float s0, const float s1, const float c, const float lo, const float hi, float * shared_vals) {
++    const int col = threadIdx.x;
+ 
+     // the loop of reduce_row_f32 on the stored squares
+     const int num_unroll = 8;
+@@ -117,7 +160,6 @@ static __global__ void inkling2_clip_f32(const float * x_ptr, const float * w_pt
+     for (int j = 0; j < num_unroll; ++j) {
+         sum += sum_temp[j];
+     }
+-    __shared__ float shared_vals[32];
+     sum = block_reduce<block_reduce_method::SUM>(sum, shared_vals);
+ 
+     // SQRT, SCALE, FILL + DIV, CLAMP
+@@ -131,6 +173,24 @@ static __global__ void inkling2_clip_f32(const float * x_ptr, const float * w_pt
+     }
+ }
+ 
++template <bool has_w>
++static __global__ void inkling2_clip_f32(const float * x_ptr, const float * w_ptr, float * dst_ptr, const int ncols,
++        const int64_t ne1, const int64_t w_ne1, const int64_t w_s1,
++        const float s0, const float s1, const float c, const float lo, const float hi) {
++    ggml_cuda_pdl_lc();
++    const int64_t row = blockIdx.x;
++
++    const float * x   = x_ptr + row*ncols;
++    const float * w   = has_w ? w_ptr + ((row % ne1) % w_ne1)*w_s1 : nullptr;
++    float       * dst = dst_ptr + row*ncols;
++
++    __shared__ float shared_vals[32];
++
++    ggml_cuda_pdl_sync();
++
++    inkling2_clip_row<has_w>(x, w, dst, ncols, s0, s1, c, lo, hi, shared_vals);
++}
++
+ static bool inkling2_match_clip(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
+     const bool has_w = cgraph->nodes[i]->op == GGML_OP_MUL;
+     const int  b     = has_w ? 1 : 0; // index of SQR
+@@ -405,6 +465,10 @@ static bool inkling2_match_conv_state(const ggml_cgraph * cgraph, int i, ggml_cu
+     if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV,
+                 GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE }, { i + 2, i + 3, i + 7 }) ||
+             !ggml_check_edges(cgraph, i, { {1, 0, 0}, {3, 0, 1}, {3, 1, 2}, {4, 0, 0}, {5, 0, 4}, {7, 0, 6} })) {
++        inkling2_declined("conv_state", "pattern 1", cgraph->nodes[i]);
++        if (cgraph->nodes[i]->ne[0] == 4) {
++            inkling2_dump_chain("conv_state", cgraph, i, 8);
++        }
+         return false;
+     }
+ 
+@@ -438,19 +502,23 @@ static bool inkling2_match_conv_state(const ggml_cgraph * cgraph, int i, ggml_cu
+             cpy->ne[2] != 1 || cpy->ne[3] != 1 ||
+             r->type != GGML_TYPE_F32 || !ggml_is_contiguous(r) || ggml_nelements(r) != n_c*n_t*n_s ||
+             dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != n_c*n_t*n_s) {
++        inkling2_declined("conv_state", "condition 2", cgraph->nodes[i]);
+         return false;
+     }
+     // with more than one token a thread reads the inputs of other tokens: dst may then not share memory with them
+     if (n_t > 1 && (inkling2_overlap(dst, cur) || inkling2_overlap(dst, r))) {
++        inkling2_declined("conv_state", "condition 3", cgraph->nodes[i]);
+         return false;
+     }
+     // the cell may not overlap any input, dst only the elements of r (and of cur, a view of r) it replaces
+     if (inkling2_overlap(cpy, past) || inkling2_overlap(cpy, cur) || inkling2_overlap(cpy, w) || inkling2_overlap(cpy, r) ||
+             inkling2_overlap(cpy, dst) || inkling2_overlap(dst, past) || inkling2_overlap(dst, w) ||
+             (inkling2_overlap(dst, r) && dst->data != r->data)) {
++        inkling2_declined("conv_state", "condition 4", cgraph->nodes[i]);
+         return false;
+     }
+     if (inkling2_overlap(dst, cur) && (cur->data != dst->data || cur->nb[1] != sizeof(float) || cur->nb[2] != dst->nb[1])) {
++        inkling2_declined("conv_state", "condition 5", cgraph->nodes[i]);
+         return false;
+     }
+ 
+@@ -464,11 +532,13 @@ static bool inkling2_match_conv_state(const ggml_cgraph * cgraph, int i, ggml_cu
+                 (inkling2_overlap(dst, r) && dst->data != r->data) || !inkling2_same_or_disjoint(dst, res) ||
+                 (inkling2_overlap(dst, cur) && (cur->data != dst->data || cur->nb[1] != sizeof(float) ||
+                     cur->nb[2] != dst->nb[1])) || inkling2_overlap(res, cpy)) {
+-            return false;
++            inkling2_declined("conv_state", "condition 6", cgraph->nodes[i]);
++        return false;
+         }
+     }
+ 
+     if (!inkling2_outside(cgraph, i, res ? 9 : 8, { past, cur, w, r, res })) {
++        inkling2_declined("conv_state", "condition 7", cgraph->nodes[i]);
+         return false;
+     }
+ 
+@@ -744,7 +814,9 @@ struct inkling2_situ_params {
+     float c0, c1, d0, d1; // SCALE, TANH, SCALE on the up
+ };
+ 
+-template <bool gather>
++// no_scale: the expert scale was applied by the product kernel already (mul_mat_vec_q's x_scale fusion for NVFP4
++// experts): the chain starts at the gate view, g = gu[j] exactly (no multiply, as the unfused ops have none)
++template <bool gather, bool no_scale = false>
+ static __global__ void inkling2_situ_f32(const float * gu_ptr, const float * s_ptr, const int32_t * ids_ptr,
+         float * dst_ptr, const int n_ff, const int n_used, const int64_t n,
+         const int64_t gu_s1, const int64_t gu_s2, const int64_t s_s1, const int64_t s_s2, const int64_t ids_s1,
+@@ -760,11 +832,16 @@ static __global__ void inkling2_situ_f32(const float * gu_ptr, const float * s_p
+     const int64_t e = (i / n_ff) % n_used;
+     const int64_t t = i / ((int64_t) n_ff*n_used);
+ 
+-    const float s = gather ? s_ptr[ids_ptr[t*ids_s1 + e]] : s_ptr[t*s_s2 + e*s_s1];
+-
+     const float * gu = gu_ptr + t*gu_s2 + e*gu_s1;
+-    const float g = __fmul_rn(gu[j],        s);
+-    const float u = __fmul_rn(gu[n_ff + j], s);
++    float g, u;
++    if constexpr (no_scale) {
++        g = gu[j];
++        u = gu[n_ff + j];
++    } else {
++        const float s = gather ? s_ptr[ids_ptr[t*ids_s1 + e]] : s_ptr[t*s_s2 + e*s_s1];
++        g = __fmul_rn(gu[j],        s);
++        u = __fmul_rn(gu[n_ff + j], s);
++    }
+ 
+     const float act  = __fmul_rn(p.b0*tanhf(p.a0*g + p.a1) + p.b1, 1.0f / (1.0f + expf(-g)));
+     const float lin  = p.d0*tanhf(p.c0*u + p.c1) + p.d1;
+@@ -773,24 +850,83 @@ static __global__ void inkling2_situ_f32(const float * gu_ptr, const float * s_p
+ }
+ 
+ static bool inkling2_match_situ(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
+-    const bool gather = cgraph->nodes[i]->op == GGML_OP_REPEAT;
+-    const int  m      = gather ? 2 : 0; // index of the scale MUL
++    const bool gather   = cgraph->nodes[i]->op == GGML_OP_REPEAT;
++    const bool no_scale = cgraph->nodes[i]->op == GGML_OP_SCALE; // the chain without the scale MUL (NVFP4 experts)
++    const int  m        = gather ? 2 : 0; // index of the scale MUL
++
++    if (no_scale) {
++        // SCALE(gate) TANH SCALE SIGMOID(gate) MUL [VIEW(up)] SCALE TANH SCALE MUL, gate = VIEW(gu) before the run. The
++        // views of gu are not part of the checked subgraph: ggml_can_fuse_subgraph allows external view sources only
++        // for constants, and gu is the product computed just before
++        const int idxs[9] = { i, i + 1, i + 2, i + 3, i + 4, i + 6, i + 7, i + 8, i + 9 };
++        const ggml_op ops[9] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
++                                 GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
++        const int outputs[1] = { i + 9 };
++        if (i + 9 >= cgraph->n_nodes || cgraph->nodes[i + 5]->op != GGML_OP_VIEW ||
++                !ggml_can_fuse_subgraph_ext(cgraph, idxs, 9, ops, outputs, 1) ||
++                !ggml_check_edges(cgraph, i, { {1, 0, 0}, {2, 0, 1}, {4, 0, 2}, {4, 1, 3}, {6, 0, 5}, {7, 0, 6}, {8, 0, 7},
++                    {9, 0, 4}, {9, 1, 8} })) {
++            inkling2_declined("situ", "pattern 3", cgraph->nodes[i]);
++            return false;
++        }
++        ggml_tensor * const * nodes = cgraph->nodes + i;
++        if (ggml_get_unary_op(nodes[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(nodes[3]) != GGML_UNARY_OP_SIGMOID ||
++                ggml_get_unary_op(nodes[7]) != GGML_UNARY_OP_TANH) {
++            return false;
++        }
++        const ggml_tensor * gate = nodes[0]->src[0];
++        const ggml_tensor * up   = nodes[5];
++        ggml_tensor       * dst  = nodes[9];
++        if (nodes[3]->src[0] != gate || gate->op != GGML_OP_VIEW || gate->view_src == nullptr || up->view_src != gate->view_src ||
++                ggml_node_get_use_count(cgraph, i + 5) != 1 || (up->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            return false;
++        }
++        const ggml_tensor * gu     = gate->view_src;
++        const int64_t       n_ff   = gate->ne[0];
++        const int64_t       n_used = gu->ne[1];
++        const int64_t       n_tok  = gu->ne[2];
++        if (!inkling2_is_f32_rows(gu) || gu->ne[0] != 2*n_ff || gu->ne[3] != 1 || !ggml_is_contiguous(gu) ||
++                gate->view_offs != 0 || up->view_offs != n_ff*sizeof(float) || !ggml_are_same_shape(gate, up) ||
++                gate->nb[1] != gu->nb[1] || gate->nb[2] != gu->nb[2] || up->nb[1] != gu->nb[1] || up->nb[2] != gu->nb[2] ||
++                gate->ne[1] != n_used || gate->ne[2] != n_tok || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
++                !ggml_are_same_shape(dst, gate) || inkling2_overlap(dst, gu) || !inkling2_glue_outside(cgraph, i, 10, { gu })) {
++            inkling2_declined("situ", "condition no_scale", cgraph->nodes[i]);
++            return false;
++        }
++        inkling2_declined("situ", "FUSED no_scale", dst);
++        args.type    = GGML_CUDA_INKLING2_SITU;
++        args.n_nodes = 10;
++        args.dst     = dst;
++        args.src[0]  = gu;
++        args.src[1]  = nullptr; // no scale
++        args.src[2]  = nullptr;
++        args.node[0] = nodes[0]; // SCALE a0/a1 of the gate
++        args.node[1] = nodes[2]; // SCALE b0/b1
++        args.node[2] = nodes[6]; // SCALE c0/c1 of the up
++        args.node[3] = nodes[8]; // SCALE d0/d1
++        args.node[4] = gate;
++        return true;
++    }
+ 
+     if (gather) {
+         if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL, GGML_OP_VIEW,
+                     GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_SCALE,
+                     GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL }, { i + 13 }) ||
+                 !ggml_check_edges(cgraph, i, { {1, 0, 0}, {2, 1, 1} })) {
+-            return false;
++            inkling2_declined("situ", "pattern 1", cgraph->nodes[i]);
++        inkling2_dump_chain("situ", cgraph, i, 14);
++        return false;
+         }
+     } else if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE,
+                     GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL },
+                     { i + 11 })) {
++        inkling2_declined("situ", "pattern 2", cgraph->nodes[i]);
+         return false;
+     }
+ 
+     if (!ggml_check_edges(cgraph, i + m, { {1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 1}, {6, 0, 4}, {6, 1, 5},
+                 {7, 0, 0}, {8, 0, 7}, {9, 0, 8}, {10, 0, 9}, {11, 0, 6}, {11, 1, 10} })) {
++        inkling2_declined("situ", "pattern 3", cgraph->nodes[i]);
+         return false;
+     }
+ 
+@@ -798,6 +934,7 @@ static bool inkling2_match_situ(const ggml_cgraph * cgraph, int i, ggml_cuda_ink
+ 
+     if (ggml_get_unary_op(nodes[3]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(nodes[5]) != GGML_UNARY_OP_SIGMOID ||
+             ggml_get_unary_op(nodes[9]) != GGML_UNARY_OP_TANH) {
++        inkling2_declined("situ", "condition 4", cgraph->nodes[i]);
+         return false;
+     }
+ 
+@@ -816,9 +953,11 @@ static bool inkling2_match_situ(const ggml_cgraph * cgraph, int i, ggml_cuda_ink
+             gate->nb[1] != mul->nb[1] || gate->nb[2] != mul->nb[2] || up->nb[1] != mul->nb[1] || up->nb[2] != mul->nb[2] ||
+             gate->ne[1] != n_used || gate->ne[2] != n_tok || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+             !ggml_are_same_shape(dst, gate)) {
++        inkling2_declined("situ", "condition 5", cgraph->nodes[i]);
+         return false;
+     }
+     if (inkling2_overlap(dst, gu)) {
++        inkling2_declined("situ", "condition 6", cgraph->nodes[i]);
+         return false;
+     }
+ 
+@@ -830,10 +969,12 @@ static bool inkling2_match_situ(const ggml_cgraph * cgraph, int i, ggml_cuda_ink
+         if (table->type != GGML_TYPE_F32 || !ggml_is_contiguous(table) || table->ne[0] != 1 || table->ne[2] != 1 ||
+                 table->ne[3] != 1 || rep->ne[0] != 1 || rep->ne[1] != table->ne[1] || rep->ne[2] != n_tok || rep->ne[3] != 1 ||
+                 ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->ne[0] != n_used || ids->ne[1] != n_tok) {
+-            return false;
++            inkling2_declined("situ", "condition 7", cgraph->nodes[i]);
++        return false;
+         }
+         if (inkling2_overlap(dst, table) || inkling2_overlap(dst, ids)) {
+-            return false;
++            inkling2_declined("situ", "condition 8", cgraph->nodes[i]);
++        return false;
+         }
+         args.src[1] = table;
+         args.src[2] = ids;
+@@ -841,15 +982,18 @@ static bool inkling2_match_situ(const ggml_cgraph * cgraph, int i, ggml_cuda_ink
+         const ggml_tensor * s = mul->src[1];
+         if (s->type != GGML_TYPE_F32 || s->ne[0] != 1 || s->ne[1] != n_used || s->ne[2] != n_tok || s->ne[3] != 1 ||
+                 inkling2_overlap(dst, s)) {
+-            return false;
++            inkling2_declined("situ", "condition 9", cgraph->nodes[i]);
++        return false;
+         }
+         args.src[1] = s;
+     }
+ 
+     if (!inkling2_outside(cgraph, i, m + 12, { gu, args.src[1], args.src[2] })) {
++        inkling2_declined("situ", "condition 10", cgraph->nodes[i]);
+         return false;
+     }
+ 
++    inkling2_declined("situ", gather ? "FUSED gather" : "FUSED", dst); // MK_DEBUG: which instances fuse
+     args.type    = GGML_CUDA_INKLING2_SITU;
+     args.n_nodes = m + 12;
+     args.dst     = dst;
+@@ -881,7 +1025,12 @@ static void inkling2_situ(ggml_backend_cuda_context & ctx, const ggml_cuda_inkli
+     const ggml_cuda_kernel_launch_params params(dim3((n + bs - 1)/bs, 1, 1), dim3(bs, 1, 1), 0, ctx.stream());
+     const int64_t gu_s1 = gu->nb[1]/sizeof(float);
+     const int64_t gu_s2 = gu->nb[2]/sizeof(float);
+-    if (ids) {
++    if (s == nullptr) {
++        // the scale-less chain (the product applied the expert scale)
++        ggml_cuda_kernel_launch(inkling2_situ_f32<false, true>, params, (const float *) gu->data, (const float *) nullptr,
++                (const int32_t *) nullptr, (float *) args.dst->data, (int) gate->ne[0], (int) gate->ne[1], n, gu_s1, gu_s2,
++                (int64_t) 0, (int64_t) 0, (int64_t) 0, p);
++    } else if (ids) {
+         ggml_cuda_kernel_launch(inkling2_situ_f32<true>, params, (const float *) gu->data, (const float *) s->data,
+                 (const int32_t *) ids->data, (float *) args.dst->data, (int) gate->ne[0], (int) gate->ne[1], n, gu_s1, gu_s2,
+                 (int64_t) 0, (int64_t) 0, (int64_t) (ids->nb[1]/sizeof(int32_t)), p);
+@@ -1105,7 +1254,7 @@ static __global__ void __launch_bounds__(INKLING2_MIX_EXACT_BLOCK) inkling2_mix_
      // rms_norm_f32 of x
      float sum_x2 = inkling2_rms_norm_partial(x, n/4);
      sum_x2 = block_reduce<block_reduce_method::SUM, bs>(sum_x2, s_sum);
@@ -1706,7 +2407,63 @@ index abdffb8d4..cb78b616f 100644
  
      // the scores: mul_mat_vec_f, one group of mmvf_block threads per state
      const int n_groups = bs/mmvf_block;
-@@ -1438,30 +1445,19 @@ static bool inkling2_ctrl_tokens_ok(const ggml_tensor * w, int64_t n_tok) {
+@@ -1272,6 +1421,7 @@ static bool inkling2_match_mix(const ggml_cgraph * cgraph, int i, ggml_cuda_inkl
+                 GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }, { i + 7 }) ||
+             !ggml_check_edges(cgraph, i, { {1, 1, 0}, {2, 0, 1}, {3, 0, 2}, {5, 0, 1}, {5, 1, 4}, {6, 0, 5}, {7, 0, 3},
+                 {7, 1, 6} })) {
++        inkling2_declined("mix", "condition 1", cgraph->nodes[i]);
+         return false;
+     }
+ 
+@@ -1294,6 +1444,7 @@ static bool inkling2_match_mix(const ggml_cgraph * cgraph, int i, ggml_cuda_inkl
+ 
+     if (ggml_get_op_params_i32(concat, 0) != 1 || softmax->src[1] || softmax->src[2] ||
+             ggml_get_op_params_f32(softmax, 1) != 0.0f) {
++        inkling2_declined("mix", "condition 2", cgraph->nodes[i]);
+         return false;
+     }
+     if (!inkling2_is_f32_rows(x) || x->ne[1] != 1 || x->ne[3] != 1 || !inkling2_is_f32_rows(p) || p->ne[0] != n ||
+@@ -1301,9 +1452,11 @@ static bool inkling2_match_mix(const ggml_cgraph * cgraph, int i, ggml_cuda_inkl
+             q->ne[0] != n || q->ne[1] != n_q || q->ne[2] != 1 || q->ne[3] != 1 || n_q > INKLING2_MIX_MAX_QUERIES ||
+             repeat->ne[2] != n_tok || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != n ||
+             dst->ne[1] != n_q || dst->ne[2] != n_tok || n > INT_MAX) {
++        inkling2_declined("mix", "condition 3", cgraph->nodes[i]);
+         return false;
+     }
+     if (inkling2_overlap(dst, x) || inkling2_overlap(dst, p) || inkling2_overlap(dst, q)) {
++        inkling2_declined("mix", "condition 4", cgraph->nodes[i]);
+         return false;
+     }
+ 
+@@ -1320,6 +1473,7 @@ static bool inkling2_match_mix(const ggml_cgraph * cgraph, int i, ggml_cuda_inkl
+                        ggml_cuda_is_aligned(p, 8) && ggml_cuda_is_aligned(q, 8) && n_q <= 3 &&
+                        INKLING2_MIX_EXACT_BLOCK % inkling2_mmvf_block_size(n, ws) == 0;
+     if (!inkling2_outside(cgraph, i, 8, { x, p, q })) {
++        inkling2_declined("mix", "condition 5", cgraph->nodes[i]);
+         return false;
+     }
+ 
+@@ -1333,6 +1487,19 @@ static bool inkling2_match_mix(const ggml_cgraph * cgraph, int i, ggml_cuda_inkl
+     args.node[1] = softmax;
+     args.node[2] = concat;
+     args.node[3] = exact ? concat : nullptr;
++    {
++        // LLAMA_INKLING_MK_DEBUG: which kernel each mix shape takes (the single-pass kernel is not bit-exact)
++        static const bool dbg = getenv("LLAMA_INKLING_MK_DEBUG") != nullptr;
++        if (dbg) {
++            static std::set<std::string> seen;
++            char key[128];
++            snprintf(key, sizeof(key), "n_st %d n_q %d tok %d exact %d x%%16 %d p%%8 %d q%%8 %d norm%%16 %d", (int) n_st, (int) n_q, (int) n_tok, (int) exact,
++                    (int) ((uintptr_t) x->data % 16), (int) ((uintptr_t) p->data % 8), (int) ((uintptr_t) q->data % 8), (int) ((uintptr_t) norm->data % 16));
++            if (seen.insert(key).second) {
++                GGML_LOG_INFO("inkling2 mix at %s: %s\n", norm->name, key);
++            }
++        }
++    }
+     return true;
+ }
+ 
+@@ -1438,30 +1605,19 @@ static bool inkling2_ctrl_tokens_ok(const ggml_tensor * w, int64_t n_tok) {
  // warp sums), with the block size that mul_mat_vec_f picks for the row length.
  static constexpr int INKLING2_CTRL_DOWN_BLOCK = 1024;
  
@@ -1750,7 +2507,7 @@ index abdffb8d4..cb78b616f 100644
  
      const int n4 = n/4;
  
-@@ -1471,9 +1467,10 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_DOWN_BLOCK) inkling2_ctrl
+@@ -1471,9 +1627,10 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_DOWN_BLOCK) inkling2_ctrl
      float sum_b = inkling2_rms_norm_partial(b, n4);
      sum_b = block_reduce<block_reduce_method::SUM, INKLING2_CTRL_DOWN_BLOCK>(sum_b, s_sum);
  
@@ -1764,7 +2521,7 @@ index abdffb8d4..cb78b616f 100644
  
      // the dot over the concatenation [rms_norm(a), rms_norm(b)] in the order of mul_mat_vec_f
      float sumf = 0.0f;
-@@ -1501,10 +1498,30 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_DOWN_BLOCK) inkling2_ctrl
+@@ -1501,10 +1658,30 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_DOWN_BLOCK) inkling2_ctrl
      }
  
      if (gt == 0 && o < n_out) {
@@ -1796,7 +2553,7 @@ index abdffb8d4..cb78b616f 100644
  static bool inkling2_match_ctrl_down(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
      if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_MUL_MAT }, { i + 3 }) ||
              !ggml_check_edges(cgraph, i, { {2, 0, 0}, {2, 1, 1}, {3, 1, 2} })) {
-@@ -1583,27 +1600,16 @@ static void inkling2_ctrl_down(ggml_backend_cuda_context & ctx, const ggml_cuda_
+@@ -1583,27 +1760,16 @@ static void inkling2_ctrl_down(ggml_backend_cuda_context & ctx, const ggml_cuda_
  // 2l and 2l + 1 (one float2), then the xor-butterfly warp sum. The results are the bits of the unfused ops.
  static constexpr int INKLING2_CTRL_OUT_ROWS = 8; // output elements (warps) per block
  
@@ -1831,7 +2588,7 @@ index abdffb8d4..cb78b616f 100644
          df += fv.x*hv.x;
          df += fv.y*hv.y;
          dg += gv.x*hv.x;
-@@ -1613,14 +1619,33 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_OUT_ROWS*WARP_SIZE) inkli
+@@ -1613,12 +1779,31 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_OUT_ROWS*WARP_SIZE) inkli
      dg = warp_reduce_sum<WARP_SIZE>(dg);
  
      if (lane == 0) {
@@ -1843,9 +2600,9 @@ index abdffb8d4..cb78b616f 100644
          const float added = __fmul_rn(tanhf(dg), m);
 -        dst_ptr[t*n + r] = __fadd_rn(kept, added);
 +        *dst = __fadd_rn(kept, added);
-     }
- }
- 
++    }
++}
++
 +static __global__ void __launch_bounds__(INKLING2_CTRL_OUT_ROWS*WARP_SIZE) inkling2_ctrl_out_f32(
 +        const float * f_ptr, const float * g_ptr, const float * h_ptr, const float * x_ptr, const float * m_ptr,
 +        float * dst_ptr, const int n, const int n_h, const int64_t n_rows,
@@ -1856,19 +2613,17 @@ index abdffb8d4..cb78b616f 100644
 +    ggml_cuda_pdl_sync();
 +    if (row >= n_rows) {
 +        return;
-+    }
+     }
 +
 +    const int64_t r = row % n;
 +    const int64_t t = row / n;
 +
 +    inkling2_ctrl_out_row(f_ptr + r*f_s1, g_ptr + r*g_s1, h_ptr + t*n_h, x_ptr + t*x_s1 + r, m_ptr + t*m_s1 + r,
 +            dst_ptr + t*n + r, n_h, lane);
-+}
-+
+ }
+ 
  static bool inkling2_match_ctrl_out(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
-     // MUL_MAT(F) MUL_MAT(G) TANH(f) MUL(., x) SUB(x, .) TANH(g) MUL(., m) ADD
-     if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
-@@ -1725,8 +1750,8 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_DOWN_BLOCK) inkling2_ctrl
+@@ -1725,8 +1910,8 @@ static __global__ void __launch_bounds__(INKLING2_CTRL_DOWN_BLOCK) inkling2_ctrl
      float sum_b = inkling2_rms_norm_partial(b, n4);
      sum_b = block_reduce<block_reduce_method::SUM, INKLING2_CTRL_DOWN_BLOCK>(sum_b, s_sum);
  
@@ -1879,11 +2634,15 @@ index abdffb8d4..cb78b616f 100644
  
      if (tid < n4) {
          const float4 va = ((const float4 *) a)[tid];
-@@ -1862,6 +1887,1000 @@ static void inkling2_ctrl_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_
-             (int64_t) (m->nb[1]/sizeof(float)));
+@@ -1863,124 +2048,1284 @@ static void inkling2_ctrl_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_
  }
  
-+// ---------------------------------------------------------------------------------------------------------------------
+ // ---------------------------------------------------------------------------------------------------------------------
+-// RELBIAS: the attention mask with the relative-position bias of each head, written straight in the type of the mask,
+-// from the bias table tab = W r of each token and head (the MUL_MAT before the chain):
+-//   y[kv, t, h] = (tab[d, h, t] - s[h, t]) + mask[kv, t],  d = pos[kv, t]
+-// The unfused chain builds the n_kv x n_tokens x n_head bias in F32 through a gather, two permuted copies and two
+-// casts; here the mask is written in one pass.
 +// GLUE (LLAMA_INKLING_MK_GLUE): the input chain of a layer application's attention or FFN for one token, as one or two
 +// kernels instead of up to 9 + the q8_1 quantization of the inputs by their consumers:
 +//   per unit j (1..3):  [CTRL_DOWN_j CTRL_OUT_j]  then  RMS_NORM_j MUL_j(w)       ->  y_j (f32) and q8_1(y_j)
@@ -1923,7 +2682,17 @@ index abdffb8d4..cb78b616f 100644
 +    int     mix_n_states;
 +    float   mix_eps, mix_scale;
 +};
-+
+ 
+-// tab - s into a buffer of its own, when the mask would be written over the table or the sinks
+-static __global__ void inkling2_relbias_sub_f32(const float * tab_ptr, const float * s_ptr, float * dst_ptr,
+-        const int n_rows, const int n_head, const int64_t tab_s1, const int64_t tab_s2) {
+-    ggml_cuda_pdl_lc();
+-    const int d = blockIdx.x*blockDim.x + threadIdx.x;
+-    const int h = blockIdx.y;
+-    const int t = blockIdx.z;
+-    ggml_cuda_pdl_sync();
+-    if (d >= n_rows) {
+-        return;
 +struct inkling2_glue_args {
 +    inkling2_glue_unit u[3];
 +    int     n_units;
@@ -1969,10 +2738,24 @@ index abdffb8d4..cb78b616f 100644
 +        CUDA_CHECK(cudaMalloc(&st->buf, ggml_cuda_mk_glue_state::size()));
 +        CUDA_CHECK(cudaMemsetAsync(st->buf, 0, ggml_cuda_mk_glue_state::size(), ctx.stream()));
 +        ctx.mk_glue = st;
-+    }
+     }
+-    dst_ptr[((int64_t) t*n_head + h)*n_rows + d] = __fsub_rn(tab_ptr[t*tab_s2 + h*tab_s1 + d], s_ptr[t*n_head + h]);
 +    return *ctx.mk_glue;
-+}
-+
+ }
+ 
+-// vw consecutive cells per thread, so that the stores of an F16 mask are at least 4 bytes wide
+-template <bool sub, int vw, typename T_mask, typename T_dst>
+-static __global__ void inkling2_relbias_mask(const float * tab_ptr, const float * s_ptr, const int32_t * pos_ptr,
+-        const T_mask * mask_ptr, T_dst * dst_ptr, const int n_kv, const int n_rows, const int n_tok, const int n_head,
+-        const int64_t tab_s1, const int64_t tab_s2, const int64_t pos_s1, const int64_t mask_s1, const int heads_per_block) {
+-    ggml_cuda_pdl_lc();
+-    const int kv = (blockIdx.x*blockDim.x + threadIdx.x)*vw;
+-    const int t  = blockIdx.y;
+-    const int h0 = blockIdx.z*heads_per_block;
+-    const int h1 = min(h0 + heads_per_block, n_head);
+-    ggml_cuda_pdl_sync();
+-    if (kv >= n_kv) {
+-        return;
 +void ggml_cuda_mk_glue_free(ggml_backend_cuda_context & ctx) {
 +    if (ctx.mk_glue != nullptr) {
 +        if (ctx.mk_glue->buf != nullptr) {
@@ -1980,17 +2763,39 @@ index abdffb8d4..cb78b616f 100644
 +        }
 +        delete ctx.mk_glue;
 +        ctx.mk_glue = nullptr;
-+    }
+     }
 +}
-+
+ 
+-    int   d[vw];
+-    float m[vw];
+-#pragma unroll
+-    for (int c = 0; c < vw; ++c) {
+-        d[c] = min(max(pos_ptr[t*pos_s1 + kv + c], 0), n_rows - 1);
+-        m[c] = ggml_cuda_cast<float>(mask_ptr[t*mask_s1 + kv + c]);
 +void ggml_cuda_mk_glue_begin_eval(ggml_backend_cuda_context & ctx) {
 +    // the q8_1 outputs are valid for the consumers of the same graph evaluation only
 +    if (ctx.mk_glue != nullptr) {
 +        ctx.mk_glue->n_entries = 0;
 +        ctx.mk_glue->next      = 0; // the same slots in every evaluation of a graph (captures are reproducible)
-+    }
+     }
 +}
-+
+ 
+-    for (int h = h0; h < h1; ++h) {
+-        const float * tab = tab_ptr + t*tab_s2 + h*tab_s1;
+-        T_dst v[vw];
+-#pragma unroll
+-        for (int c = 0; c < vw; ++c) {
+-            const float b = sub ? __fsub_rn(tab[d[c]], s_ptr[t*n_head + h]) : tab[d[c]];
+-            v[c] = ggml_cuda_cast<T_dst>(__fadd_rn(b, m[c]));
+-        }
+-        T_dst * dst = dst_ptr + ((int64_t) h*n_tok + t)*n_kv + kv;
+-        if constexpr (vw == 2 && std::is_same_v<T_dst, half>) {
+-            *(half2 *) dst = make_half2(v[0], v[1]);
+-        } else {
+-#pragma unroll
+-            for (int c = 0; c < vw; ++c) {
+-                dst[c] = v[c];
+-            }
 +const block_q8_1 * ggml_cuda_mk_glue_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
 +    if (ctx.mk_glue == nullptr || ctx.mk_glue->n_entries == 0 || src1 == nullptr || src1->type != GGML_TYPE_F32 ||
 +            src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float)) {
@@ -2005,20 +2810,36 @@ index abdffb8d4..cb78b616f 100644
 +        const auto & e = ctx.mk_glue->entries[i];
 +        if (e.t == root && e.data == root->data && e.data == src1->data && e.ne0 == src1->ne[0]) {
 +            return e.q8;
-+        }
-+    }
+         }
+     }
 +    return nullptr;
-+}
-+
+ }
+ 
+-static bool inkling2_match_relbias(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
+-    // SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT CPY(mask -> F32) ADD [CPY(-> F16)]
+-    static const ggml_op ops[10] = { GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+-        GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_CPY, GGML_OP_ADD, GGML_OP_CPY };
+-
+-    if (i + 9 > cgraph->n_nodes) {
+-        return false;
 +template <bool l2>
 +static __device__ __forceinline__ float4 inkling2_glue_load4(const float * x, const int i) {
 +    if constexpr (l2) {
 +        return __ldcg(((const float4 *) x) + i); // written by other blocks of this launch: not through L1
 +    } else {
 +        return ((const float4 *) x)[i];
-+    }
+     }
+-    const bool cast_out = i + 9 < cgraph->n_nodes && cgraph->nodes[i + 9]->op == GGML_OP_CPY &&
+-                          cgraph->nodes[i + 9]->src[0] == cgraph->nodes[i + 8];
+-    const int  n_nodes  = cast_out ? 10 : 9;
 +}
-+
+ 
+-    // the mask cast references itself as src[1] (ggml_cast), which the subgraph check would count as a use from
+-    // outside: check it here and leave it out of the subgraph check
+-    const ggml_tensor * mask_f32 = cgraph->nodes[i + 7];
+-    if (mask_f32->op != GGML_OP_CPY || mask_f32->src[1] != mask_f32 || mask_f32->flags & GGML_TENSOR_FLAG_OUTPUT ||
+-            ggml_node_get_use_count(cgraph, i + 7) != 2) {
+-        return false;
 +// rms_norm_f32<float, 1024, 1, true, do_multiply> of one row of n floats (n/4 in (512, 1024]): the per-thread float4
 +// sum, the block sum, scale*x then *w per component; then quantize_q8_1 of the stored result over n_pad values (one lane
 +// per value, warp max and sum over 32 lanes, zeros past n as the padded quantization writes them)
@@ -2033,10 +2854,20 @@ index abdffb8d4..cb78b616f 100644
 +    if (tid < n4) {
 +        xs   = inkling2_glue_load4<l2>(x, tid);
 +        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
-+    }
+     }
 +    tmp = block_reduce<block_reduce_method::SUM, INKLING2_GLUE_BLOCK>(tmp, s_sum);
 +    const float scale = rsqrtf(tmp / n + eps);
-+
+ 
+-    int     idxs[9];
+-    ggml_op sub_ops[9];
+-    int     n_sub = 0;
+-    for (int k = 0; k < n_nodes; ++k) {
+-        if (k == 7) {
+-            continue;
+-        }
+-        idxs[n_sub]    = i + k;
+-        sub_ops[n_sub] = ops[k];
+-        ++n_sub;
 +    if (tid < n4) {
 +        const float4 m = ((const float4 *) w)[tid];
 +        float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
@@ -2048,7 +2879,12 @@ index abdffb8d4..cb78b616f 100644
 +    }
 +    if (q8 == nullptr) {
 +        return;
-+    }
+     }
+-    const int out = i + n_nodes - 1;
+-    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n_sub, sub_ops, &out, 1) ||
+-            !ggml_check_edges(cgraph, i, { {1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {6, 0, 5}, {8, 0, 6},
+-                {8, 1, 7} })) {
+-        return false;
 +    __syncthreads(); // y complete (read back below by other threads of this block)
 +
 +    for (int i = tid; i < n_pad; i += INKLING2_GLUE_BLOCK) {
@@ -2064,9 +2900,10 @@ index abdffb8d4..cb78b616f 100644
 +        if (iqs == 0) {
 +            q8[ib].ds = make_half2(d, d * sum);
 +        }
-+    }
+     }
 +}
-+
+ 
+-    ggml_tensor * const * nodes = cgraph->nodes + i;
 +// The depth mix of one unit with the bits of inkling2_mix_exact_f32, for the unit's query alone: the columns of the two
 +// mul_mat_vec_f products the exact kernel replicates are independent, and the soft_max_f32 warp butterfly over 32 lanes
 +// with zeros past the states gives the same sum for any power-of-two width >= the state count, so one width (16) serves
@@ -2076,19 +2913,32 @@ index abdffb8d4..cb78b616f 100644
 +    float s_score[INKLING2_MIX_MAX_STATES];
 +    float s_prob[INKLING2_MIX_MAX_STATES];
 +};
-+
+ 
+-    const ggml_tensor * sub  = nodes[0];
+-    const ggml_tensor * tabT = nodes[2];
+-    const ggml_tensor * rows = nodes[3];
+-    const ggml_tensor * kq_b = nodes[6];
+-    ggml_tensor       * dst  = nodes[n_nodes - 1];
 +static __device__ void inkling2_glue_mix(const inkling2_glue_unit & u, float * y, const int n, const int mmvf_block,
 +        float * s_sum, inkling2_glue_mix_shared & sh) {
 +    constexpr int ms  = INKLING2_MIX_MAX_STATES;
 +    constexpr int bs  = INKLING2_GLUE_BLOCK;
 +    const int     tid = threadIdx.x;
-+
+ 
+-    const ggml_tensor * tab  = sub->src[0];
+-    const ggml_tensor * s    = sub->src[1];
+-    const ggml_tensor * pos  = rows->src[1];
+-    const ggml_tensor * mask = mask_f32->src[0];
 +    const float * p        = u.mix_p;
 +    const float * x        = u.mix_x;
 +    const float * q        = u.mix_q;
 +    const int     n_states = u.mix_n_states;
 +    const int     n_p      = n_states - 1; // states before x
-+
+ 
+-    const int64_t n_rows = tab->ne[0];
+-    const int64_t n_head = tab->ne[1];
+-    const int64_t n_tok  = tab->ne[2];
+-    const int64_t n_kv   = pos->ne[0];
 +    // rms_norm_f32 of x
 +    float sum_x2 = inkling2_rms_norm_partial(x, n/4);
 +    sum_x2 = block_reduce<block_reduce_method::SUM, bs>(sum_x2, s_sum);
@@ -2877,14 +3727,388 @@ index abdffb8d4..cb78b616f 100644
 +    }
 +}
 +
++// ---------------------------------------------------------------------------------------------------------------------
++// RELTAB (LLAMA_INKLING_MK_RELTAB): the relative-position bias table of one token's attention,
++//   table[e, h] = sum_k pad(W)[k, e] * Rcur[k, h],  Rcur = clip(R*w) [* tau],  pad(W) = W [k, E] with a zero row E
++// as one kernel instead of PAD, CLIP and the cuBLAS SGEMM (k 16, n 24, m 1025) the unfused graph runs. The dot is the
++// FMA chain over k in ascending order, which gives the bits of cublasSgemm for this shape on the 3090 (0 differing
++// elements in 4.9 M, scripts/inkling-launch-costs.cu's sibling experiment; the self-test keeps checking it); the clip
++// is the CLIP body with the block size the unfused launch uses for n_head rows (512 threads).
++
++static constexpr int INKLING2_RELTAB_BLOCK = 512;
++static constexpr int INKLING2_RELTAB_MAX_K = 32;
++
++template <bool has_w, bool has_tau>
++static __global__ void __launch_bounds__(INKLING2_RELTAB_BLOCK) inkling2_reltab_f32(const float * x_ptr, const float * w_ptr,
++        const float * tau_ptr, const float * tab_ptr, float * dst_ptr, const int k, const int n_ext, const int64_t w_ne1,
++        const int64_t w_s1, const int64_t tab_s1, const float s0, const float s1, const float c, const float lo, const float hi) {
++    const int h = blockIdx.y; // head
++    __shared__ float shared_vals[32];
++    __shared__ float r[INKLING2_RELTAB_MAX_K];
++
++    ggml_cuda_pdl_lc();
++    ggml_cuda_pdl_sync();
++
++    // Rcur[:, h] = clip(x[:, h] * w[:, h % w_ne1]) (* tau), as the CLIP kernel's block of 512 for these rows
++    inkling2_clip_row<has_w>(x_ptr + h*k, has_w ? w_ptr + (h % w_ne1)*w_s1 : nullptr, r, k, s0, s1, c, lo, hi, shared_vals);
++    __syncthreads();
++    if (has_tau && threadIdx.x < (unsigned) k) {
++        r[threadIdx.x] = r[threadIdx.x]*tau_ptr[0]; // the MUL by the broadcast [1, 1, 1] tau
++    }
++    __syncthreads();
++
++    const int e = blockIdx.x*INKLING2_RELTAB_BLOCK + threadIdx.x;
++    if (e > n_ext) {
++        return;
++    }
++    float acc = 0.0f;
++    if (e < n_ext) {
++        const float * tab = tab_ptr + e*tab_s1;
++        for (int kk = 0; kk < k; ++kk) {
++            acc = fmaf(tab[kk], r[kk], acc);
++        }
++    } else {
++        // the padded row: zeros times r, as the SGEMM computes it
++        for (int kk = 0; kk < k; ++kk) {
++            acc = fmaf(0.0f, r[kk], acc);
++        }
++    }
++    dst_ptr[(int64_t) h*(n_ext + 1) + e] = acc;
++}
++
++// PAD(W) [CLIP of R] [MUL(., tau)] MUL_MAT(pad, Rcur): the run from the PAD to the product
++static bool inkling2_match_reltab(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
++    const ggml_tensor * pad = cgraph->nodes[i];
++    if (pad->op != GGML_OP_PAD || i + 10 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * tab = pad->src[0];
++    const int64_t       k   = tab->ne[0];
++    const int64_t       E   = tab->ne[1];
++    // a zero row appended along dim 1 of a constant F32 table
++    if (tab->type != GGML_TYPE_F32 || !inkling2_is_f32_rows(tab) || tab->ne[2] != 1 || tab->ne[3] != 1 || k > INKLING2_RELTAB_MAX_K ||
++            pad->type != GGML_TYPE_F32 || pad->ne[0] != k || pad->ne[1] != E + 1 || pad->ne[2] != 1 || pad->ne[3] != 1 ||
++            ggml_get_op_params_i32(pad, 0) != 0 || ggml_get_op_params_i32(pad, 1) != 0 || ggml_get_op_params_i32(pad, 2) != 0 ||
++            ggml_get_op_params_i32(pad, 3) != 1 || ggml_get_op_params_i32(pad, 4) != 0 || ggml_get_op_params_i32(pad, 5) != 0 ||
++            ggml_get_op_params_i32(pad, 6) != 0 || ggml_get_op_params_i32(pad, 7) != 0 || !inkling2_internal(cgraph, i, 1) ||
++            tab->buffer == nullptr || ggml_backend_buffer_get_usage(tab->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        return false;
++    }
++    // the clip of R right after (views between)
++    const int kc = inkling2_next_node(cgraph, i + 1);
++    ggml_cuda_inkling2_args clip;
++    if (kc >= cgraph->n_nodes || !inkling2_match_clip(cgraph, kc, clip)) {
++        return false;
++    }
++    const ggml_tensor * x    = clip.src[0];
++    const ggml_tensor * w    = clip.src[1];
++    const ggml_tensor * rcur = clip.dst;
++    int km = inkling2_next_node(cgraph, kc + clip.n_nodes);
++    if (km >= cgraph->n_nodes || !inkling2_internal(cgraph, kc + clip.n_nodes - 1, 1)) {
++        return false;
++    }
++    const ggml_tensor * tau = nullptr;
++    if (cgraph->nodes[km]->op == GGML_OP_MUL) {
++        const ggml_tensor * mul = cgraph->nodes[km];
++        if (mul->src[0] != rcur || !inkling2_internal(cgraph, km, 1)) {
++            return false;
++        }
++        tau  = mul->src[1];
++        rcur = mul;
++        km   = inkling2_next_node(cgraph, km + 1);
++        if (km >= cgraph->n_nodes || tau->type != GGML_TYPE_F32 || ggml_nelements(tau) != 1 || !ggml_are_same_shape(mul, clip.dst)) {
++            return false;
++        }
++    }
++    ggml_tensor * dst = cgraph->nodes[km];
++    if (dst->op != GGML_OP_MUL_MAT || dst->src[0] != pad || dst->src[1] != rcur) {
++        return false;
++    }
++    const int64_t n_head = rcur->ne[1];
++    // one token, the tested shape class: rows of k <= 32 floats, n_head <= 32 heads, R contiguous [k, n_head, 1]
++    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != E + 1 || dst->ne[1] != n_head || dst->ne[2] != 1 ||
++            dst->ne[3] != 1 || rcur->type != GGML_TYPE_F32 || !ggml_is_contiguous(rcur) || rcur->ne[0] != k || rcur->ne[2] != 1 ||
++            rcur->ne[3] != 1 || n_head > 32 || x->ne[0] != k || x->ne[1] != n_head || ggml_nrows(x) != n_head ||
++            (w != nullptr && (w->ne[1] != 1 && w->ne[1] != n_head))) {
++        return false;
++    }
++    // the CLIP replication: the block size sum_rows_f32_cuda picks for n_head rows must be the kernel's
++    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++    if ((n_head / nsm) >= 2 || INKLING2_RELTAB_BLOCK != 512) {
++        return false;
++    }
++    const int n_nodes = km + 1 - i;
++    if (!inkling2_glue_outside(cgraph, i, n_nodes, { x, w, tau, tab }) || inkling2_overlap(dst, x) || (w && inkling2_overlap(dst, w)) ||
++            (tau && inkling2_overlap(dst, tau)) || inkling2_overlap(dst, tab)) {
++        return false;
++    }
++
++    args.type    = GGML_CUDA_INKLING2_RELTAB;
++    args.n_nodes = n_nodes;
++    args.dst     = dst;
++    args.src[0]  = x;
++    args.src[1]  = w;
++    args.src[2]  = tau;
++    args.src[3]  = tab;
++    args.node[0] = clip.node[0]; // SCALE
++    args.node[1] = clip.node[1]; // FILL
++    args.node[2] = clip.node[2]; // CLAMP
++    return true;
++}
++
++static void inkling2_reltab(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_args & args) {
++    const ggml_tensor * x   = args.src[0];
++    const ggml_tensor * w   = args.src[1];
++    const ggml_tensor * tau = args.src[2];
++    const ggml_tensor * tab = args.src[3];
++
++    const int k      = (int) tab->ne[0];
++    const int n_ext  = (int) tab->ne[1];
++    const int n_head = (int) x->ne[1];
++
++    const float s0 = ggml_get_op_params_f32(args.node[0], 0);
++    const float s1 = ggml_get_op_params_f32(args.node[0], 1);
++    const float c  = ggml_get_op_params_f32(args.node[1], 0);
++    const float lo = ggml_get_op_params_f32(args.node[2], 0);
++    const float hi = ggml_get_op_params_f32(args.node[2], 1);
++
++    const ggml_cuda_kernel_launch_params params(dim3((n_ext + 1 + INKLING2_RELTAB_BLOCK - 1)/INKLING2_RELTAB_BLOCK, n_head, 1),
++            dim3(INKLING2_RELTAB_BLOCK, 1, 1), 0, ctx.stream());
++    const float * xd   = (const float *) x->data;
++    const float * wd   = w ? (const float *) w->data : nullptr;
++    const float * taud = tau ? (const float *) tau->data : nullptr;
++    const float * td   = (const float *) tab->data;
++    float       * dd   = (float *) args.dst->data;
++    const int64_t w_ne1 = w ? w->ne[1] : 1;
++    const int64_t w_s1  = w ? (int64_t) (w->nb[1]/sizeof(float)) : 0;
++    const int64_t tab_s1 = (int64_t) (tab->nb[1]/sizeof(float));
++    if (w && tau) {
++        ggml_cuda_kernel_launch(inkling2_reltab_f32<true, true>, params, xd, wd, taud, td, dd, k, n_ext, w_ne1, w_s1, tab_s1, s0, s1, c, lo, hi);
++    } else if (w) {
++        ggml_cuda_kernel_launch(inkling2_reltab_f32<true, false>, params, xd, wd, taud, td, dd, k, n_ext, w_ne1, w_s1, tab_s1, s0, s1, c, lo, hi);
++    } else if (tau) {
++        ggml_cuda_kernel_launch(inkling2_reltab_f32<false, true>, params, xd, wd, taud, td, dd, k, n_ext, w_ne1, w_s1, tab_s1, s0, s1, c, lo, hi);
++    } else {
++        ggml_cuda_kernel_launch(inkling2_reltab_f32<false, false>, params, xd, wd, taud, td, dd, k, n_ext, w_ne1, w_s1, tab_s1, s0, s1, c, lo, hi);
++    }
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// RELBIAS: the attention mask with the relative-position bias of each head, written straight in the type of the mask,
++// from the bias table tab = W r of each token and head (the MUL_MAT before the chain):
++//   y[kv, t, h] = (tab[d, h, t] - s[h, t]) + mask[kv, t],  d = pos[kv, t]
++// The unfused chain builds the n_kv x n_tokens x n_head bias in F32 through a gather, two permuted copies and two
++// casts; here the mask is written in one pass.
++
++// tab - s into a buffer of its own, when the mask would be written over the table or the sinks
++static __global__ void inkling2_relbias_sub_f32(const float * tab_ptr, const float * s_ptr, float * dst_ptr,
++        const int n_rows, const int n_head, const int64_t tab_s1, const int64_t tab_s2) {
++    ggml_cuda_pdl_lc();
++    const int d = blockIdx.x*blockDim.x + threadIdx.x;
++    const int h = blockIdx.y;
++    const int t = blockIdx.z;
++    ggml_cuda_pdl_sync();
++    if (d >= n_rows) {
++        return;
++    }
++    dst_ptr[((int64_t) t*n_head + h)*n_rows + d] = __fsub_rn(tab_ptr[t*tab_s2 + h*tab_s1 + d], s_ptr[t*n_head + h]);
++}
++
++// vw consecutive cells per thread, so that the stores of an F16 mask are at least 4 bytes wide
++template <bool sub, int vw, typename T_mask, typename T_dst>
++static __global__ void inkling2_relbias_mask(const float * tab_ptr, const float * s_ptr, const int32_t * pos_ptr,
++        const T_mask * mask_ptr, T_dst * dst_ptr, const int n_kv, const int n_rows, const int n_tok, const int n_head,
++        const int64_t tab_s1, const int64_t tab_s2, const int64_t pos_s1, const int64_t mask_s1, const int heads_per_block) {
++    ggml_cuda_pdl_lc();
++    const int kv = (blockIdx.x*blockDim.x + threadIdx.x)*vw;
++    const int t  = blockIdx.y;
++    const int h0 = blockIdx.z*heads_per_block;
++    const int h1 = min(h0 + heads_per_block, n_head);
++    ggml_cuda_pdl_sync();
++    if (kv >= n_kv) {
++        return;
++    }
++
++    int   d[vw];
++    float m[vw];
++#pragma unroll
++    for (int c = 0; c < vw; ++c) {
++        d[c] = min(max(pos_ptr[t*pos_s1 + kv + c], 0), n_rows - 1);
++        m[c] = ggml_cuda_cast<float>(mask_ptr[t*mask_s1 + kv + c]);
++    }
++
++    for (int h = h0; h < h1; ++h) {
++        const float * tab = tab_ptr + t*tab_s2 + h*tab_s1;
++        T_dst v[vw];
++#pragma unroll
++        for (int c = 0; c < vw; ++c) {
++            const float b = sub ? __fsub_rn(tab[d[c]], s_ptr[t*n_head + h]) : tab[d[c]];
++            v[c] = ggml_cuda_cast<T_dst>(__fadd_rn(b, m[c]));
++        }
++        T_dst * dst = dst_ptr + ((int64_t) h*n_tok + t)*n_kv + kv;
++        if constexpr (vw == 2 && std::is_same_v<T_dst, half>) {
++            *(half2 *) dst = make_half2(v[0], v[1]);
++        } else {
++#pragma unroll
++            for (int c = 0; c < vw; ++c) {
++                dst[c] = v[c];
++            }
++        }
++    }
++}
++
++static bool inkling2_match_relbias(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
++    // SUB PERMUTE CONT GET_ROWS RESHAPE PERMUTE CONT CPY(mask -> F32) ADD [CPY(-> F16)]
++    static const ggml_op ops[10] = { GGML_OP_SUB, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
++        GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_CPY, GGML_OP_ADD, GGML_OP_CPY };
++
++    if (i + 9 > cgraph->n_nodes) {
++        return false;
++    }
++    const bool cast_out = i + 9 < cgraph->n_nodes && cgraph->nodes[i + 9]->op == GGML_OP_CPY &&
++                          cgraph->nodes[i + 9]->src[0] == cgraph->nodes[i + 8];
++    const int  n_nodes  = cast_out ? 10 : 9;
++
++    // the mask cast references itself as src[1] (ggml_cast), which the subgraph check would count as a use from
++    // outside: check it here and leave it out of the subgraph check
++    const ggml_tensor * mask_f32 = cgraph->nodes[i + 7];
++    if (mask_f32->op != GGML_OP_CPY || mask_f32->src[1] != mask_f32 || mask_f32->flags & GGML_TENSOR_FLAG_OUTPUT ||
++            ggml_node_get_use_count(cgraph, i + 7) != 2) {
++        return false;
++    }
++
++    int     idxs[9];
++    ggml_op sub_ops[9];
++    int     n_sub = 0;
++    for (int k = 0; k < n_nodes; ++k) {
++        if (k == 7) {
++            continue;
++        }
++        idxs[n_sub]    = i + k;
++        sub_ops[n_sub] = ops[k];
++        ++n_sub;
++    }
++    const int out = i + n_nodes - 1;
++    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n_sub, sub_ops, &out, 1) ||
++            !ggml_check_edges(cgraph, i, { {1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {6, 0, 5}, {8, 0, 6},
++                {8, 1, 7} })) {
++        return false;
++    }
++
++    ggml_tensor * const * nodes = cgraph->nodes + i;
++
++    const ggml_tensor * sub  = nodes[0];
++    const ggml_tensor * tabT = nodes[2];
++    const ggml_tensor * rows = nodes[3];
++    const ggml_tensor * kq_b = nodes[6];
++    ggml_tensor       * dst  = nodes[n_nodes - 1];
++
++    const ggml_tensor * tab  = sub->src[0];
++    const ggml_tensor * s    = sub->src[1];
++    const ggml_tensor * pos  = rows->src[1];
++    const ggml_tensor * mask = mask_f32->src[0];
++
++    const int64_t n_rows = tab->ne[0];
++    const int64_t n_head = tab->ne[1];
++    const int64_t n_tok  = tab->ne[2];
++    const int64_t n_kv   = pos->ne[0];
+ 
+     // table^T = permute(1, 0, 2, 3), bias = permute(reshape(rows, [n_head, n_kv, n_tok, 1]), 2, 0, 1, 3)
+     const ggml_tensor * rows_r = nodes[4];
+@@ -2110,7 +3455,47 @@ static void inkling2_relbias(ggml_backend_cuda_context & ctx, const ggml_cuda_in
+ 
  // ---------------------------------------------------------------------------------------------------------------------
- // RELBIAS: the attention mask with the relative-position bias of each head, written straight in the type of the mask,
- // from the bias table tab = W r of each token and head (the MUL_MAT before the chain):
+ 
++static bool ggml_cuda_inkling2_match_impl(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args);
++
++// LLAMA_INKLING_FUSION_SKIP=name[,name...]: the fusions of this file to leave to the unfused ops (diagnosis), names
++// clip conv conv_state conv_dyn situ mix ctrl_down ctrl_out ctrl_norm ctrl_tail relbias reltab
++static bool inkling2_fusion_skipped(ggml_cuda_inkling2_fusion type) {
++    static const unsigned mask = [] {
++        const char * env = getenv("LLAMA_INKLING_FUSION_SKIP");
++        if (!env) {
++            return 0u;
++        }
++        static const char * names[] = { "none", "clip", "conv", "situ", "mix", "ctrl_down", "ctrl_out", "relbias", "conv_state",
++                                        "conv_dyn", "ctrl_norm", "ctrl_tail", "reltab" };
++        unsigned m = 0;
++        std::string list(env);
++        for (size_t pos = 0; pos < list.size();) {
++            size_t end = list.find(',', pos);
++            if (end == std::string::npos) {
++                end = list.size();
++            }
++            const std::string name = list.substr(pos, end - pos);
++            for (unsigned k = 1; k < sizeof(names)/sizeof(names[0]); ++k) {
++                if (name == names[k]) {
++                    m |= 1u << k;
++                }
++            }
++            pos = end + 1;
++        }
++        GGML_LOG_INFO("inkling2: fusions skipped by LLAMA_INKLING_FUSION_SKIP: mask %#x\n", m);
++        return m;
++    }();
++    return (mask >> (unsigned) type) & 1u;
++}
++
+ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
++    if (!ggml_cuda_inkling2_match_impl(cgraph, i, args)) {
++        return false;
++    }
++    return !inkling2_fusion_skipped(args.type);
++}
++
++static bool ggml_cuda_inkling2_match_impl(const ggml_cgraph * cgraph, int i, ggml_cuda_inkling2_args & args) {
+     args = {};
+ 
+     switch (cgraph->nodes[i]->op) {
+@@ -2121,6 +3506,7 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
+         case GGML_OP_SSM_CONV:
+             return inkling2_match_conv(cgraph, i, args);
+         case GGML_OP_REPEAT:
++        case GGML_OP_SCALE:
+             return inkling2_match_situ(cgraph, i, args);
+         case GGML_OP_RMS_NORM:
+             return inkling2_match_mix(cgraph, i, args) || inkling2_match_ctrl_down(cgraph, i, args) ||
+@@ -2131,6 +3517,8 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
+             return inkling2_match_ctrl_out(cgraph, i, args);
+         case GGML_OP_SUB:
+             return inkling2_match_relbias(cgraph, i, args);
++        case GGML_OP_PAD:
++            return inkling2_mk_reltab_mode() != 0 && inkling2_match_reltab(cgraph, i, args);
+         case GGML_OP_CONCAT:
+             return inkling2_match_conv_state(cgraph, i, args) || inkling2_match_conv_dyn(cgraph, i, args);
+         default:
+@@ -2151,6 +3539,7 @@ void ggml_cuda_inkling2_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_i
+         case GGML_CUDA_INKLING2_CTRL_NORM:  inkling2_ctrl_norm(ctx, args);  break;
+         case GGML_CUDA_INKLING2_CTRL_TAIL:  inkling2_ctrl_tail(ctx, args);  break;
+         case GGML_CUDA_INKLING2_RELBIAS:    inkling2_relbias(ctx, args);    break;
++        case GGML_CUDA_INKLING2_RELTAB:     inkling2_reltab(ctx, args);     break;
+         default: GGML_ABORT("fatal error");
+     }
+ }
 diff --git a/ggml/src/ggml-cuda/inkling2.cuh b/ggml/src/ggml-cuda/inkling2.cuh
-index a3fb4bfb8..a575a2d57 100644
+index a3fb4bfb8..557ef0611 100644
 --- a/ggml/src/ggml-cuda/inkling2.cuh
 +++ b/ggml/src/ggml-cuda/inkling2.cuh
-@@ -35,3 +35,46 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
+@@ -17,8 +17,15 @@ enum ggml_cuda_inkling2_fusion {
+     GGML_CUDA_INKLING2_CONV_DYN,   // CONV_STATE with per-head input-dependent taps     : full-attention K/V conv
+     GGML_CUDA_INKLING2_CTRL_NORM,  // RMS_NORM RMS_NORM CONCAT                          : controller input, large batches
+     GGML_CUDA_INKLING2_CTRL_TAIL,  // TANH MUL SUB TANH MUL ADD                         : controller output, large batches
++    GGML_CUDA_INKLING2_RELTAB,     // PAD [CLIP] [MUL] MUL_MAT                          : relative-position bias table (MK_RELTAB)
+ };
+ 
++// the stages with their own switch, declined under LLAMA_INKLING_MK_CHECK after a shadow run (ggml-cuda.cu)
++static inline bool ggml_cuda_inkling2_is_mk_stage(ggml_cuda_inkling2_fusion type) {
++    return type == GGML_CUDA_INKLING2_RELTAB;
++}
++int inkling2_mk_reltab_mode(); // LLAMA_INKLING_MK_RELTAB
++
+ struct ggml_cuda_inkling2_args {
+     ggml_cuda_inkling2_fusion type = GGML_CUDA_INKLING2_NONE;
+ 
+@@ -35,3 +42,46 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
  
  // run the fused kernel of a match
  void ggml_cuda_inkling2_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_inkling2_args & args);
@@ -2931,8 +4155,200 @@ index a3fb4bfb8..a575a2d57 100644
 +const block_q8_1 * ggml_cuda_mk_glue_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * src1);
 +void ggml_cuda_mk_glue_begin_eval(ggml_backend_cuda_context & ctx); // a graph evaluation starts: earlier outputs are stale
 +void ggml_cuda_mk_glue_free(ggml_backend_cuda_context & ctx);       // the context is destroyed
+diff --git a/ggml/src/ggml-cuda/mmvq-inkling.cu b/ggml/src/ggml-cuda/mmvq-inkling.cu
+new file mode 100644
+index 000000000..f935834a7
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-inkling.cu
+@@ -0,0 +1,165 @@
++// LLAMA_INKLING_GEMV: one-token matrix-vector products for the Q8_0 / Q6_K attention projections of Inkling 2 Mini.
++//
++// mul_mat_vec_q's K loop has a run-time trip count (`for (kbx = ...; kbx < blocks_per_row_x; kbx += ...)`), so each
++// thread waits for the loads of one iteration before it issues those of the next: on the 2304-wide rows of Inkling 2
++// Mini that is 3 dependent rounds of global loads per thread (Q8_0: 72 blocks, 32 per iteration). This is the same
++// kernel with the row length as a template parameter: the loop is unrolled and every load of a thread is issued up
++// front. Same threads, same slices, same vec_dot functions, same reduction: the results are bit-identical.
++//
++// Also tried (docs/inkling-moonshot.md, "Branch gemv"): staging the rows in shared memory with 16-byte cp.async copies
++// (per-warp rings) or 16-byte register loads (everything in flight from the start) instead of the 2-byte loads. Both
++// were at best 4% faster on 3072 x 2304 and slower on the smaller shapes: a plain read of the same 7.5 MB takes 9.7 us
++// (the floor), and the staging kernels spent ~1 us after the last byte arrived computing from shared memory. The
++// 2-byte loads are not what limits mul_mat_vec_q on this GPU; the dependent load rounds are.
++
++#include "mmvq-inkling.cuh"
++
++#include "inkling2.cuh" // ggml_cuda_mk_glue_q8: the input already quantized by the glue kernel (LLAMA_INKLING_MK_GLUE)
++#include "quantize.cuh"
++#include "vecdotq.cuh"
++
++#include <cstdlib>
++#include <mutex>
++#include <set>
++#include <tuple>
++
++bool ggml_cuda_inkling_gemv_enabled() {
++    const char * env = getenv("LLAMA_INKLING_GEMV");
++    return env != nullptr && atoi(env) != 0;
++}
++
++// LLAMA_INKLING_GEMV_DEBUG: log the first launch of each (type, shape)
++static void inkling_gemv_log(ggml_type type, int64_t ncols, int64_t nrows) {
++    static const bool debug = getenv("LLAMA_INKLING_GEMV_DEBUG") != nullptr;
++    if (!debug) {
++        return;
++    }
++    static std::mutex mutex;
++    static std::set<std::tuple<int, int64_t, int64_t>> seen;
++    std::lock_guard<std::mutex> lock(mutex);
++    if (seen.insert({(int) type, ncols, nrows}).second) {
++        GGML_LOG_INFO("inkling_gemv: %s %lld x %lld\n", ggml_type_name(type), (long long) ncols, (long long) nrows);
++    }
++}
++
++// mul_mat_vec_q<type, ncols_dst = 1, has_fusion = false> as it runs on NVIDIA Ampere and Ada (the generic parameter
++// table: 4 warps, one row per block, not the small_k variant), with ncols known at compile time
++template <ggml_type type, int ncols>
++__launch_bounds__(4*WARP_SIZE, 1)
++static __global__ void inkling_gemv(const char * __restrict__ x, const char * __restrict__ y, float * __restrict__ dst) {
++    constexpr int nwarps          = 4;
++    constexpr int qk              = ggml_cuda_type_traits<type>::qk;
++    constexpr int qi              = ggml_cuda_type_traits<type>::qi;
++    constexpr int vdr             = type == GGML_TYPE_Q8_0 ? VDR_Q8_0_Q8_1_MMVQ : VDR_Q6_K_Q8_1_MMVQ;
++    constexpr int nb              = ncols / qk; // blocks per row
++    constexpr int blocks_per_iter = vdr*nwarps*WARP_SIZE / qi;
++    constexpr int nit             = (nb + blocks_per_iter - 1) / blocks_per_iter;
++    static_assert(type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K, "the types of the Inkling 2 Mini projections");
++    static_assert(ncols % qk == 0, "whole blocks");
++    // mul_mat_vec_q switches to its small_k variant (rows_per_block = nwarps) when one iteration covers the row
++    static_assert(nb >= blocks_per_iter, "the small_k variant of mul_mat_vec_q is not reproduced");
++
++    const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
++    const int kqs = vdr*(tid % (qi/vdr));
++    const void       * xr = x + (size_t) blockIdx.x*nb*ggml_cuda_type_traits<type>::bs;
++    const block_q8_1 * yb = (const block_q8_1 *) y;
++
++    float tmp = 0.0f;
++#pragma unroll
++    for (int it = 0; it < nit; ++it) {
++        const int kbx = tid/(qi/vdr) + it*blocks_per_iter;
++        if (nb % blocks_per_iter == 0 || it < nit - 1 || kbx < nb) {
++            if constexpr (type == GGML_TYPE_Q8_0) {
++                tmp += vec_dot_q8_0_q8_1(xr, yb + kbx*(qk/QK8_1), kbx, kqs);
++            } else {
++                tmp += vec_dot_q6_K_q8_1(xr, yb + kbx*(qk/QK8_1), kbx, kqs);
++            }
++        }
++    }
++
++    // the partial sums of warps 1..3 added to warp 0's in order, then the warp sum, as in mul_mat_vec_q
++    __shared__ float tmp_shared[nwarps - 1][WARP_SIZE];
++    if (threadIdx.y > 0) {
++        tmp_shared[threadIdx.y - 1][threadIdx.x] = tmp;
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) {
++        return;
++    }
++#pragma unroll
++    for (int l = 0; l < nwarps - 1; ++l) {
++        tmp += tmp_shared[l][threadIdx.x];
++    }
++    tmp = warp_reduce_sum<WARP_SIZE>(tmp);
++    if (threadIdx.x == 0) {
++        dst[blockIdx.x] = tmp;
++    }
++}
++
++template <ggml_type type, int ncols>
++static void inkling_gemv_launch(const char * x, const char * y, float * dst, const int64_t nrows, cudaStream_t stream) {
++    inkling_gemv<type, ncols><<<(unsigned int) nrows, dim3(WARP_SIZE, 4), 0, stream>>>(x, y, dst);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// the shapes it was measured on (RTX 3090): the Inkling 2 Mini attention projections Q, gate (2304 -> 3072),
++// K, V (2304 -> 1024), R (2304 -> 384) and the output (3072 -> 2304)
++static bool inkling_gemv_shape(const int64_t ncols, const int64_t nrows) {
++    return (ncols == 2304 && (nrows == 3072 || nrows == 1024 || nrows == 384)) || (ncols == 3072 && nrows == 2304);
++}
++
++bool ggml_cuda_inkling_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    if (!ggml_cuda_inkling_gemv_enabled()) {
++        return false;
++    }
++    // mul_mat_vec_q uses its generic parameter table on NVIDIA Ampere and Ada except Orin; Hopper and newer also add
++    // PDL (and GB10 has its own table): tuned and checked on Ampere (RTX 3090) only
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE || cc == GGML_CUDA_CC_ORIN || cc >= GGML_CUDA_CC_HOPPER) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q6_K) {
++        return false;
++    }
++    const int64_t ncols = src0->ne[0];
++    const int64_t nrows = src0->ne[1];
++    if (!inkling_gemv_shape(ncols, nrows) || src0->ne[2] != 1 || src0->ne[3] != 1 || !ggml_is_contiguous(src0) ||
++            src1->type != GGML_TYPE_F32 || src1->ne[0] != ncols || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
++            !ggml_is_contiguous(src1) || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++    // weights only: a compute-buffer src0 may need the padding clear of mul_mat_vec_q
++    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        return false;
++    }
++
++    cudaStream_t stream = ctx.stream();
++
++    // the q8_1 of the input, as mul_mat_vec_q makes it (or the glue kernel already did)
++    const int64_t ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
++    const block_q8_1 * glue_q8 = ggml_cuda_mk_glue_q8(ctx, src1);
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
++    if (glue_q8 == nullptr) {
++        src1_q8_1.alloc(ncols_padded*sizeof(block_q8_1)/QK8_1);
++        quantize_row_q8_1_cuda((const float *) src1->data, src1_q8_1.get(), ncols, ncols, ncols, ncols, ncols_padded, 1, 1, 1, stream);
++    }
++    const char * y = glue_q8 != nullptr ? (const char *) glue_q8 : src1_q8_1.get();
++
++    inkling_gemv_log(src0->type, ncols, nrows);
++    const char * x = (const char *) src0->data;
++    float      * d = (float *) dst->data;
++    if (src0->type == GGML_TYPE_Q8_0) {
++        if (ncols == 2304) {
++            inkling_gemv_launch<GGML_TYPE_Q8_0, 2304>(x, y, d, nrows, stream);
++        } else {
++            inkling_gemv_launch<GGML_TYPE_Q8_0, 3072>(x, y, d, nrows, stream);
++        }
++    } else {
++        if (ncols == 2304) {
++            inkling_gemv_launch<GGML_TYPE_Q6_K, 2304>(x, y, d, nrows, stream);
++        } else {
++            inkling_gemv_launch<GGML_TYPE_Q6_K, 3072>(x, y, d, nrows, stream);
++        }
++    }
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/mmvq-inkling.cuh b/ggml/src/ggml-cuda/mmvq-inkling.cuh
+new file mode 100644
+index 000000000..6555d3f8f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-inkling.cuh
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include "common.cuh"
++
++// LLAMA_INKLING_GEMV=1 (default off): one-token matrix-vector products over the Q8_0 and Q6_K weights of
++// Inkling 2 Mini's attention projections (2304- and 3072-wide rows) with mul_mat_vec_q's own thread mapping and
++// reduction but the row length fixed at compile time, so that each thread issues all its loads at once. The results
++// are bit-identical to mul_mat_vec_q's. See docs/inkling-moonshot.md, "Branch gemv".
++
++// true when the switch is on (read on every call, so that a test can toggle it between evaluations)
++bool ggml_cuda_inkling_gemv_enabled();
++
++// runs dst = src0 * src1 for the shapes the kernel was tuned for and returns true; returns false (nothing done) for
++// any other product, which then takes the usual path. Call it where ggml_cuda_mul_mat would use mul_mat_vec_q.
++bool ggml_cuda_inkling_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 6f10428e6..3c1647df1 100644
+index 6f10428e6..64b6055f8 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,5 +1,9 @@
@@ -2974,7 +4390,7 @@ index 6f10428e6..3c1647df1 100644
          ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
-@@ -1688,3 +1696,706 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1688,3 +1696,747 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }
@@ -2992,13 +4408,16 @@ index 6f10428e6..3c1647df1 100644
 +    int nrows[MMVQ_MULTI_MAX];
 +    int ncols_x[MMVQ_MULTI_MAX];
 +    int stride_row_x[MMVQ_MULTI_MAX]; // in blocks
++    int rb_end[MMVQ_MULTI_MAX];       // the flattened row-block space: product m owns blocks [rb_end[m-1], rb_end[m])
 +    const int32_t * ids = nullptr;    // MUL_MAT_ID: the matrix of product m is expert ids[m] of vx[m]
 +    size_t          expert_nbytes = 0;
 +};
 +
-+// blockIdx.y: the matrix; blockIdx.x: its row block. The body is the ncols_dst == 1, no-fusion body of mul_mat_vec_q,
-+// with the same thread-to-block mapping, accumulation order and reductions.
-+template <ggml_type type, bool small_k>
++// blockIdx.x: a row block of the flattened space of all products (no idle blocks for the shorter products). The body
++// is the ncols_dst == 1, no-fusion body of mul_mat_vec_q, with the same thread-to-block mapping, accumulation order
++// and reductions. ncols_t > 0: the row length at compile time (the projections' 2304): the K loop is unrolled and
++// every load of a thread is issued at once, the same operations in the same order (the unrolled gemv of mmvq-inkling.cu).
++template <ggml_type type, bool small_k, int ncols_t = 0>
 +__launch_bounds__(calc_nwarps(type, 1, get_device_table_id(), small_k, false)*ggml_cuda_get_physical_warp_size(), 1)
 +// __grid_constant__: the per-product arrays are indexed with the block's matrix; without it the compiler copies the
 +// whole parameter struct to local memory per thread before indexing it (measured 5-20% slower than mul_mat_vec_q)
@@ -3012,19 +4431,28 @@ index 6f10428e6..3c1647df1 100644
 +    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 +    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 +
-+    const int m = blockIdx.y;
++    // the product of this block and its first row block within it (the compares are uniform over the block)
++    int m = 0;
++#pragma unroll
++    for (int k = 1; k < MMVQ_MULTI_MAX; ++k) {
++        if (k < args.n && (int) blockIdx.x >= args.rb_end[k - 1]) {
++            m = k;
++        }
++    }
++    const int rb0 = m == 0 ? 0 : args.rb_end[m - 1];
 +    if (args.debug && (m >= args.n || args.vx[m] == nullptr || args.vy[m] == nullptr || args.dst[m] == nullptr ||
-+            args.ncols_x[m] % qk != 0 || args.nrows[m] <= 0)) {
++            args.ncols_x[m] % qk != 0 || args.nrows[m] <= 0 || (ncols_t > 0 && args.ncols_x[m] != ncols_t) ||
++            (int) blockIdx.x >= args.rb_end[m])) {
 +        if (threadIdx.x == 0 && threadIdx.y == 0) {
-+            printf("mul_mat_vec_q_multi: bad matrix %d of %d at block (%u, %u): nrows %d ncols %d\n",
-+                   m, args.n, blockIdx.x, blockIdx.y, args.nrows[m], args.ncols_x[m]);
++            printf("mul_mat_vec_q_multi: bad matrix %d of %d at block %u: nrows %d ncols %d\n",
++                   m, args.n, blockIdx.x, args.nrows[m], args.ncols_x[m]);
 +        }
 +        return;
 +    }
 +    const int nrows = args.nrows[m];
-+    const int row0  = rows_per_cuda_block*blockIdx.x;
++    const int row0  = rows_per_cuda_block*((int) blockIdx.x - rb0);
 +    if (row0 >= nrows) {
-+        return; // a shorter matrix than the grid, uniform for the block
++        return;
 +    }
 +    const void       * GGML_CUDA_RESTRICT vx = args.vx[m];
 +    const block_q8_1 * GGML_CUDA_RESTRICT y  = args.vy[m];
@@ -3039,7 +4467,7 @@ index 6f10428e6..3c1647df1 100644
 +        vx = (const char *) vx + (size_t) expert*args.expert_nbytes;
 +    }
 +    float            * GGML_CUDA_RESTRICT dst = args.dst[m];
-+    const int blocks_per_row_x = args.ncols_x[m] / qk;
++    const int blocks_per_row_x = ncols_t > 0 ? ncols_t / qk : args.ncols_x[m] / qk;
 +    const int stride_row_x     = args.stride_row_x[m];
 +
 +    const     int tid = warp_size*threadIdx.y + threadIdx.x;
@@ -3047,12 +4475,29 @@ index 6f10428e6..3c1647df1 100644
 +
 +    float tmp[rows_per_cuda_block] = {0.0f};
 +    const int kbx_offset = row0*stride_row_x;
-+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-+        const int kby = kbx * (qk/QK8_1);
-+        const int kqs = vdr * (tid % (qi/vdr));
++    if constexpr (ncols_t > 0) {
++        constexpr int nb  = ncols_t / qk;
++        constexpr int nit = (nb + blocks_per_iter - 1) / blocks_per_iter;
 +#pragma unroll
-+        for (int i = 0; i < rows_per_cuda_block; ++i) {
-+            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++        for (int it = 0; it < nit; ++it) {
++            const int kbx = tid / (qi/vdr) + it*blocks_per_iter;
++            if (nb % blocks_per_iter == 0 || it < nit - 1 || kbx < nb) {
++                const int kby = kbx * (qk/QK8_1);
++                const int kqs = vdr * (tid % (qi/vdr));
++#pragma unroll
++                for (int i = 0; i < rows_per_cuda_block; ++i) {
++                    tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                }
++            }
++        }
++    } else {
++        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++            const int kby = kbx * (qk/QK8_1);
++            const int kqs = vdr * (tid % (qi/vdr));
++#pragma unroll
++            for (int i = 0; i < rows_per_cuda_block; ++i) {
++                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++            }
 +        }
 +    }
 +
@@ -3088,13 +4533,25 @@ index 6f10428e6..3c1647df1 100644
 +    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
 +    const int nwarps = calc_nwarps(type, 1, table_id, small_k, false);
 +    const int rpb    = calc_rows_per_block(type, 1, table_id, small_k, nwarps);
-+    const dim3 block_nums((max_nrows + rpb - 1)/rpb, args.n, 1);
++    // the flattened row-block space of all products
++    mmvq_multi_args a = args;
++    int  total = 0;
++    bool all_2304 = true;
++    for (int k = 0; k < a.n; ++k) {
++        total      += (a.nrows[k] + rpb - 1)/rpb;
++        a.rb_end[k] = total;
++        all_2304    = all_2304 && a.ncols_x[k] == 2304;
++    }
++    const dim3 block_nums(total, 1, 1);
 +    const dim3 block_dims(warp_size, nwarps, 1);
 +    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
++    GGML_UNUSED(max_nrows);
 +    if (small_k) {
-+        ggml_cuda_kernel_launch(mul_mat_vec_q_multi<type, true>, launch_params, args);
++        ggml_cuda_kernel_launch(mul_mat_vec_q_multi<type, true>, launch_params, a);
++    } else if (all_2304 && 2304 % ggml_cuda_type_traits<type>::qk == 0) {
++        ggml_cuda_kernel_launch(mul_mat_vec_q_multi<type, false, 2304>, launch_params, a);
 +    } else {
-+        ggml_cuda_kernel_launch(mul_mat_vec_q_multi<type, false>, launch_params, args);
++        ggml_cuda_kernel_launch(mul_mat_vec_q_multi<type, false>, launch_params, a);
 +    }
 +}
 +
@@ -3715,6 +5172,312 @@ index 5605bf7a4..f160d3321 100644
  void ggml_cuda_op_mul_mat_vec_q(
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+index 11ec58497..683488dd1 100644
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+@@ -1,7 +1,13 @@
+ #include "moe-weighted-reduction.cuh"
+ 
++// scale_ids (LLAMA_INKLING_MK_MOESCALE): the expert scale of row r is expert_scale[scale_ids[r]], i.e. the gather that
++// the graph does with REPEAT + GET_ROWS of the per-expert scale table before the products; the same values, so the same bits
++// exact: every operation rounded as the unfused MUL, MUL and ADD kernels round it (no FMA contraction of the last
++// multiply with the add), so the result is bit-identical to the unfused graph; false keeps the upstream arithmetic
++template <bool exact>
+ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
+                                                   const float * __restrict__ expert_scale,
++                                                  const int32_t * __restrict__ scale_ids,
+                                                   const float * __restrict__ weights,
+                                                   float * __restrict__ dst,
+                                                   const int64_t n_embd,
+@@ -13,19 +19,25 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
+     }
+ 
+     const uint64_t first_row   = (uint64_t) token * n_expert_used;
+-    const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
++    const float    first_scale = expert_scale != nullptr ? expert_scale[scale_ids != nullptr ? scale_ids[first_row] : first_row] : 1.0f;
+     float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
+ 
+     for (int expert = 1; expert < n_expert_used; ++expert) {
+         const uint64_t row   = first_row + expert;
+-        const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+-        sum += (experts[row * n_embd + col] * scale) * weights[row];
++        const float   scale = expert_scale != nullptr ? expert_scale[scale_ids != nullptr ? scale_ids[row] : row] : 1.0f;
++        if constexpr (exact) {
++            const float scaled = expert_scale != nullptr ? __fmul_rn(experts[row * n_embd + col], scale) : experts[row * n_embd + col];
++            sum = __fadd_rn(sum, __fmul_rn(scaled, weights[row]));
++        } else {
++            sum += (experts[row * n_embd + col] * scale) * weights[row];
++        }
+     }
+     dst[token * n_embd + col] = sum;
+ }
+ 
+ static void launch_moe_weighted_reduction(const float * experts,
+                                           const float * expert_scale,
++                                          const int32_t * scale_ids,
+                                           const float * weights,
+                                           float *       dst,
+                                           int64_t       n_embd,
+@@ -34,15 +46,19 @@ static void launch_moe_weighted_reduction(const float * experts,
+                                           cudaStream_t  stream) {
+     constexpr int threads = 256;
+     const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
+-    moe_weighted_reduction_f32
+-        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++    if (scale_ids != nullptr) {
++        moe_weighted_reduction_f32<true><<<blocks, threads, 0, stream>>>(experts, expert_scale, scale_ids, weights, dst, n_embd, n_expert_used);
++    } else {
++        moe_weighted_reduction_f32<false><<<blocks, threads, 0, stream>>>(experts, expert_scale, scale_ids, weights, dst, n_embd, n_expert_used);
++    }
+ }
+ 
+ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
+                                          const ggml_tensor *         experts,
+                                          const ggml_tensor *         expert_scale,
+                                          const ggml_tensor *         weights,
+-                                         ggml_tensor *               dst) {
++                                         ggml_tensor *               dst,
++                                         const ggml_tensor *         scale_ids) {
+     GGML_ASSERT(experts->type == GGML_TYPE_F32);
+     GGML_ASSERT(weights->type == GGML_TYPE_F32);
+     GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
+@@ -50,6 +66,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
+     GGML_ASSERT(ggml_is_contiguous(experts));
+     GGML_ASSERT(ggml_is_contiguous(weights));
+     GGML_ASSERT(expert_scale == nullptr || ggml_is_contiguous(expert_scale));
++    GGML_ASSERT(scale_ids == nullptr || (expert_scale != nullptr && scale_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(scale_ids)));
+     GGML_ASSERT(ggml_is_contiguous(dst));
+ 
+     const int64_t n_embd        = experts->ne[0];
+@@ -59,6 +76,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
+ 
+     launch_moe_weighted_reduction((const float *) experts->data,
+                                   expert_scale ? (const float *) expert_scale->data : nullptr,
++                                  scale_ids ? (const int32_t *) scale_ids->data : nullptr,
+                                   (const float *) weights->data,
+                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
+     CUDA_CHECK(cudaGetLastError());
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
+index b72f947ab..3e648e105 100644
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
+@@ -4,4 +4,5 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
+                                          const ggml_tensor *         experts,
+                                          const ggml_tensor *         expert_scale,
+                                          const ggml_tensor *         weights,
+-                                         ggml_tensor *               dst);
++                                         ggml_tensor *               dst,
++                                         const ggml_tensor *         scale_ids = nullptr);
+diff --git a/scripts/inkling-gemv-bwprobe.cu b/scripts/inkling-gemv-bwprobe.cu
+new file mode 100644
+index 000000000..de7af6881
+--- /dev/null
++++ b/scripts/inkling-gemv-bwprobe.cu
+@@ -0,0 +1,80 @@
++// Read-bandwidth probe for the LLAMA_INKLING_GEMV work (docs/inkling-moonshot.md, "Branch gemv"): how long one
++// kernel takes to read N bytes once (no L2 reuse, 512 MB pool), i.e. the floor of a one-token GEMV over N bytes of
++// weights, and how much of a short kernel is fixed overhead. Four kernel variants (one pass or grid-stride, 4 or 8
++// 16-byte loads per thread), each launched 64 times per CUDA graph; the kernel durations come from nsys:
++//
++//   nvcc -O3 -arch=sm_86 -o bwprobe scripts/inkling-gemv-bwprobe.cu
++//   nsys profile -t cuda --cuda-graph-trace=node -o bw ./bwprobe && nsys stats -r cuda_gpu_kern_sum bw.nsys-rep
++//
++// RTX 3090: 0.98 MB 2.4 us, 2.52 MB 4.15 us, 7.52 MB 9.7 us, 30 MB 35.0 us (= 1.3 us + bytes / 892 GB/s).
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++#include <cuda_runtime.h>
++#define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { printf("%s: %s\n", #x, cudaGetErrorString(e)); exit(1); } } while (0)
++
++// each thread reads U int4 with stride blockDim*gridDim (one pass), xor-reduces, one store per block
++template <int U>
++__global__ void rd_plain(const int4 * __restrict__ x, int n4, int * out) {
++    int acc = 0;
++    const int i0 = blockIdx.x*blockDim.x*U + threadIdx.x;
++    int4 v[U];
++#pragma unroll
++    for (int u = 0; u < U; ++u) { const int i = i0 + u*blockDim.x; v[u] = i < n4 ? __ldcs(x + i) : make_int4(0,0,0,0); }
++#pragma unroll
++    for (int u = 0; u < U; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
++    if (acc == 0x12345678) out[blockIdx.x] = acc;
++}
++// persistent grid-stride version
++template <int U>
++__global__ void rd_persist(const int4 * __restrict__ x, int n4, int * out) {
++    int acc = 0;
++    for (int i0 = blockIdx.x*blockDim.x*U + threadIdx.x; i0 < n4; i0 += gridDim.x*blockDim.x*U) {
++        int4 v[U];
++#pragma unroll
++        for (int u = 0; u < U; ++u) { const int i = i0 + u*blockDim.x; v[u] = i < n4 ? __ldcs(x + i) : make_int4(0,0,0,0); }
++#pragma unroll
++        for (int u = 0; u < U; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
++    }
++    if (acc == 0x12345678) out[blockIdx.x] = acc;
++}
++
++int main() {
++    const size_t pool = 512ull << 20;
++    char * buf; int * out;
++    CK(cudaMalloc(&buf, pool)); CK(cudaMalloc(&out, 1 << 24));
++    CK(cudaMemset(buf, 1, pool));
++    cudaStream_t s; CK(cudaStreamCreate(&s));
++    int nsm; CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
++    const size_t sizes[] = { 979968, 2519040, 7520256, 7520256*4 };
++    for (size_t bytes : sizes) {
++        const int n4 = (int) (bytes/16);
++        const int nbuf = (int) (pool/bytes);
++        for (int variant = 0; variant < 4; ++variant) {
++            cudaGraph_t g; cudaGraphExec_t ge;
++            CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
++            const int nl = 64;
++            for (int l = 0; l < nl; ++l) {
++                const int4 * x = (const int4 *) (buf + (size_t) (l % nbuf)*((bytes + 255)/256*256));
++                switch (variant) {
++                    case 0: rd_plain<4><<<(n4 + 256*4 - 1)/(256*4), 256, 0, s>>>(x, n4, out); break;
++                    case 1: rd_plain<8><<<(n4 + 256*8 - 1)/(256*8), 256, 0, s>>>(x, n4, out); break;
++                    case 2: rd_persist<4><<<nsm*4, 256, 0, s>>>(x, n4, out); break;
++                    case 3: rd_persist<8><<<nsm*6, 128, 0, s>>>(x, n4, out); break;
++                }
++            }
++            CK(cudaStreamEndCapture(s, &g));
++            CK(cudaGraphInstantiate(&ge, g, 0));
++            CK(cudaGraphLaunch(ge, s)); CK(cudaStreamSynchronize(s));
++            cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
++            cudaEventRecord(a, s);
++            for (int r = 0; r < 10; ++r) CK(cudaGraphLaunch(ge, s));
++            cudaEventRecord(b, s); CK(cudaEventSynchronize(b));
++            float ms; cudaEventElapsedTime(&ms, a, b);
++            const double us = ms*1e3/(10*nl);
++            printf("bytes %9zu variant %d: %6.2f us per launch (graph), %5.0f GB/s\n", bytes, variant, us, bytes/us*1e-3);
++            cudaGraphExecDestroy(ge); cudaGraphDestroy(g);
++        }
++    }
++    return 0;
++}
+diff --git a/scripts/inkling-launch-costs.cu b/scripts/inkling-launch-costs.cu
+new file mode 100644
+index 000000000..977ba53fe
+--- /dev/null
++++ b/scripts/inkling-launch-costs.cu
+@@ -0,0 +1,117 @@
++// Standalone: nvcc -O3 -arch=sm_86 -o launch-costs scripts/inkling-launch-costs.cu && ./launch-costs
++// Results on the RTX 3090 (2026-11-24): graph launch 1.30 us (empty 0.73), cooperative launch +0, cg grid barrier 1.02 us,
++// hand-rolled barrier 2.05 us, stream launch 2.03 us. See docs/inkling-moonshot.md, iteration 8.
++// Costs that decide the layer-kernel design on this GPU: a kernel launch inside a replayed CUDA graph, a cooperative
++// launch, a grid-wide barrier (cooperative groups and a hand-rolled one). 82 blocks x 1024 threads like the glue kernels.
++#include <cooperative_groups.h>
++#include <cstdio>
++#include <cstdlib>
++namespace cg = cooperative_groups;
++
++__global__ void k_empty(float * p) { if (threadIdx.x == 0 && blockIdx.x == 0 && p == nullptr) p[0] = 1.0f; }
++
++// touches 16 KB per block (like a small phase), no barrier
++__global__ void k_touch(float * p, int n) {
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    if (i < n) p[i] = p[i]*1.0001f + 1.0f;
++}
++
++template <int K>
++__global__ void k_coop(float * p, int n) {
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    for (int k = 0; k < K; ++k) {
++        if (i < n) p[i] = p[i]*1.0001f + 1.0f;
++        cg::this_grid().sync();
++    }
++    if (i < n) p[i] += 1.0f;
++}
++
++// hand-rolled: generation barrier, one atomic per block; needs co-residency (cooperative launch)
++__device__ __forceinline__ void grid_barrier(unsigned int * bar, unsigned int nblocks) {
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        __threadfence();
++        const unsigned int gen = bar[1];
++        if (atomicAdd(&bar[0], 1u) == nblocks - 1) {
++            bar[0] = 0;
++            __threadfence();
++            atomicAdd(&bar[1], 1u);
++        } else {
++            while (*((volatile unsigned int *) &bar[1]) == gen) { __nanosleep(32); }
++        }
++        __threadfence();
++    }
++    __syncthreads();
++}
++
++template <int K>
++__global__ void k_hand(float * p, int n, unsigned int * bar) {
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    for (int k = 0; k < K; ++k) {
++        if (i < n) p[i] = p[i]*1.0001f + 1.0f;
++        grid_barrier(bar, gridDim.x);
++    }
++    if (i < n) p[i] += 1.0f;
++}
++
++#define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { printf("%s: %s\n", #x, cudaGetErrorString(e)); exit(1); } } while (0)
++
++static cudaStream_t st;
++static float * buf; static unsigned int * bar; static int n;
++
++template <typename F>
++static double timed_graph(F launch, int per_graph, int reps) {
++    cudaGraph_t g; cudaGraphExec_t ge;
++    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed));
++    for (int i = 0; i < per_graph; ++i) launch();
++    CK(cudaStreamEndCapture(st, &g));
++    CK(cudaGraphInstantiate(&ge, g, 0));
++    CK(cudaGraphLaunch(ge, st)); CK(cudaStreamSynchronize(st));
++    cudaEvent_t a, b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
++    CK(cudaEventRecord(a, st));
++    for (int r = 0; r < reps; ++r) CK(cudaGraphLaunch(ge, st));
++    CK(cudaEventRecord(b, st)); CK(cudaStreamSynchronize(st));
++    float ms; CK(cudaEventElapsedTime(&ms, a, b));
++    CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
++    return ms*1000.0/reps/per_graph; // us per launch
++}
++
++template <typename Kern, typename... Args>
++static void coop_launch(Kern kern, int grid, Args... args) {
++    cudaLaunchAttribute attr = {}; attr.id = cudaLaunchAttributeCooperative; attr.val.cooperative = 1;
++    cudaLaunchConfig_t cfg = {}; cfg.gridDim = dim3(grid); cfg.blockDim = dim3(1024); cfg.stream = st; cfg.attrs = &attr; cfg.numAttrs = 1;
++    CK(cudaLaunchKernelEx(&cfg, kern, args...));
++}
++
++int main() {
++    int dev = 0, nsm = 0; CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
++    CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
++    n = nsm*1024; CK(cudaMalloc(&buf, n*sizeof(float))); CK(cudaMemset(buf, 0, n*sizeof(float)));
++    CK(cudaMalloc(&bar, 2*sizeof(unsigned int))); CK(cudaMemset(bar, 0, 2*sizeof(unsigned int)));
++    const int G = nsm; // one block per SM
++    printf("SMs %d, grid %d x 1024\n", nsm, G);
++    printf("graph: empty kernel (1 block)             %6.2f us/launch\n", timed_graph([&]{ k_empty<<<1, 32, 0, st>>>(buf); }, 200, 20));
++    printf("graph: touch kernel (%d x 1024)           %6.2f us/launch\n", G, timed_graph([&]{ k_touch<<<G, 1024, 0, st>>>(buf, n); }, 200, 20));
++    printf("graph: cooperative touch, 0 barriers      %6.2f us/launch\n", timed_graph([&]{ coop_launch(k_coop<0>, G, buf, n); }, 200, 20));
++    double t1 = timed_graph([&]{ coop_launch(k_coop<1>, G, buf, n); }, 100, 20);
++    double t4 = timed_graph([&]{ coop_launch(k_coop<4>, G, buf, n); }, 100, 20);
++    double t16 = timed_graph([&]{ coop_launch(k_coop<16>, G, buf, n); }, 50, 20);
++    printf("graph: cooperative, 1/4/16 cg barriers    %6.2f %6.2f %6.2f us/launch -> %5.2f us per barrier\n", t1, t4, t16, (t16 - t4)/12.0);
++    double h1 = timed_graph([&]{ coop_launch(k_hand<1>, G, buf, n, bar); }, 100, 20);
++    double h4 = timed_graph([&]{ coop_launch(k_hand<4>, G, buf, n, bar); }, 100, 20);
++    double h16 = timed_graph([&]{ coop_launch(k_hand<16>, G, buf, n, bar); }, 50, 20);
++    printf("graph: cooperative, 1/4/16 hand barriers  %6.2f %6.2f %6.2f us/launch -> %5.2f us per barrier\n", h1, h4, h16, (h16 - h4)/12.0);
++    // the same with 2 blocks per SM (512 threads each would fit; here 1024 x 2 needs <= 32 regs: try)
++    int per_sm = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k_coop<4>, 1024, 0));
++    printf("resident 1024-thread blocks per SM for k_coop: %d\n", per_sm);
++    if (per_sm >= 2) {
++        double t4b = timed_graph([&]{ coop_launch(k_coop<4>, 2*G, buf, n); }, 100, 20);
++        double t16b = timed_graph([&]{ coop_launch(k_coop<16>, 2*G, buf, n); }, 50, 20);
++        printf("graph: cooperative %d blocks, 4/16 barriers %6.2f %6.2f -> %5.2f us per barrier\n", 2*G, t4b, t16b, (t16b - t4b)/12.0);
++    }
++    // non-graph launches for reference
++    cudaEvent_t a, b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
++    CK(cudaEventRecord(a, st)); for (int i = 0; i < 500; ++i) k_touch<<<G, 1024, 0, st>>>(buf, n); CK(cudaEventRecord(b, st)); CK(cudaStreamSynchronize(st));
++    float ms; CK(cudaEventElapsedTime(&ms, a, b)); printf("stream (no graph): touch kernel          %6.2f us/launch\n", ms*1000/500);
++    return 0;
++}
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index c27a91b6e..d94b52193 100644
 --- a/src/llama-context.cpp
@@ -3744,10 +5507,10 @@ index c27a91b6e..d94b52193 100644
  
  static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index d503e8310..4a1d1302a 100644
+index d503e8310..9bf4c4f65 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -12,6 +12,21 @@ bool llama_model_inkling2::graph::graph_trim_enabled() {
+@@ -12,6 +12,25 @@ bool llama_model_inkling2::graph::graph_trim_enabled() {
      return enabled;
  }
  
@@ -3756,9 +5519,13 @@ index d503e8310..4a1d1302a 100644
 +// (ggml_cuda_mk_proj_match); unset, the graph is exactly the one without the fusion
 +static bool inkling_mk_proj_order() {
 +    static const bool enabled = [] {
-+        // LLAMA_INKLING_MK_GLUE needs the same order: its chain is the controllers followed by the three norms
++        // LLAMA_INKLING_MK_GLUE needs the same order: its chain is the controllers followed by the three norms;
++        // LLAMA_INKLING_MK_ORDER=1 selects the order alone (to test its effect without any fused kernel)
 +        if (getenv("LLAMA_INKLING_MK_GLUE") != nullptr) {
 +            return true;
++        }
++        if (const char * order = getenv("LLAMA_INKLING_MK_ORDER")) {
++            return atoi(order) != 0;
 +        }
 +        const char * env = getenv("LLAMA_INKLING_MK_PROJ");
 +        return env && atoi(env) != 0;
@@ -3769,7 +5536,7 @@ index d503e8310..4a1d1302a 100644
  // LLAMA_INKLING_DECODE_SINKS=0 folds the sink into the bias table for one-token graphs too (SUB + FILL per layer)
  bool llama_model_inkling2::graph::decode_sinks_enabled() {
      static const bool enabled = [] {
-@@ -397,10 +412,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -397,10 +416,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          inputs[2] = build_norm(inputs[2], layer.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
      }
  
@@ -3791,7 +5558,7 @@ index d503e8310..4a1d1302a 100644
  
          // a slot that shares the KV cache of another slot (inkling2_loop, LLAMA_INKLING_SHARE_LOOP_KV) computes
          // no K and V: build_attn() reads the source slot's cache, which the source stored earlier in this graph
-@@ -411,7 +437,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -411,7 +441,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
              Vcur = build_lora_mm(layer.wv, inputs[2]);
              cb(Kcur, "Kpre", il);
              cb(Vcur, "Vpre", il);
@@ -3808,7 +5575,7 @@ index d503e8310..4a1d1302a 100644
              Kcur = convolve(Kcur, layer.attn_k_conv,
                      is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
              Vcur = convolve(Vcur, layer.attn_v_conv,
-@@ -435,8 +470,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -435,8 +474,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          cb(Qcur, "Qcur", il);
          cb(Rcur, "Rcur", il);
  
@@ -3817,7 +5584,7 @@ index d503e8310..4a1d1302a 100644
          // the far bin (distance >= extent) is the zero row of the padded table
          ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
  
-@@ -464,7 +497,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -464,7 +501,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                  nullptr, nullptr, nullptr,
                  Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
  
@@ -3827,15 +5594,16 @@ index d503e8310..4a1d1302a 100644
          cb(cur, "attn_out", il);
      }
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index e6186af10..b120b49b3 100644
+index e6186af10..842ab3dd9 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -369,6 +369,8 @@ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
+@@ -369,6 +369,9 @@ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
  
  llama_build_and_test(test-backend-tensor.cpp LINK ggml)
  llama_build_and_test(test-flash-attn-indexed-bias.cpp LINK ggml)
 +llama_build_and_test(test-sched-streams.cpp LINK ggml)
 +llama_build_and_test(test-inkling-megakernel.cpp LINK ggml)
++llama_build_and_test(test-inkling-gemv.cpp LINK ggml)
  llama_build_and_test(test-sleep.cpp LINK ggml)
  llama_build_and_test(test-backend-sched.cpp LINK ggml)
  
@@ -4034,12 +5802,218 @@ index 6b8fb1b3a..64c6091b0 100644
          ggml_backend_free(backend);
      }
  }
+diff --git a/tests/test-inkling-gemv.cpp b/tests/test-inkling-gemv.cpp
+new file mode 100644
+index 000000000..c3b8a195c
+--- /dev/null
++++ b/tests/test-inkling-gemv.cpp
+@@ -0,0 +1,200 @@
++// LLAMA_INKLING_GEMV: the one-token Q8_0 / Q6_K matrix-vector kernel of the CUDA backend (mmvq-inkling.cu) against
++// mul_mat_vec_q at the shapes of Inkling 2 Mini's attention projections, on random weights.
++//
++// Per case: a graph of n_mats products of the same input with distinct copies of one random weight matrix (together
++// larger than the L2 cache, as in decoding), evaluated with the switch off (mul_mat_vec_q) and on. The outputs must be
++// bit-identical to mul_mat_vec_q's; they are also checked against a double-precision product of the dequantized
++// weights (NMSE, catches a product that would be wrong in both). The backend logs "inkling_gemv: <type> <shape>" on
++// the first launch of the kernel (LLAMA_INKLING_GEMV_DEBUG, set here), which shows that the case did run it.
++// The time per product is the graph time (CUDA graphs on, replayed) over n_mats: kernel plus launch gap. For the
++// kernel alone run it under nsys (see docs/inkling-moonshot.md, "Branch gemv").
++//
++//   test-inkling-gemv                  all cases
++//   test-inkling-gemv -t q8_0          the cases whose name contains "q8_0"
++
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static uint32_t g_state = 12345u;
++static float frand() {
++    g_state = g_state*1664525u + 1013904223u;
++    return float(g_state >> 8)/float(1u << 24) - 0.5f;
++}
++
++struct run_result {
++    std::vector<std::vector<float>> out; // per product
++    double us_per_product = 0.0;
++};
++
++// n_mats products y_i = W_i x with every W_i holding the same bytes, evaluated 1 + n_rep times
++static run_result run(ggml_backend_t backend, ggml_type type, int64_t ncols, int64_t nrows, int n_mats,
++        const std::vector<uint8_t> & w, const std::vector<float> & x, int n_rep) {
++    ggml_context * ctx = ggml_init({ggml_tensor_overhead()*(2*n_mats + 4) + ggml_graph_overhead_custom(2*n_mats + 4, false), nullptr, true});
++    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 2*n_mats + 4, false);
++    ggml_tensor * xt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ncols);
++    ggml_set_input(xt);
++    std::vector<ggml_tensor *> ws, ys;
++    for (int i = 0; i < n_mats; ++i) {
++        ggml_tensor * wt = ggml_new_tensor_2d(ctx, type, ncols, nrows);
++        ggml_tensor * yt = ggml_mul_mat(ctx, wt, xt);
++        ggml_set_output(yt);
++        ggml_build_forward_expand(gf, yt);
++        ws.push_back(wt);
++        ys.push_back(yt);
++    }
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    GGML_ASSERT(buf);
++    for (ggml_tensor * wt : ws) {
++        ggml_backend_tensor_set(wt, w.data(), 0, ggml_nbytes(wt));
++    }
++    ggml_backend_tensor_set(xt, x.data(), 0, ggml_nbytes(xt));
++
++    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS); // captured
++    ggml_backend_synchronize(backend);
++    const auto t0 = std::chrono::steady_clock::now();
++    for (int r = 0; r < n_rep; ++r) {
++        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS); // replayed
++    }
++    ggml_backend_synchronize(backend);
++    run_result res;
++    res.us_per_product = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()/n_rep/n_mats;
++    for (ggml_tensor * yt : ys) {
++        std::vector<float> v(nrows);
++        ggml_backend_tensor_get(yt, v.data(), 0, ggml_nbytes(yt));
++        res.out.push_back(std::move(v));
++    }
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++    return res;
++}
++
++static bool test_case(ggml_backend_t backend, ggml_type type, int64_t ncols, int64_t nrows, const char * what) {
++    char name[96];
++    snprintf(name, sizeof(name), "%s %lld x %lld (%s)", ggml_type_name(type), (long long) ncols, (long long) nrows, what);
++
++    // weights in [-0.5, 0.5) with a few rows scaled up, so that the block scales differ a lot between rows
++    std::vector<float> wf(ncols*nrows);
++    for (int64_t r = 0; r < nrows; ++r) {
++        const float s = r % 7 == 3 ? 8.0f : 1.0f;
++        for (int64_t c = 0; c < ncols; ++c) {
++            wf[r*ncols + c] = s*frand();
++        }
++    }
++    std::vector<uint8_t> w(ggml_row_size(type, ncols)*nrows);
++    ggml_quantize_chunk(type, wf.data(), w.data(), 0, nrows, ncols, nullptr);
++    std::vector<float> x(ncols);
++    for (float & v : x) {
++        v = 2.0f*frand();
++    }
++
++    // reference in double precision from the dequantized weights (the GPU paths also quantize x to q8_1)
++    std::vector<float> wd(ncols*nrows);
++    ggml_get_type_traits(type)->to_float(w.data(), wd.data(), ncols*nrows);
++    std::vector<double> ref(nrows);
++    for (int64_t r = 0; r < nrows; ++r) {
++        double s = 0.0;
++        for (int64_t c = 0; c < ncols; ++c) {
++            s += double(wd[r*ncols + c])*double(x[c]);
++        }
++        ref[r] = s;
++    }
++
++    const int64_t bytes  = (int64_t) w.size();
++    const int     n_mats = (int) std::min<int64_t>(256, std::max<int64_t>(8, (160ll << 20)/bytes));
++    const int     n_rep  = 20;
++
++    setenv("LLAMA_INKLING_GEMV", "0", 1);
++    const run_result base = run(backend, type, ncols, nrows, n_mats, w, x, n_rep);
++
++    double nmse_num = 0.0, nmse_den = 0.0;
++    for (int64_t r = 0; r < nrows; ++r) {
++        nmse_num += (base.out[0][r] - ref[r])*(base.out[0][r] - ref[r]);
++        nmse_den += ref[r]*ref[r];
++    }
++    const double nmse = nmse_num/std::max(nmse_den, 1e-30);
++    bool ok = nmse < 5e-4;
++    printf("%-34s mmvq         %7.2f us/product  %6.0f GB/s  (NMSE vs double %.2g%s)\n", name, base.us_per_product,
++            bytes/base.us_per_product*1e-3, nmse, nmse < 5e-4 ? "" : " FAIL");
++
++    setenv("LLAMA_INKLING_GEMV", "1", 1);
++    {
++        const run_result g = run(backend, type, ncols, nrows, n_mats, w, x, n_rep);
++        int64_t n_diff = 0;
++        double  max_abs = 0.0;
++        for (int i = 0; i < n_mats; ++i) {
++            for (int64_t r = 0; r < nrows; ++r) {
++                const float a = base.out[i][r], b = g.out[i][r];
++                if (!(a == b) || std::signbit(a) != std::signbit(b)) {
++                    n_diff++;
++                    max_abs = std::max(max_abs, fabs(double(a) - double(b)));
++                }
++            }
++        }
++        ok = ok && n_diff == 0;
++        printf("%-34s gemv         %7.2f us/product  %6.0f GB/s  %s", name, g.us_per_product,
++                bytes/g.us_per_product*1e-3, n_diff == 0 ? "bit-identical" : "DIFFERENT");
++        if (n_diff != 0) {
++            printf(" (%lld of %lld outputs, max abs %.3g) FAIL", (long long) n_diff, (long long) (n_mats*nrows), max_abs);
++        }
++        printf("\n");
++    }
++    setenv("LLAMA_INKLING_GEMV", "0", 1);
++    return ok;
++}
++
++int main(int argc, char ** argv) {
++    std::string filter;
++    for (int a = 1; a + 1 < argc; a += 2) {
++        if (std::string(argv[a]) == "-t") {
++            filter = argv[a + 1];
++        }
++    }
++    setenv("LLAMA_INKLING_GEMV_DEBUG", "1", 0); // the backend logs the first launch of each kernel configuration
++    ggml_backend_load_all();
++
++    struct shape { ggml_type type; int64_t ncols, nrows; const char * what; };
++    const shape shapes[] = {
++        { GGML_TYPE_Q8_0, 2304, 3072, "Q, gate"  },
++        { GGML_TYPE_Q8_0, 2304, 1024, "K, V"     },
++        { GGML_TYPE_Q8_0, 2304,  384, "R"        },
++        { GGML_TYPE_Q8_0, 3072, 2304, "output"   },
++        { GGML_TYPE_Q6_K, 2304, 3072, "Q, gate"  },
++        { GGML_TYPE_Q6_K, 2304, 1024, "K, V"     },
++        { GGML_TYPE_Q6_K, 2304,  384, "R"        },
++        { GGML_TYPE_Q6_K, 3072, 2304, "output"   },
++    };
++
++    int n_fail = 0, n_run = 0;
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU || std::string(ggml_backend_dev_name(dev)).find("CUDA") != 0) {
++            continue;
++        }
++        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
++        GGML_ASSERT(backend);
++        printf("== %s\n", ggml_backend_name(backend));
++        for (const shape & s : shapes) {
++            char name[96];
++            snprintf(name, sizeof(name), "%s %lld x %lld (%s)", ggml_type_name(s.type), (long long) s.ncols, (long long) s.nrows, s.what);
++            if (!filter.empty() && std::string(name).find(filter) == std::string::npos) {
++                continue;
++            }
++            const bool ok = test_case(backend, s.type, s.ncols, s.nrows, s.what);
++            n_fail += !ok;
++            n_run++;
++        }
++        ggml_backend_free(backend);
++    }
++    printf("%d/%d cases passed\n", n_run - n_fail, n_run);
++    return n_fail == 0 ? 0 : 1;
++}
 diff --git a/tests/test-inkling-megakernel.cpp b/tests/test-inkling-megakernel.cpp
 new file mode 100644
-index 000000000..49a3d0482
+index 000000000..b812adda1
 --- /dev/null
 +++ b/tests/test-inkling-megakernel.cpp
-@@ -0,0 +1,997 @@
+@@ -0,0 +1,1135 @@
 +// The Inkling 2 decode megakernel stages against the reference CUDA path, on random weights in the quant types of
 +// UD-Q3_K_XL, at the real shapes of one layer application. Each stage is toggled through its environment switch
 +// between two evaluations of the same graph; the outputs must be bit-identical; the time per evaluation is printed
@@ -4890,6 +6864,137 @@ index 000000000..49a3d0482
 +    return ok;
 +}
 +
++// The relative-position bias table of one token (LLAMA_INKLING_MK_RELTAB=1): R [16 x 24] clipped per head (the model's
++// clip()), optionally scaled by tau, then PAD(table [16 x 1024], one zero row) x Rcur -> [1025 x 24]; the unfused graph
++// runs PAD, the CLIP fusion (or its 9 ops) and cublasSgemm; the fused kernel must give the same bits.
++static bool test_reltab(ggml_backend_t backend, const char * name, bool with_tau, int64_t n_ext) {
++    const int64_t n_rel = 16, n_head = 24;
++    std::vector<float> r(n_rel*n_head), wclip(n_rel*n_head), table(n_rel*n_ext);
++    for (float & v : r) {
++        v = 2.0f*frand();
++    }
++    for (float & v : wclip) {
++        v = 1.0f + 0.3f*frand();
++    }
++    for (float & v : table) {
++        v = 4.0f*frand();
++    }
++    const float tau_v = 1.7f;
++    return compare_stage("reltab", name, backend, { "table" }, [&](ggml_context * ctx, ggml_cgraph * gf, std::vector<ggml_tensor *> & outputs, std::vector<std::pair<ggml_tensor *, const void *>> & data) {
++        ggml_tensor * tr   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel*n_head, 1);
++        ggml_tensor * tw   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, n_head);
++        ggml_tensor * ttab = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, n_ext);
++        ggml_set_input(tr);
++        data.emplace_back(tr, r.data());
++        data.emplace_back(tw, wclip.data());
++        data.emplace_back(ttab, table.data());
++        // inkling2.cpp clip()
++        ggml_tensor * cur  = ggml_mul(ctx, ggml_reshape_3d(ctx, tr, n_rel, n_head, 1), tw);
++        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
++        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
++        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, 10.0f), norm);
++        ggml_tensor * rcur = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
++        if (with_tau) {
++            ggml_tensor * tau = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, 1);
++            data.emplace_back(tau, &tau_v);
++            rcur = ggml_mul(ctx, rcur, tau);
++        }
++        ggml_tensor * out = ggml_mul_mat(ctx, ggml_pad(ctx, ttab, 0, 1, 0, 0), rcur);
++        ggml_set_output(out);
++        ggml_build_forward_expand(gf, out);
++        outputs.push_back(out);
++    }, { { "LLAMA_INKLING_MK_RELTAB", "1" } }, UNFUSED);
++}
++
++// The MoE epilogue of one token (LLAMA_INKLING_MK_MOESCALE=1): the down products of the 8 used experts [2304, 8],
++// per-expert scales gathered from the table [1, 128] by the routed ids (REPEAT + GET_ROWS), times the router weights,
++// summed over the experts (the model's build_moe_ffn tail); the fused reduction gathers the scales itself.
++static bool test_moescale(ggml_backend_t backend, const char * name) {
++    const int64_t n_embd = 2304, n_used = 8, n_expert = 128;
++    std::vector<float> down(n_embd*n_used), table(n_expert), weights(n_used);
++    for (float & v : down) {
++        v = 2.0f*frand();
++    }
++    for (float & v : table) {
++        v = 0.5f + frand();
++    }
++    for (float & v : weights) {
++        v = 0.25f + 0.1f*frand();
++    }
++    int32_t ids[8];
++    for (int i = 0; i < n_used; ++i) {
++        ids[i] = (37*i + 5) % n_expert;
++    }
++    return compare_stage("moesc", name, backend, { "ffn_out" }, [&](ggml_context * ctx, ggml_cgraph * gf, std::vector<ggml_tensor *> & outputs, std::vector<std::pair<ggml_tensor *, const void *>> & data) {
++        ggml_tensor * tdown = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, 1);
++        ggml_tensor * ttab  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
++        ggml_tensor * tw    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, 1);
++        ggml_tensor * tids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
++        ggml_set_input(tdown);
++        ggml_set_input(tids);
++        data.emplace_back(tdown, down.data());
++        data.emplace_back(ttab, table.data());
++        data.emplace_back(tw, weights.data());
++        data.emplace_back(tids, ids);
++        // llama-graph.cpp build_moe_ffn: the scale gather, the two MULs and the sum of the expert slices
++        ggml_tensor * scale = ggml_get_rows(ctx, ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, ttab, 1, n_expert, 1), 1, n_expert, 1, 1), tids);
++        ggml_tensor * experts = ggml_mul(ctx, ggml_mul(ctx, tdown, scale), tw);
++        ggml_tensor * out = nullptr;
++        for (int e = 0; e < n_used; ++e) {
++            ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, 1, experts->nb[2], e*experts->nb[1]);
++            out = out ? ggml_add(ctx, out, v) : v;
++        }
++        ggml_set_output(out);
++        ggml_build_forward_expand(gf, out);
++        outputs.push_back(out);
++    }, { { "LLAMA_INKLING_MK_MOESCALE", "1" } }, UNFUSED);
++}
++
++// The SITU of the expert gate/up products for one token, gu [2304 = 2 x 1152, 8 slots]: with the per-expert scale gathered
++// by the routed ids (REPEAT + GET_ROWS + MUL, the chain of the IQ/Q*_K layers) or without it (the NVFP4 layers, whose
++// product kernel applies the scale: the chain starts at the gate view). The fusion is always on; compared against the
++// truly unfused ops.
++static bool test_situ(ggml_backend_t backend, const char * name, bool with_scale) {
++    const int64_t n_ff = 1152, n_used = 8, n_expert = 128;
++    std::vector<float> gu(2*n_ff*n_used), table(n_expert);
++    for (float & v : gu) {
++        v = 3.0f*frand();
++    }
++    for (float & v : table) {
++        v = 0.5f + frand();
++    }
++    int32_t ids[8];
++    for (int i = 0; i < n_used; ++i) {
++        ids[i] = (37*i + 5) % n_expert;
++    }
++    // inkling2_loop.activation: situ_beta 4, situ_linear_beta 25 (the SCALE pairs of the model's SITU)
++    return compare_stage("situ", name, backend, { "situ" }, [&](ggml_context * ctx, ggml_cgraph * gf, std::vector<ggml_tensor *> & outputs, std::vector<std::pair<ggml_tensor *, const void *>> & data) {
++        ggml_tensor * tgu  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_used, 1);
++        ggml_set_input(tgu);
++        data.emplace_back(tgu, gu.data());
++        ggml_tensor * cur = tgu;
++        if (with_scale) {
++            ggml_tensor * ttab = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
++            ggml_tensor * tids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
++            ggml_set_input(tids);
++            data.emplace_back(ttab, table.data());
++            data.emplace_back(tids, ids);
++            ggml_tensor * scale = ggml_get_rows(ctx, ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, ttab, 1, n_expert, 1), 1, n_expert, 1, 1), tids);
++            cur = ggml_mul(ctx, cur, scale);
++        }
++        ggml_tensor * gate = ggml_view_3d(ctx, cur, n_ff, n_used, 1, cur->nb[1], cur->nb[2], 0);
++        ggml_tensor * up   = ggml_view_3d(ctx, cur, n_ff, n_used, 1, cur->nb[1], cur->nb[2], n_ff*sizeof(float));
++        // llama-graph.cpp LLM_FFN_SITU: act = (b0*tanh(a0*g + a1) + b1) * sigmoid(g), lin = d0*tanh(c0*u + c1) + d1
++        ggml_tensor * act = ggml_scale_bias(ctx, ggml_tanh(ctx, ggml_scale_bias(ctx, gate, 4.0f, 0.0f)), 1.0f, 0.0f);
++        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gate));
++        ggml_tensor * lin = ggml_scale_bias(ctx, ggml_tanh(ctx, ggml_scale_bias(ctx, up, 1.0f/25.0f, 0.0f)), 25.0f, 0.0f);
++        ggml_tensor * out = ggml_mul(ctx, act, lin);
++        ggml_set_output(out);
++        ggml_build_forward_expand(gf, out);
++        outputs.push_back(out);
++    }, {}, UNFUSED);
++}
++
 +int main(int argc, char ** argv) {
 +    for (int a = 1; a + 1 < argc; a += 2) {
 +        if (std::string(argv[a]) == "-t") {
@@ -4973,6 +7078,13 @@ index 000000000..49a3d0482
 +        check(test_steps(backend, "loop layer, 3 inputs, q8_0", 3, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 6));
 +        check(test_steps(backend, "tail layer, q6_K/q5_K, 3 inputs", 3, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, 6));
 +
++        // the relative-position bias table: SWA layer (1024 + 1 bins), full-attention layer (tau), both vs the unfused
++        // PAD + clip ops + cuBLAS; also the fused kernel against the backend's own fusions (CLIP) + cuBLAS
++        check(test_situ(backend, "situ with the scale gather", true));
++        check(test_situ(backend, "situ without scale (nvfp4)",  false));
++        check(test_moescale(backend, "moe epilogue, scale gather"));
++        check(test_reltab(backend, "reltab swa 1025 bins",            false, 1024));
++        check(test_reltab(backend, "reltab full layer with tau",      true,  1024));
 +        check(test_wo(backend, "wo q8_0 with sigmoid gate", GGML_TYPE_Q8_0));
 +        check(test_wo(backend, "wo q6_K with sigmoid gate", GGML_TYPE_Q6_K));
 +

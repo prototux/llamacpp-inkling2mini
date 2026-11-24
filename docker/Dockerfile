@@ -43,7 +43,7 @@ FROM docker.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS buil
 ARG CUDA_ARCH=86
 # nvcc needs ~1-2 GB of RAM per job for the flash-attention kernels
 ARG BUILD_JOBS=4
-ARG TARGETS="llama-server llama-perplexity llama-inkling-pass-kv test-flash-attn-indexed-bias test-backend-ops test-sched-streams test-llama-archs test-inkling-megakernel"
+ARG TARGETS="llama-server llama-perplexity llama-inkling-pass-kv test-flash-attn-indexed-bias test-backend-ops test-sched-streams test-llama-archs test-inkling-megakernel test-inkling-gemv"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-14 g++-14 build-essential cmake git libssl-dev libgomp1 \
     && rm -rf /var/lib/apt/lists/*

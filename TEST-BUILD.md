@@ -25,6 +25,13 @@ compares every fused stage with the unfused computation bit for bit inside the r
 the repetition loop, or clears them all), `MK_PROFILE` times each decode step per kernel class (explains why glue gave
 no speedup). New stages: `MK_GLUE=2` (controllers as one cooperative kernel) and the depth mix folded into the glue.
 
+Rev 9 (measured on the 3090, CUDA graphs on, `scripts/mk-bench.sh`): the repetition loop was `LLAMA_INKLING_SHARE_LOOP_KV`,
+not a megakernel stage. The glue is now bit-exact (MK_CHECK: 0 mismatching outputs), and new bit-exact stages
+`MK_RELTAB`, `MK_MOESCALE`, `GEMV` (a faster Q8_0/Q6_K one-token kernel) and a faster `MK_PROJ` bring decode to
+~103 tok/s short / ~80 at 54K, from ~90 / ~73 with everything off. Recommended: `LLAMA_INKLING_MK_GLUE=1
+LLAMA_INKLING_MK_RELTAB=1 LLAMA_INKLING_MK_MOESCALE=1 LLAMA_INKLING_GEMV=1 LLAMA_INKLING_MK_PROJ=1 LLAMA_INKLING_NO_MASK=1`.
+`MK_WO`, `MK_MOE`, `MK_GLUE=2` and `GGML_CUDA_GRAPH_OPT=2` measured neutral or slower; see `.env.example`.
+
 ## Install from ghcr.io (any machine)
 
 ```bash

@@ -184,6 +184,10 @@ The build clones upstream llama.cpp at the commit pinned in the Dockerfile (`LLA
 - **Loop KV sharing (`LLAMA_INKLING_SHARE_LOOP_KV=1`) makes long answers degrade into repetition**: short tests
   look fine, but a 3000-token greedy Terraform answer diverges from the default after ~60 characters and ends in
   a loop (`scripts/bisect-loop.sh`). Leave it off.
+- **With thinking off the model sometimes declines to write a long file in full** ("I can't produce a fully runnable
+  configuration...") and gives a skeleton, most often at temperature 0. This is the model, not this build: every
+  configuration does it, all optimizations off included. `"reasoning_effort": "low"` (a few hundred thinking
+  tokens) gave complete Terraform files in all runs; `REASONING_EFFORT=low` makes it the default.
 - Tool calls with thinking off can fail with "unexpected empty grammar stack" in some setups
   ([#32818](https://github.com/ggml-org/llama.cpp/issues/32818)); `"reasoning_effort": "minimal"` avoids it.
 - `--reasoning-budget` re-arms on every thinking block ([#32836](https://github.com/ggml-org/llama.cpp/issues/32836));

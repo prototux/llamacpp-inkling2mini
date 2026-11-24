@@ -1,11 +1,11 @@
 # Patches
 
 Applied in file-name order with `git apply` on upstream llama.cpp at the commit pinned in
-[../docker/Dockerfile](../docker/Dockerfile) (`LLAMA_CPP_COMMIT`, ggml-org/llama.cpp master of 2026-11-22).
+[../docker/Dockerfile](../docker/Dockerfile) (`LLAMA_CPP_COMMIT`, ggml-org/llama.cpp master of 2026-11-23).
 
 | Patch | Origin | Content |
 |---|---|---|
-| `0001-cuda-indexed-bias-flash-attention.patch` | pwilkin, branch [`codex/inkling2-flash-attention-cuda`](https://github.com/pwilkin/llama.cpp/tree/codex/inkling2-flash-attention-cuda) at `b9ea31a8d2`; the ggml part is upstream PR [#32740](https://github.com/ggml-org/llama.cpp/pull/32740) | indexed relative-position bias in `GGML_OP_FLASH_ATTN_EXT`, CPU reference, CUDA vec/tile kernels, Inkling 2 graph |
+| `0001-cuda-indexed-bias-flash-attention.patch` | pwilkin, branch [`codex/inkling2-flash-attention-cuda`](https://github.com/pwilkin/llama.cpp/tree/codex/inkling2-flash-attention-cuda) at `b9ea31a8d2`; its ggml API and CPU reference were merged upstream as [#32740](https://github.com/ggml-org/llama.cpp/pull/32740), so the patch now carries the CUDA/HIP kernels, the Inkling 2 graph and the bias added before the mask's F16 rounding (upstream: in F32), as the CUDA tiles do | indexed relative-position bias in `GGML_OP_FLASH_ATTN_EXT`, CPU reference, CUDA vec/tile kernels, Inkling 2 graph |
 | `0002-inkling2-dspark-speculative-decoding.patch` | upstream PR [#32218](https://github.com/ggml-org/llama.cpp/pull/32218) at `e4b1cb5318` | DSpark draft model, converter and speculative decoding |
 | `0003-inkling2-fused-cuda-glue-kernels.patch` | realugbun, branch [`inkling2-speed`](https://github.com/realugbun/llama.cpp/tree/inkling2-speed), commits `7ec7714fa` `26739461d` `520a486b0` `0f6ac0c9c` | fused CUDA kernels for the Inkling 2 glue op chains; one conflict with 0001 resolved by keeping the indexed-bias graph |
 | `0004-inkling2-attention-prefill-position-bias-q8-kv.patch` | this repository | tensor-core prefill with the bias, position-mode bias, q8_0 K/V read in place, tests |

@@ -1,5 +1,5 @@
 diff --git a/common/parsers/inkling.cpp b/common/parsers/inkling.cpp
-index 9c30cdb87..a8f9fd3e0 100644
+index 082bd86fd..e2e78dafd 100644
 --- a/common/parsers/inkling.cpp
 +++ b/common/parsers/inkling.cpp
 @@ -98,6 +98,16 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template &
@@ -18,12 +18,12 @@ index 9c30cdb87..a8f9fd3e0 100644
 +    }
      auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
  
-     data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+     data.parser = build_chat_peg_parser(inputs.specials, [&](common_chat_peg_builder & p) {
 diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
-index 11fa68f6a..f4e314560 100644
+index 20a3cc6a0..0ef082f10 100644
 --- a/tests/test-chat.cpp
 +++ b/tests/test-chat.cpp
-@@ -5665,6 +5665,21 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+@@ -5666,6 +5666,21 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
              .expect(message_assist)
              .run();
  

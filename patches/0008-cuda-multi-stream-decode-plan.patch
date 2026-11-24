@@ -384,7 +384,7 @@ index 5ad8d9b3c..37c4ab357 100644
          // Calculate KQ tile and keep track of new maximum KQ values:
          float KQ_reg[ncols]; // KQ in registers.
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1ad59ebb1..bd028e93f 100644
+index 75ff9afc8..5c28c7b9b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -79,6 +79,8 @@
@@ -426,7 +426,7 @@ index 1ad59ebb1..bd028e93f 100644
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
      const ggml_tensor * ids  = dst->src[2];
-@@ -4466,7 +4476,500 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4507,7 +4517,500 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -927,7 +927,7 @@ index 1ad59ebb1..bd028e93f 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      if (ggml_cuda_fusion_disabled()) {
-@@ -4475,7 +4978,118 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4516,7 +5019,118 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -1046,7 +1046,7 @@ index 1ad59ebb1..bd028e93f 100644
          ggml_cuda_inkling2_args inkling2;
          if (ggml_cuda_inkling2_match(cgraph, i, inkling2)) {
              ggml_cuda_inkling2_fused(*cuda_ctx, inkling2);
-@@ -5322,6 +5936,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5363,6 +5977,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -1058,7 +1058,7 @@ index 1ad59ebb1..bd028e93f 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -5330,6 +5949,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5371,6 +5990,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      ggml_cuda_concurrent_event * concurrent_event           = nullptr;
      bool                         should_launch_concurrent_events = false;
  
@@ -1117,7 +1117,7 @@ index 1ad59ebb1..bd028e93f 100644
  #ifdef USE_CUDA_GRAPH
      ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
      const int         chunk_size = ggml_cuda_graph_chunk_size();
-@@ -5429,7 +6100,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5470,7 +6141,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  #ifdef USE_CUDA_GRAPH
                  // fused nodes are skipped together, so a cut never splits a fusion
                  // a concurrent region must join before its capture can end
@@ -1126,7 +1126,7 @@ index 1ad59ebb1..bd028e93f 100644
                      ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                      CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
                      chunk_end = i + chunk_size;
-@@ -5471,12 +6142,40 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5512,12 +6183,40 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -1167,7 +1167,7 @@ index 1ad59ebb1..bd028e93f 100644
                  if (nodes_to_skip != 0) {
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
-@@ -5484,6 +6183,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5525,6 +6224,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                              nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                              ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
  #endif
@@ -1177,7 +1177,7 @@ index 1ad59ebb1..bd028e93f 100644
                      i += nodes_to_skip;
                      continue;
                  }
-@@ -5509,6 +6211,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5550,6 +6252,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
@@ -1191,7 +1191,7 @@ index 1ad59ebb1..bd028e93f 100644
  
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
-@@ -5534,6 +6243,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5575,6 +6284,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          } else {
              graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
          }
@@ -1202,7 +1202,7 @@ index 1ad59ebb1..bd028e93f 100644
      }
  
      if (use_cuda_graph && !cuda_graph_update_required) {
-@@ -5655,6 +6368,253 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -5696,6 +6409,253 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
      }
  }
  
@@ -1456,7 +1456,7 @@ index 1ad59ebb1..bd028e93f 100644
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
-@@ -5817,12 +6777,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5858,12 +6818,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      GGML_UNUSED(cgraph);
  #endif
  
@@ -1471,7 +1471,7 @@ index 1ad59ebb1..bd028e93f 100644
          return;
      }
  
-@@ -5833,6 +6789,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5874,6 +6830,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          return;
      }
  
@@ -3535,7 +3535,7 @@ index 5605bf7a4..f160d3321 100644
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index dd774ce58..310f184e5 100644
+index c27a91b6e..d94b52193 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -145,6 +145,23 @@ static void llama_graph_log_stats(ggml_cgraph * gf, uint32_t n_tokens) {
@@ -3646,10 +3646,10 @@ index d503e8310..4a1d1302a 100644
          cb(cur, "attn_out", il);
      }
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index f9dff8bf8..97e9c955a 100644
+index e6186af10..b120b49b3 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -368,6 +368,8 @@ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
+@@ -369,6 +369,8 @@ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
  
  llama_build_and_test(test-backend-tensor.cpp LINK ggml)
  llama_build_and_test(test-flash-attn-indexed-bias.cpp LINK ggml)
@@ -3659,10 +3659,18 @@ index f9dff8bf8..97e9c955a 100644
  llama_build_and_test(test-backend-sched.cpp LINK ggml)
  
 diff --git a/tests/test-flash-attn-indexed-bias.cpp b/tests/test-flash-attn-indexed-bias.cpp
-index 6b8fb1b3a..a41a9460e 100644
+index 6b8fb1b3a..64c6091b0 100644
 --- a/tests/test-flash-attn-indexed-bias.cpp
 +++ b/tests/test-flash-attn-indexed-bias.cpp
-@@ -165,6 +165,160 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows,
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <vector>
+ 
+ static void set_kv(ggml_tensor * t, const std::vector<float> & data) {
+@@ -165,6 +166,166 @@ static void test_indexed_bias(ggml_backend_t backend, int width, bool use_rows,
      ggml_free(ctx);
  }
  
@@ -3693,7 +3701,13 @@ index 6b8fb1b3a..a41a9460e 100644
 +    ggml_flash_attn_ext_add_position_bias(out, table, k_pos, q_pos);
 +    ggml_prec_set_acc(out, GGML_PREC_F32);
 +    if (!ggml_backend_supports_op(backend, out)) {
-+        printf("%s: kv=%s, queries=%d, cells=%d, window=%d: op not supported, skipped\n", ggml_backend_name(backend), ggml_type_name(kv_type), n_query, cells, window);
++        // Inkling 2 runs these shapes on the GPU: a GPU backend that rejects one would silently move attention off it
++        const bool gpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU;
++        printf("%s: kv=%s, queries=%d, cells=%d, window=%d: op not supported%s\n", ggml_backend_name(backend), ggml_type_name(kv_type), n_query, cells, window,
++               gpu ? ", FAIL" : ", skipped");
++        if (gpu) {
++            exit(1);
++        }
 +        ggml_free(ctx);
 +        return;
 +    }
@@ -3823,7 +3837,7 @@ index 6b8fb1b3a..a41a9460e 100644
  int main() {
      ggml_backend_load_all();
      for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-@@ -195,6 +349,15 @@ int main() {
+@@ -195,6 +356,15 @@ int main() {
                  test_indexed_bias(backend, width, false, n_query, 1024, GGML_TYPE_Q4_0, true);
              }
          }

@@ -15,7 +15,7 @@ ARG NODE_VERSION=24
 FROM docker.io/library/alpine:3 AS source
 ARG LLAMA_CPP_REPO=https://github.com/ggml-org/llama.cpp.git
 # ggml-org/llama.cpp master of 2026-11-22; bump it together with the patches
-ARG LLAMA_CPP_COMMIT=94f3af3d09e74a0fb35f703194318d3b4037714a
+ARG LLAMA_CPP_COMMIT=c74c71a6f7a0b06df30f979520e5d9a86a4d60ad
 RUN apk add --no-cache git
 WORKDIR /src
 COPY patches/ /patches/

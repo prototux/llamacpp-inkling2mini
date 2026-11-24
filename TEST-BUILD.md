@@ -37,7 +37,7 @@ LLAMA_INKLING_MK_RELTAB=1 LLAMA_INKLING_MK_MOESCALE=1 LLAMA_INKLING_GEMV=1 LLAMA
 ```bash
 git clone -b megakernel https://github.com/prototux/llamacpp-inkling2mini && cd llamacpp-inkling2mini
 ln -s /path/to/your/models models
-docker compose pull                     # ghcr.io/prototux/llamacpp-inkling2mini:megakernel, built by CI
+docker compose pull --policy always     # ghcr.io/prototux/llamacpp-inkling2mini:megakernel, built by CI (pull_policy: missing skips a plain pull)
 SKIP_BUILD=1 scripts/test-megakernel.sh # tests the pulled image; or `docker compose up -d` to just run it
 ```
 

@@ -9,7 +9,7 @@ name: inkling
 
 services:
   inkling:
-    # megakernel test build: prebuilt on ghcr.io by CI from this branch (docker compose pull),
+    # megakernel test build: prebuilt on ghcr.io by CI from this branch (docker compose pull --policy always),
     # or built locally from docker/Dockerfile + patches/ (docker compose build)
     image: ${IMAGE:-ghcr.io/prototux/llamacpp-inkling2mini:megakernel}
     build:

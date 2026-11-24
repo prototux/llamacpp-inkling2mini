@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index dc981f03f..d21c01587 100644
+index 5b050aa45..2cc88c181 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -2301,6 +2301,20 @@ extern "C" {
@@ -24,7 +24,7 @@ index dc981f03f..d21c01587 100644
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
              struct ggml_context * ctx,
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index a46c96ece..562372463 100644
+index 7a92f43a0..b04169dfd 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -8967,6 +8967,45 @@ void ggml_compute_forward_top_k(
@@ -950,10 +950,10 @@ index 11b8a3e89..407f9c586 100644
          case BEST_FATTN_KERNEL_VEC: {
              const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 652a7c7d6..4a2b2ce82 100644
+index c616fa39b..325a0f94c 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5558,6 +5558,7 @@ void ggml_flash_attn_ext_add_indexed_bias(
+@@ -5557,6 +5557,7 @@ void ggml_flash_attn_ext_add_indexed_bias(
      GGML_ASSERT((table == NULL) == (indices == NULL));
      a->src[6] = table;
      a->src[7] = indices;
@@ -961,7 +961,7 @@ index 652a7c7d6..4a2b2ce82 100644
      ggml_set_op_params_i32(a, 5, table != NULL);
      if (!table) {
          return;
-@@ -5573,6 +5574,38 @@ void ggml_flash_attn_ext_add_indexed_bias(
+@@ -5572,6 +5573,38 @@ void ggml_flash_attn_ext_add_indexed_bias(
      GGML_ASSERT(indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2]);
  }
  
@@ -1001,7 +1001,7 @@ index 652a7c7d6..4a2b2ce82 100644
  
  struct ggml_tensor * ggml_flash_attn_back(
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 6738482c8..f9644d2d3 100644
+index db931004b..7a2170528 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -28,6 +28,15 @@
@@ -1020,7 +1020,7 @@ index 6738482c8..f9644d2d3 100644
  // dedup helpers
  
  static ggml_tensor * build_attn_inp_kq_mask(
-@@ -1432,6 +1441,20 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
+@@ -1464,6 +1473,20 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
          attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, inp_attn->self_attn_mask_swa.rows, ubatch, extent_swa);
      }
  
@@ -1041,7 +1041,7 @@ index 6738482c8..f9644d2d3 100644
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
      if (inp_rs->s_copy) {
-@@ -1472,6 +1495,12 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+@@ -1506,6 +1529,12 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
  
      res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
  
@@ -1054,7 +1054,7 @@ index 6738482c8..f9644d2d3 100644
      res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
  
      res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-@@ -3112,7 +3141,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3146,7 +3175,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 float   kq_scale,
                   int   il,
           ggml_tensor * bias_table,
@@ -1065,7 +1065,7 @@ index 6738482c8..f9644d2d3 100644
      const bool v_trans = v->nb[1] > v->nb[2];
  
      // split the batch into streams if needed
-@@ -3176,9 +3207,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3210,9 +3241,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
          ggml_prec_set_acc(cur, GGML_PREC_F32);
          if (bias_table) {
@@ -1086,7 +1086,7 @@ index 6738482c8..f9644d2d3 100644
                  ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
                  cur->src[3] = dense_bias_mask();
              } else if (kv_rows) {
-@@ -3726,7 +3766,9 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3760,7 +3800,9 @@ static ggml_tensor * build_attn_iswa_impl(
              float     kq_scale,
              int       il,
          ggml_tensor * bias_table = nullptr,
@@ -1097,7 +1097,7 @@ index 6738482c8..f9644d2d3 100644
      ggml_context * ctx0 = gctx.ctx0;
      ggml_cgraph  * gf   = gctx.gf;
  
-@@ -3792,7 +3834,7 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3826,7 +3868,7 @@ static ggml_tensor * build_attn_iswa_impl(
      ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
  
@@ -1106,7 +1106,7 @@ index 6738482c8..f9644d2d3 100644
      cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
      gctx.cb(cur, "kqv_out", il);
  
-@@ -4416,6 +4458,24 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -4477,6 +4519,24 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
      ggml_set_input(inp->self_rel_pos_swa);
      ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
  
@@ -1131,7 +1131,7 @@ index 6738482c8..f9644d2d3 100644
      return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
  }
  
-@@ -4438,9 +4498,10 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -4499,9 +4559,10 @@ ggml_tensor * llm_graph_context::build_attn(
      const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
  
      ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
@@ -1144,10 +1144,10 @@ index 6738482c8..f9644d2d3 100644
  
  void llm_graph_context::build_dense_out(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 1acf4461e..5250ca285 100644
+index 22860eb7f..f5b9b5ff7 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -806,6 +806,12 @@ public:
+@@ -819,6 +819,12 @@ public:
      ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
      ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
  
@@ -1160,7 +1160,7 @@ index 1acf4461e..5250ca285 100644
      const uint32_t extent;
      const uint32_t extent_swa;
  
-@@ -1337,7 +1343,9 @@ struct llm_graph_context {
+@@ -1350,7 +1356,9 @@ struct llm_graph_context {
                    float   kq_scale,
                      int   il,
              ggml_tensor * bias_table = nullptr,
@@ -1172,7 +1172,7 @@ index 1acf4461e..5250ca285 100644
      llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 06b4a8a48..350bd518e 100644
+index 9c8f4f5ba..dcfc3fe50 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -2025,6 +2025,24 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const ggml_tensor

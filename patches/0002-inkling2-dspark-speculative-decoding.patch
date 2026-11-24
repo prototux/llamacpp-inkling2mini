@@ -575,7 +575,7 @@ index 08c8d2f33..900aef614 100644
          self.add_array(Keys.LLM.TARGET_LAYERS.format(arch=self.arch), value)
  
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index cdb1f3794..b8eb39fb2 100644
+index 9019fb26d..074bcc4a3 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -913,6 +913,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
@@ -621,7 +621,7 @@ index cdb1f3794..b8eb39fb2 100644
      {LLM_TENSOR_LILICORR_PASS_HIDDEN_PROJ,  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
      {LLM_TENSOR_LILICORR_SLOT_EMBD,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index 6517a3ea7..54c2c8f82 100644
+index 45ef8bc09..a0ee9e49d 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
 @@ -918,6 +918,8 @@ enum llm_tensor {
@@ -673,7 +673,7 @@ index 642f90118..b6a373bfe 100644
      uint32_t lilicorr_candidate_topk = 0;
      uint32_t lilicorr_num_heads      = 0;
 diff --git a/src/llama-model.h b/src/llama-model.h
-index eae5c6848..c4ac3331c 100644
+index d7285d226..e0273d7d1 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -424,6 +424,13 @@ struct llama_layer {
@@ -690,7 +690,7 @@ index eae5c6848..c4ac3331c 100644
      struct ggml_tensor * lilicorr_attn_norm       = nullptr;
      struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
      struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
-@@ -939,6 +946,9 @@ struct llama_model {
+@@ -950,6 +957,9 @@ struct llama_model {
      struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
      struct ggml_tensor * dspark_joint_proj_b = nullptr;
      struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
@@ -1224,10 +1224,10 @@ index a52c3b237..60c74361e 100644
      }
  
 diff --git a/src/models/models.h b/src/models/models.h
-index a728398dd..3cd042b24 100644
+index 07d226e1b..737404b3b 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -1643,7 +1643,10 @@ struct llama_model_dflash : public llama_model_base {
+@@ -1668,7 +1668,10 @@ struct llama_model_dflash : public llama_model_base {
          graph_base(const llm_graph_params & params);
  
          ggml_tensor * build_inject();

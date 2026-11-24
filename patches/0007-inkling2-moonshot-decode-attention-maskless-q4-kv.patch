@@ -102,7 +102,7 @@ index 000000000..23b8fdd52
 +6. Configuration experiments without code: `-ub 2048 -b 2048` for prefill (4x more rows per expert GEMM), and
 +   `--backend-sampling` for decode (no 800 KB logits copy per token).
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index d21c01587..bc2d46950 100644
+index 2cc88c181..84c1a5d13 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -2315,6 +2315,15 @@ extern "C" {
@@ -122,7 +122,7 @@ index d21c01587..bc2d46950 100644
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
              struct ggml_context * ctx,
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 562372463..0ff8ae699 100644
+index b04169dfd..186bd6e2a 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -8975,6 +8975,9 @@ struct ggml_fa_bias_row {
@@ -910,10 +910,10 @@ index 4fc250ce4..63eea044e 100644
              break;
          case BEST_FATTN_KERNEL_VEC: {
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 4a2b2ce82..7201e6522 100644
+index 325a0f94c..5b3baef8b 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5579,6 +5579,22 @@ bool ggml_flash_attn_ext_has_position_bias(const struct ggml_tensor * a) {
+@@ -5578,6 +5578,22 @@ bool ggml_flash_attn_ext_has_position_bias(const struct ggml_tensor * a) {
      return ggml_get_op_params_i32(a, 5) == 2;
  }
  
@@ -936,7 +936,7 @@ index 4a2b2ce82..7201e6522 100644
  void ggml_flash_attn_ext_add_position_bias(
          struct ggml_tensor * a,
          struct ggml_tensor * table,
-@@ -5591,12 +5607,15 @@ void ggml_flash_attn_ext_add_position_bias(
+@@ -5590,12 +5606,15 @@ void ggml_flash_attn_ext_add_position_bias(
  
      const struct ggml_tensor * q = a->src[0];
      const struct ggml_tensor * mask = a->src[3];
@@ -956,7 +956,7 @@ index 4a2b2ce82..7201e6522 100644
      GGML_ASSERT(q_pos->ne[0] == table->ne[2]);
  
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 07a0dbafc..dd774ce58 100644
+index 4caca65f3..c27a91b6e 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -19,6 +19,7 @@
@@ -1010,7 +1010,7 @@ index 07a0dbafc..dd774ce58 100644
  static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
      switch (ctx_type) {
          case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
-@@ -1859,6 +1896,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1868,6 +1905,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          }
  
          gf_res_prev_active = res;
@@ -1020,7 +1020,7 @@ index 07a0dbafc..dd774ce58 100644
  
      // set the input data for the input tensors
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index ed982dde4..8f2fecab4 100644
+index 980bb05cc..45b23344e 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -37,6 +37,37 @@ static bool llama_inkling_position_bias_enabled() {
@@ -1061,7 +1061,7 @@ index ed982dde4..8f2fecab4 100644
  // dedup helpers
  
  static ggml_tensor * build_attn_inp_kq_mask(
-@@ -1501,6 +1532,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+@@ -1535,6 +1566,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
          res &= self_kv_pos_swa->ne[1] == inp_attn->self_attn_mask_swa.raw->ne[3];
      }
  
@@ -1071,7 +1071,7 @@ index ed982dde4..8f2fecab4 100644
      res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
  
      res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-@@ -2499,7 +2533,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2532,7 +2566,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
              // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
              weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
          } else if (hparams.expert_weights_norm_eps > 0.0f) {
@@ -1090,7 +1090,7 @@ index ed982dde4..8f2fecab4 100644
          } else {
              // Avoid division by zero, clamp to smallest number representable by F16
              weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
-@@ -3143,7 +3187,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3177,7 +3221,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
           ggml_tensor * bias_table,
           ggml_tensor * bias_indices,
           ggml_tensor * bias_k_pos,
@@ -1100,7 +1100,7 @@ index ed982dde4..8f2fecab4 100644
      const bool v_trans = v->nb[1] > v->nb[2];
  
      // split the batch into streams if needed
-@@ -3212,8 +3257,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3246,8 +3291,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              // prefer the position mode: no [n_kv, n_tokens] index tensor to fill, upload and keep in memory
              bool attached = false;
              if (offload && bias_k_pos && !kv_rows && llama_inkling_position_bias_enabled()) {
@@ -1125,7 +1125,7 @@ index ed982dde4..8f2fecab4 100644
              }
              if (!attached) {
                  ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
-@@ -3768,7 +3827,8 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3802,7 +3861,8 @@ static ggml_tensor * build_attn_iswa_impl(
          ggml_tensor * bias_table = nullptr,
          ggml_tensor * bias_indices = nullptr,
          ggml_tensor * bias_k_pos = nullptr,
@@ -1135,7 +1135,7 @@ index ed982dde4..8f2fecab4 100644
      ggml_context * ctx0 = gctx.ctx0;
      ggml_cgraph  * gf   = gctx.gf;
  
-@@ -3834,7 +3894,7 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3868,7 +3928,7 @@ static ggml_tensor * build_attn_iswa_impl(
      ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
  
@@ -1144,7 +1144,7 @@ index ed982dde4..8f2fecab4 100644
      cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
      gctx.cb(cur, "kqv_out", il);
  
-@@ -4503,6 +4563,8 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -4564,6 +4624,8 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
          ggml_set_name(inp->self_q_pos, "attn_inp_q_pos");
      }
  
@@ -1153,7 +1153,7 @@ index ed982dde4..8f2fecab4 100644
      return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
  }
  
-@@ -4527,8 +4589,11 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -4588,8 +4650,11 @@ ggml_tensor * llm_graph_context::build_attn(
      ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
      ggml_tensor * k_pos   = is_swa ? inp->self_kv_pos_swa  : inp->self_kv_pos;
  
@@ -1167,10 +1167,10 @@ index ed982dde4..8f2fecab4 100644
  
  void llm_graph_context::build_dense_out(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index afd39e3a6..b5cf8f4ac 100644
+index edd25b4b5..1f06e1291 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -812,6 +812,10 @@ public:
+@@ -825,6 +825,10 @@ public:
      ggml_tensor * self_kv_pos_swa = nullptr; // I32 [n_kv_swa, n_stream]
      ggml_tensor * self_q_pos      = nullptr; // I32 [n_batch]
  
@@ -1181,7 +1181,7 @@ index afd39e3a6..b5cf8f4ac 100644
      const uint32_t extent;
      const uint32_t extent_swa;
  
-@@ -1348,7 +1352,8 @@ struct llm_graph_context {
+@@ -1361,7 +1365,8 @@ struct llm_graph_context {
              ggml_tensor * bias_table = nullptr,
              ggml_tensor * bias_indices = nullptr,
              ggml_tensor * bias_k_pos = nullptr,  // position mode of the bias, see ggml_flash_attn_ext_add_position_bias
@@ -1246,7 +1246,7 @@ index 8ce8e0165..5749283d6 100644
              0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 350bd518e..a13eaed08 100644
+index dcfc3fe50..f1bc896d0 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -1310,6 +1310,18 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -1396,10 +1396,10 @@ index 4cb102bf5..d503e8310 100644
      cb(cur, "result_output", -1);
      res->t_logits = cur;
 diff --git a/src/models/models.h b/src/models/models.h
-index e7b6d38a1..06a701eca 100644
+index dec40f29f..d42a7e0c8 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -2551,6 +2551,11 @@ struct llama_model_inkling2 : public llama_model_base {
+@@ -2576,6 +2576,11 @@ struct llama_model_inkling2 : public llama_model_base {
  
          ggml_tensor * inp_out_ids = nullptr;
          ggml_tensor * tau         = nullptr; // log-scaled positions

@@ -1,126 +1,38 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 2f466e2e4..dc981f03f 100644
+index 0007fa18f..5b050aa45 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -2292,6 +2292,15 @@ extern "C" {
-             struct ggml_tensor * a,
-             struct ggml_tensor * sinks);
+@@ -2294,7 +2294,7 @@ extern "C" {
  
-+    GGML_API bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a);
-+
+     GGML_API bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a);
+ 
+-    // Add table[indices[key, query], head, query] to the mask, in F32.
 +    // Add table[indices[key, query], head, query] to the mask before its F16 rounding.
-+    // Queries from all streams are flattened in stream order. Indices must be in [0, table->ne[0]).
-+    GGML_API void ggml_flash_attn_ext_add_indexed_bias(
-+            struct ggml_tensor * a,
-+            struct ggml_tensor * table,
-+            struct ggml_tensor * indices);
-+
-     // TODO: needs to be adapted to ggml_flash_attn_ext
-     GGML_API struct ggml_tensor * ggml_flash_attn_back(
-             struct ggml_context * ctx,
-diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 54d85b597..466ef72a2 100644
---- a/ggml/src/ggml-backend-meta.cpp
-+++ b/ggml/src/ggml-backend-meta.cpp
-@@ -152,6 +152,10 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
- static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
- 
- static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-+    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
-+        return false;
-+    }
-+
-     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
-     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
-diff --git a/ggml/src/ggml-cann/ggml-cann.cpp b/ggml/src/ggml-cann/ggml-cann.cpp
-index 0adc8680f..4ea2f216d 100644
---- a/ggml/src/ggml-cann/ggml-cann.cpp
-+++ b/ggml/src/ggml-cann/ggml-cann.cpp
-@@ -2679,8 +2679,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
-             return true;
-         case GGML_OP_FLASH_ATTN_EXT:
-             {
--                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
--                if (op->src[5] != nullptr) {
-+                // K/V row lists and indexed bias are not supported
-+                if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
-                     return false;
-                 }
- #ifdef ASCEND_310P
+     // Queries from all streams are flattened in stream order. Indices must be in [0, table->ne[0]).
+     GGML_API void ggml_flash_attn_ext_add_indexed_bias(
+             struct ggml_tensor * a,
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index f984f13a6..a46c96ece 100644
+index 72dd3e691..7a92f43a0 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -8981,6 +8981,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-     const ggml_tensor * mask  = dst->src[3];
-     const ggml_tensor * sinks = dst->src[4];
-     const ggml_tensor * kv_rows = dst->src[5];
-+    const ggml_tensor * bias_table   = dst->src[6];
-+    const ggml_tensor * bias_indices = dst->src[7];
- 
-     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
-     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
-@@ -9022,6 +9024,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-     const int64_t rv2 = neq2/nev2;
-     const int64_t rv3 = neq3/nev3;
- 
-+    const int64_t n_bins = bias_table ? bias_table->ne[0] : 0;
-+
-     // parallelize by q rows using ggml_vec_dot_f32
- 
-     float scale         = 1.0f;
-@@ -9085,12 +9089,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
- 
-         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
- 
-+        // bias rows of this query and head, queries of all streams are flattened
-+        const float   * bias = bias_table   ? (const float   *) ((const char *) bias_table->data   + (iq3*neq1 + iq1)*bias_table->nb[2] + iq2*bias_table->nb[1]) : nullptr;
-+        const int32_t * bins = bias_indices ? (const int32_t *) ((const char *) bias_indices->data + (iq3*neq1 + iq1)*bias_indices->nb[1]) : nullptr;
-+
-         // online softmax / attention
-         // loop over n_kv and n_head_kv
-         // ref: https://arxiv.org/pdf/2112.05682.pdf
- 
-         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
--            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
-+            float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
-+            if (bias) {
-+                GGML_ASSERT(bins[ic] >= 0 && bins[ic] < n_bins);
+@@ -9101,7 +9101,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+             float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+             if (bias) {
+                 GGML_ASSERT(bins[ic] >= 0 && bins[ic] < n_bins);
+-                mv += bias[bins[ic]];
 +                mv = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(mv + bias[bins[ic]]));
-+            }
-+            mv *= slope;
-             if (mv == -INFINITY) {
-                 continue;
              }
-@@ -9268,6 +9281,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
-     const ggml_tensor * kv_rows = dst->src[5];
-     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
- 
-+    const ggml_tensor * bias_table   = dst->src[6];
-+    const ggml_tensor * bias_indices = dst->src[7];
-+    const int64_t n_bins = bias_table ? bias_table->ne[0] : 0;
-+
-     int ir = ir0;
-     while (ir < ir1) {
-         // q indices for the start of this tile
-@@ -9346,8 +9363,15 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
-                 bool can_skip = true;
-                 for (int tq = 0; tq < tile_rows; tq++) {
-                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-+                    const float   * bias = bias_table   ? (const float   *) ((const char *) bias_table->data   + (iq3*neq1 + iq1 + tq)*bias_table->nb[2] + iq2*bias_table->nb[1]) : nullptr;
-+                    const int32_t * bins = bias_indices ? (const int32_t *) ((const char *) bias_indices->data + (iq3*neq1 + iq1 + tq)*bias_indices->nb[1]) : nullptr;
-                     for (int tk = 0; tk < kv_tile; tk++) {
--                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
-+                        float m = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
-+                        if (bias) {
-+                            GGML_ASSERT(bins[ic + tk] >= 0 && bins[ic + tk] < n_bins);
+             mv *= slope;
+             if (mv == -INFINITY) {
+@@ -9369,7 +9369,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+                         float m = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                         if (bias) {
+                             GGML_ASSERT(bins[ic + tk] >= 0 && bins[ic + tk] < n_bins);
+-                            m += bias[bins[ic + tk]];
 +                            m = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(m + bias[bins[ic + tk]]));
-+                        }
-+                        mask32[tq * KV_TILE_SZ + tk] = slope * m;
-                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                             can_skip = false;
                          }
+                         mask32[tq * KV_TILE_SZ + tk] = slope * m;
+                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
 index fc0cc7403..9ed4e7ce2 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
@@ -674,10 +586,21 @@ index 09a46187d..42c0ef1c4 100644
      const bool need_f16_V = type_V == GGML_TYPE_F16;
      constexpr size_t nbytes_shared = 0;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 10aa5af15..11b8a3e89 100644
+index b37065c31..11b8a3e89 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -669,6 +669,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -582,10 +582,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     return BEST_FATTN_KERNEL_NONE;
+ #endif// FLASH_ATTN_AVAILABLE
+ 
+-    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+-        return BEST_FATTN_KERNEL_NONE;
+-    }
+-
+     const ggml_tensor * KQV   = dst;
+     const ggml_tensor * Q     = dst->src[0];
+     const ggml_tensor * K     = dst->src[1];
+@@ -673,6 +669,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
          return BEST_FATTN_KERNEL_NONE;
      }
  
@@ -696,68 +619,12 @@ index 10aa5af15..11b8a3e89 100644
      if (mask && mask->ne[2] != 1) {
          // the kv_rows mask is compacted per sequence, it has no head dimension
          if (kv_rows) {
-diff --git a/ggml/src/ggml-et/ggml-et.cpp b/ggml/src/ggml-et/ggml-et.cpp
-index 53e64b323..e575ee78b 100644
---- a/ggml/src/ggml-et/ggml-et.cpp
-+++ b/ggml/src/ggml-et/ggml-et.cpp
-@@ -1277,6 +1277,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
-             if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->src[1] &&
-                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) && op->src[2] &&
-                 (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) && op->src[4] == nullptr && op->src[5] == nullptr &&
-+                !ggml_flash_attn_ext_has_indexed_bias(op) &&
-                 ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(op->src[0])) {
-                 float max_bias      = 0.0f;
-                 float logit_softcap = 0.0f;
-diff --git a/ggml/src/ggml-hexagon/htp-kparams.cpp b/ggml/src/ggml-hexagon/htp-kparams.cpp
-index 6d365b811..4e3c5cb8d 100644
---- a/ggml/src/ggml-hexagon/htp-kparams.cpp
-+++ b/ggml/src/ggml-hexagon/htp-kparams.cpp
-@@ -355,8 +355,8 @@ static bool htp_kparams_solve_flash_attn(
-         return false;
-     }
- 
--    // K/V row lists (ggml_flash_attn_ext_rows) are not supported
--    if (op->src[5] != nullptr) {
-+    // K/V row lists and indexed bias are not supported
-+    if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
-         return false;
-     }
- 
-diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index 2e085453a..4de1c2d28 100644
---- a/ggml/src/ggml-metal/ggml-metal-device.m
-+++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -1744,6 +1744,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
-         case GGML_OP_ROLL:
-             return ggml_is_contiguous(op->src[0]);
-         case GGML_OP_FLASH_ATTN_EXT:
-+            if (ggml_flash_attn_ext_has_indexed_bias(op)) {
-+                return false;
-+            }
-             // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
-             if (op->src[5] != NULL) {
-                 const struct ggml_tensor * kv_rows = op->src[5];
-diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index d35c6d047..ef9bc9d54 100644
---- a/ggml/src/ggml-opencl/ggml-opencl.cpp
-+++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -12569,8 +12569,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
-         case GGML_OP_MEAN:
-             return op->src[0]->type == GGML_TYPE_F32;
-         case GGML_OP_FLASH_ATTN_EXT: {
--            // K/V row lists (ggml_flash_attn_ext_rows) are not supported
--            if (op->src[5] != nullptr) {
-+            // K/V row lists and indexed bias are not supported
-+            if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
-                 return false;
-             }
- #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
 diff --git a/ggml/src/ggml-openvino/ggml-openvino.cpp b/ggml/src/ggml-openvino/ggml-openvino.cpp
-index bd49560d8..8325e638a 100644
+index e1ba0baeb..8b6d12c65 100644
 --- a/ggml/src/ggml-openvino/ggml-openvino.cpp
 +++ b/ggml/src/ggml-openvino/ggml-openvino.cpp
-@@ -1905,6 +1905,10 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
-             return {false, "FLASH_ATTN_EXT gemma3n pattern on GPU is not supported"};
+@@ -1933,6 +1933,10 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
+             return {false, "FLASH_ATTN_EXT with indexed bias is not supported"};
          }
  
 +        if (ggml_flash_attn_ext_has_indexed_bias(op)) {
@@ -768,10 +635,10 @@ index bd49560d8..8325e638a 100644
          if (op->src[5] != nullptr) {
              return {false, "FLASH_ATTN_EXT with K/V row lists is not supported"};
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index e4a84cb0c..3ccfa8b9b 100644
+index 6197f01c2..e88160354 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -3113,9 +3113,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
+@@ -2880,9 +2880,8 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
  
  static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      GGML_UNUSED(dev);
@@ -782,123 +649,11 @@ index e4a84cb0c..3ccfa8b9b 100644
  }
  
  static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 7dda19dfd..75df12c73 100644
---- a/ggml/src/ggml-sycl/ggml-sycl.cpp
-+++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -7741,8 +7741,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
-         case GGML_OP_SOLVE_TRI:
-             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
-         case GGML_OP_FLASH_ATTN_EXT:
--            // K/V row lists (ggml_flash_attn_ext_rows) are not supported
--            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
-+            // K/V row lists and indexed bias are not supported
-+            return op->src[5] == nullptr && !ggml_flash_attn_ext_has_indexed_bias(op) && ggml_sycl_flash_attn_ext_supported(device, op);
-         default:
-             return false;
-     }
-diff --git a/ggml/src/ggml-virtgpu/ggml-backend-device.cpp b/ggml/src/ggml-virtgpu/ggml-backend-device.cpp
-index 86df4cc5f..a9e9e1b86 100644
---- a/ggml/src/ggml-virtgpu/ggml-backend-device.cpp
-+++ b/ggml/src/ggml-virtgpu/ggml-backend-device.cpp
-@@ -30,6 +30,10 @@ static void ggml_backend_remoting_device_get_memory(ggml_backend_dev_t dev, size
- }
- 
- static bool ggml_backend_remoting_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-+    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
-+        return false;
-+    }
-+
-     if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
-         !ggml_rope_get_truncate(op)) {
-         return false;
-diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 60cebe494..0711166f9 100644
---- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-+++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -16774,8 +16774,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
-             }
-         case GGML_OP_FLASH_ATTN_EXT:
-             {
--                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
--                if (op->src[5] != nullptr) {
-+                if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
-                     return false;
-                 }
-                 bool coopmat2 = device->coopmat2;
-diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
-index 886760849..3f1ce0e10 100644
---- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
-+++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
-@@ -5083,8 +5083,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
-             {
-                 // conservative support checks for whether the more resource-intensive shader paths
-                 // can be used, to avoid cases where flash_attn is assigned to the CPU later on
--                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
--                supports_op = op->src[5] == nullptr && src0->type == GGML_TYPE_F32 &&
-+                // K/V row lists and indexed bias are not supported
-+                supports_op = op->src[5] == nullptr && !ggml_flash_attn_ext_has_indexed_bias(op) &&
-+                              src0->type == GGML_TYPE_F32 &&
-                               (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 ||
-                                src1->type == GGML_TYPE_Q4_0 || src1->type == GGML_TYPE_Q8_0) &&
-                               (src2->type == GGML_TYPE_F32 || src2->type == GGML_TYPE_F16 ||
-diff --git a/ggml/src/ggml-zdnn/fattn.cpp b/ggml/src/ggml-zdnn/fattn.cpp
-index e6a0c24ca..5e74e67a4 100644
---- a/ggml/src/ggml-zdnn/fattn.cpp
-+++ b/ggml/src/ggml-zdnn/fattn.cpp
-@@ -21,7 +21,7 @@ bool ggml_zdnn_supports_flash_attn_ext(const ggml_backend_zdnn_device_context *
-     memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
- 
-     // sinks, alibi, softcap, sparse k/v sets and k/v row lists are not implemented
--    if (op->src[4] != nullptr || op->src[5] != nullptr || max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(op, 4) != 0) {
-+    if (op->src[4] != nullptr || op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op) || max_bias != 0.0f || logit_softcap != 0.0f || ggml_get_op_params_i32(op, 4) != 0) {
-         return false;
-     }
- 
-diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 3389dcd63..652a7c7d6 100644
---- a/ggml/src/ggml.c
-+++ b/ggml/src/ggml.c
-@@ -5545,6 +5545,34 @@ void ggml_flash_attn_ext_add_sinks(
-     a->src[4] = sinks;
- }
- 
-+bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
-+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-+    return ggml_get_op_params_i32(a, 5) != 0;
-+}
-+
-+void ggml_flash_attn_ext_add_indexed_bias(
-+        struct ggml_tensor * a,
-+        struct ggml_tensor * table,
-+        struct ggml_tensor * indices) {
-+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-+    GGML_ASSERT((table == NULL) == (indices == NULL));
-+    a->src[6] = table;
-+    a->src[7] = indices;
-+    ggml_set_op_params_i32(a, 5, table != NULL);
-+    if (!table) {
-+        return;
-+    }
-+
-+    const struct ggml_tensor * q = a->src[0];
-+    const struct ggml_tensor * mask = a->src[3];
-+    GGML_ASSERT(mask && mask->ne[0] == (a->src[5] ? a->src[5]->ne[0] : a->src[1]->ne[1]) && mask->ne[1] == q->ne[1]);
-+    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
-+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
-+    GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[0] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
-+    GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices));
-+    GGML_ASSERT(indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2]);
-+}
-+
- // ggml_flash_attn_back
- 
- struct ggml_tensor * ggml_flash_attn_back(
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 1bd3f8d0f..6738482c8 100644
+index 5fef4c421..db931004b 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1415,7 +1415,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
+@@ -1447,7 +1447,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
      }
  
      if (self_rel_pos->buffer) {
@@ -907,7 +662,7 @@ index 1bd3f8d0f..6738482c8 100644
      }
  
      // swa tensors may not be allocated if there are no SWA attention layers
-@@ -1429,7 +1429,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
+@@ -1461,7 +1461,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
      }
  
      if (self_rel_pos_swa->buffer) {
@@ -916,7 +671,7 @@ index 1bd3f8d0f..6738482c8 100644
      }
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
-@@ -1454,16 +1454,13 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+@@ -1488,16 +1488,13 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
  
      const auto * attn_ctx = mctx->get_attn();
  
@@ -934,7 +689,7 @@ index 1bd3f8d0f..6738482c8 100644
      res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
  
      // swa tensors may not be allocated if there are no SWA attention layers
-@@ -1471,9 +1468,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+@@ -1505,9 +1502,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
          res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
      }
  
@@ -945,7 +700,7 @@ index 1bd3f8d0f..6738482c8 100644
      res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
  
      res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-@@ -3114,7 +3110,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3148,7 +3144,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
           ggml_tensor * v_mla,
               int64_t   n_kv_max,
                 float   kq_scale,
@@ -956,7 +711,7 @@ index 1bd3f8d0f..6738482c8 100644
      const bool v_trans = v->nb[1] > v->nb[2];
  
      // split the batch into streams if needed
-@@ -3129,6 +3127,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3163,6 +3161,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
      k = ggml_permute(ctx0, k, 0, 2, 1, 3);
      v = ggml_permute(ctx0, v, 0, 2, 1, 3);
  
@@ -978,7 +733,7 @@ index 1bd3f8d0f..6738482c8 100644
      ggml_tensor * cur;
  
      const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
-@@ -3162,6 +3175,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3196,6 +3209,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
          ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
          ggml_prec_set_acc(cur, GGML_PREC_F32);
@@ -1002,7 +757,7 @@ index 1bd3f8d0f..6738482c8 100644
  
          if (v_mla) {
  #if 0
-@@ -3182,6 +3212,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3216,6 +3246,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
  
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
      } else {
@@ -1012,7 +767,7 @@ index 1bd3f8d0f..6738482c8 100644
          ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
          cb(kq, "kq", il);
  
-@@ -3691,7 +3724,9 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3725,7 +3758,9 @@ static ggml_tensor * build_attn_iswa_impl(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
              float     kq_scale,
@@ -1023,7 +778,7 @@ index 1bd3f8d0f..6738482c8 100644
      ggml_context * ctx0 = gctx.ctx0;
      ggml_cgraph  * gf   = gctx.gf;
  
-@@ -3757,7 +3792,7 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3791,7 +3826,7 @@ static ggml_tensor * build_attn_iswa_impl(
      ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
  
@@ -1032,7 +787,7 @@ index 1bd3f8d0f..6738482c8 100644
      cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
      gctx.cb(cur, "kqv_out", il);
  
-@@ -4351,19 +4386,18 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -4412,19 +4447,18 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
  
      auto inp_attn = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, attn_ctx);
  
@@ -1054,7 +809,7 @@ index 1bd3f8d0f..6738482c8 100644
      }
  
      inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
-@@ -4374,11 +4408,11 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -4435,11 +4469,11 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
  
      auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
  
@@ -1068,7 +823,7 @@ index 1bd3f8d0f..6738482c8 100644
      ggml_set_input(inp->self_rel_pos_swa);
      ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
  
-@@ -4393,7 +4427,7 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -4454,7 +4488,7 @@ ggml_tensor * llm_graph_context::build_attn(
          ggml_tensor * q_cur,
          ggml_tensor * k_cur,
          ggml_tensor * v_cur,
@@ -1077,7 +832,7 @@ index 1bd3f8d0f..6738482c8 100644
          ggml_tensor * sinks,
              float     kq_scale,
              int       il) const {
-@@ -4403,22 +4437,10 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -4464,22 +4498,10 @@ ggml_tensor * llm_graph_context::build_attn(
  
      const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
  
@@ -1104,10 +859,10 @@ index 1bd3f8d0f..6738482c8 100644
  
  void llm_graph_context::build_dense_out(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 116b7132a..1acf4461e 100644
+index ff155f14d..22860eb7f 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -774,8 +774,7 @@ public:
+@@ -787,8 +787,7 @@ public:
  };
  
  // hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling)
@@ -1117,7 +872,7 @@ index 116b7132a..1acf4461e 100644
  class llm_graph_input_mem_hybrid_iswa_rel : public llm_graph_input_i {
  public:
      llm_graph_input_mem_hybrid_iswa_rel(
-@@ -1336,7 +1335,9 @@ struct llm_graph_context {
+@@ -1349,7 +1348,9 @@ struct llm_graph_context {
              ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                  int64_t   n_kv_max,
                    float   kq_scale,
@@ -1128,7 +883,7 @@ index 116b7132a..1acf4461e 100644
  
      llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
  
-@@ -1534,7 +1535,7 @@ struct llm_graph_context {
+@@ -1547,7 +1548,7 @@ struct llm_graph_context {
              uint32_t extent,
              uint32_t extent_swa) const;
  
@@ -1137,7 +892,7 @@ index 116b7132a..1acf4461e 100644
      ggml_tensor * build_attn(
              llm_graph_input_mem_hybrid_iswa_rel * inp,
              ggml_tensor * wo,
-@@ -1543,7 +1544,7 @@ struct llm_graph_context {
+@@ -1556,7 +1557,7 @@ struct llm_graph_context {
              ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
              ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
              ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
@@ -1147,7 +902,7 @@ index 116b7132a..1acf4461e 100644
                    float   kq_scale,
                      int   il) const;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index fbe422a27..06b4a8a48 100644
+index bb546f7cd..9c8f4f5ba 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -2007,14 +2007,18 @@ bool llama_kv_cache::has_cell_ext() const {
@@ -1249,10 +1004,10 @@ index 45477a69e..a52c3b237 100644
          cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
          cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
 diff --git a/src/models/models.h b/src/models/models.h
-index b12642fb9..a728398dd 100644
+index 3b4f04c19..07d226e1b 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -2544,7 +2544,6 @@ struct llama_model_inkling2 : public llama_model_base {
+@@ -2569,7 +2569,6 @@ struct llama_model_inkling2 : public llama_model_base {
          void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
  
          llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
@@ -1261,10 +1016,10 @@ index b12642fb9..a728398dd 100644
  
          ggml_tensor * inp_out_ids = nullptr;
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 5b997e91b..f9dff8bf8 100644
+index 2e0edcb49..e6186af10 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -367,6 +367,7 @@ endif()
+@@ -368,6 +368,7 @@ endif()
  llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
  
  llama_build_and_test(test-backend-tensor.cpp LINK ggml)

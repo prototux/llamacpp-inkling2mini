@@ -1,5 +1,5 @@
 diff --git a/docs/inkling-moonshot.md b/docs/inkling-moonshot.md
-index 23b8fdd52..01001b720 100644
+index 23b8fdd52..65c647174 100644
 --- a/docs/inkling-moonshot.md
 +++ b/docs/inkling-moonshot.md
 @@ -61,6 +61,7 @@ layer application for 8 experts), the output head Q5_K (320 MB).
@@ -10,7 +10,7 @@ index 23b8fdd52..01001b720 100644
  
  Existing switches from `inkling-3090-exp` keep working: `LLAMA_INKLING_FA_MMA`, `LLAMA_INKLING_POS_BIAS`,
  `LLAMA_INKLING_FA_Q8_0`, `LLAMA_INKLING_FA_VEC_VERIFY`, `LLAMA_INKLING_SHARE_LOOP_KV`. `LLAMA_INKLING_NO_MASK`
-@@ -95,3 +96,618 @@ All commands through the compose service; `E` stands for the environment of the
+@@ -95,3 +96,642 @@ All commands through the compose service; `E` stands for the environment of the
     `n_ctx`. For q4_0 run `llama-perplexity -c 8192` against the q8_0 cache and decide on the loss.
  6. Configuration experiments without code: `-ub 2048 -b 2048` for prefill (4x more rows per expert GEMM), and
     `--backend-sampling` for decode (no 800 KB logits copy per token).
@@ -627,8 +627,32 @@ index 23b8fdd52..01001b720 100644
 +(each ~0.5-1%): the gated wo input quantized in one kernel and handed to mmvq, SITU emitting the down product's q8_1
 +(needs the hand-off to carry 8 rows), K/V clip + FWHT + SET_ROWS epilogues, Q clip + FWHT.
 +
++### Option A, steps 4-5: `LLAMA_INKLING_MK_WOQ=1`, `LLAMA_INKLING_MK_QKV=1` (committed 58e91726e, matcher fix below)
++| step | what | MK_CHECK | mk-bench short / 54K |
++|---|---|---|---|
++| 4 `LLAMA_INKLING_MK_WOQ=1` | the gated wo input (SIGMOID + MUL, 2 launches) quantized to q8_1 in one kernel and handed to the wo product through the glue's q8_1 slot ring, so the product skips its own quantize launch | 100 steps: 0 mismatching | rec 103.0-103.3 / 79.5-80.9 -> +woq 104.1-104.7 / 80.7 (+0.5-1%) |
++| 5 `LLAMA_INKLING_MK_QKV=1` | the Q/K/V epilogue of a token (Q clip with weight, optional tau, 128-wide Hadamard rotation; K clip, rotation; V RMS norm, 64-wide rotation; the two q8_0 cache stores: 14 launches) in one kernel of n_head + 2 n_kv blocks; the clips and norm are elementwise or one-warp reductions written as the unfused kernels, the rotation is `fwht_cuda`'s butterfly | 100 steps: 0 mismatching (117 792 outputs) | self-test 34 -> 17 us; see the fix below |
++
++QKV fired on 1 of 48 applications at first. The MK_DEBUG decline log (every `return false` of the matcher labelled)
++showed the pattern walk succeeding on 47 and the final check declining them all for *overlap*: ggml-alloc places the
++rotated Q over the Q projection (dead after the clip in the unfused graph), either at the same address or 0.5-9 KB
++below it, and the fused kernel reads the projection while it writes the rotated Q (different blocks, no ordering).
++Fix in the model graph, not the kernel: when `LLAMA_INKLING_MK_QKV` is set, `build_inkling2` marks the Q projection
++`ggml_set_output`, which the allocator never frees or reuses (12 KB per application, 576 KB per graph). The kernel
++keeps its overlap check as a guard. The one remaining decline (`q rotation`, node 1103) is one application whose
++next node after the Q clip is not the rotation; 47 of 48 fuse.
++
++| config (two runs each) | short-1 | short-2 | 54K |
++|---|---|---|---|
++| rec+woq | 103.8 / 103.4 | 103.7 / 102.6 | 80.4 / 79.9 |
++| rec+woq+qkv | 109.0 / 108.6 | 108.5 / 108.6 | 83.2 / 83.0 |
++
++QKV: +5% short, +3.5% at 54K; 14 launches per application saved (672 per token).
++
 +Recommended production set now: `LLAMA_INKLING_MK_GLUE=1 LLAMA_INKLING_MK_RELTAB=1 LLAMA_INKLING_MK_MOESCALE=1
-+LLAMA_INKLING_GEMV=1 LLAMA_INKLING_NO_MASK=1` (each bit-identical to the unfused graph; MK_CHECK 0 with all of them).
++LLAMA_INKLING_GEMV=1 LLAMA_INKLING_MK_PROJ=1 LLAMA_INKLING_NO_MASK=1 LLAMA_INKLING_MK_WOQ=1 LLAMA_INKLING_MK_QKV=1`
++(each bit-identical to the unfused graph; MK_CHECK 0 with all of them). Remaining barrier-free candidates: SITU
++emitting the down product's q8_1 (the hand-off must carry 8 rows), the R clip + tau, the 48th QKV application.
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 5b3c32858..4aa490c55 100644
 --- a/ggml/src/ggml-cuda/common.cuh
@@ -2122,7 +2146,7 @@ index 7b9c27789..5275a0dbc 100644
      }
  };
 diff --git a/ggml/src/ggml-cuda/inkling2.cu b/ggml/src/ggml-cuda/inkling2.cu
-index abdffb8d4..9b860a696 100644
+index abdffb8d4..cd889addf 100644
 --- a/ggml/src/ggml-cuda/inkling2.cu
 +++ b/ggml/src/ggml-cuda/inkling2.cu
 @@ -1,18 +1,81 @@
@@ -2740,7 +2764,7 @@ index abdffb8d4..9b860a696 100644
  
      if (tid < n4) {
          const float4 va = ((const float4 *) a)[tid];
-@@ -1863,121 +2061,1653 @@ static void inkling2_ctrl_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_
+@@ -1863,121 +2061,1669 @@ static void inkling2_ctrl_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_
  }
  
  // ---------------------------------------------------------------------------------------------------------------------
@@ -4215,17 +4239,19 @@ index abdffb8d4..9b860a696 100644
 +    // Q: CLIP with weight, optional MUL by tau, the rotation
 +    ggml_cuda_inkling2_args cq;
 +    if (cgraph->nodes[i]->op != GGML_OP_MUL || !inkling2_match_clip(cgraph, i, cq) || cq.src[1] == nullptr) {
-+        return false;
++        return false; // not a Q clip: no log, every other MUL lands here
 +    }
 +    const ggml_tensor * xq = cq.src[0];
 +    const ggml_tensor * wq = cq.src[1];
 +    const ggml_tensor * qf = cq.dst;
 +    if (qf->ne[0] != D || qf->ne[2] != 1 || !inkling2_internal(cgraph, i + cq.n_nodes - 1, 1)) {
++        inkling2_declined("qkv", "q shape", cgraph->nodes[i]);
 +        return false;
 +    }
 +    const int64_t n_head = qf->ne[1];
 +    int k = inkling2_next_node(cgraph, i + cq.n_nodes);
 +    if (k >= cgraph->n_nodes) {
++        inkling2_declined("qkv", "end of graph", cgraph->nodes[i]);
 +        return false;
 +    }
 +    const ggml_tensor * tau = nullptr;
@@ -4233,13 +4259,15 @@ index abdffb8d4..9b860a696 100644
 +        const ggml_tensor * mul = cgraph->nodes[k];
 +        if (mul->src[0] != qf || ggml_nelements(mul->src[1]) != 1 || mul->src[1]->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, qf) ||
 +                !inkling2_internal(cgraph, k, 1)) {
-+            return false;
++            inkling2_declined("qkv", "tau", cgraph->nodes[i]);
++        return false;
 +        }
 +        tau = mul->src[1];
 +        qf  = mul;
 +        k   = inkling2_next_node(cgraph, k + 1);
 +    }
 +    if (k >= cgraph->n_nodes || !inkling2_is_rotation(cgraph->nodes[k], qf, D)) {
++        inkling2_declined("qkv", "q rotation", cgraph->nodes[i]);
 +        return false;
 +    }
 +    ggml_tensor * dq = cgraph->nodes[k];
@@ -4254,6 +4282,7 @@ index abdffb8d4..9b860a696 100644
 +    const ggml_tensor * kcur = ck.dst;
 +    const int64_t       n_kv = kcur->ne[1];
 +    if (kcur->ne[0] != D || kcur->ne[2] != 1 || !inkling2_internal(cgraph, kk + ck.n_nodes - 1, 1)) {
++        inkling2_declined("qkv", "k shape", cgraph->nodes[i]);
 +        return false;
 +    }
 +    kk = inkling2_next_node(cgraph, kk + ck.n_nodes);
@@ -4272,6 +4301,7 @@ index abdffb8d4..9b860a696 100644
 +    const ggml_tensor * xv    = vnorm->src[0];
 +    if (vnorm->type != GGML_TYPE_F32 || xv->type != GGML_TYPE_F32 || !ggml_is_contiguous(xv) || xv->ne[0] != D || xv->ne[1] != n_kv ||
 +            xv->ne[2] != 1 || xv->ne[3] != 1 || (uintptr_t) xv->data % 16 != 0) {
++        inkling2_declined("qkv", "v shape", cgraph->nodes[i]);
 +        return false;
 +    }
 +    kv = inkling2_next_node(cgraph, kv + 1);
@@ -4304,10 +4334,20 @@ index abdffb8d4..9b860a696 100644
 +        inkling2_declined("qkv", "shape", cgraph->nodes[i]);
 +        return false;
 +    }
-+    if (!inkling2_glue_outside(cgraph, i, n_nodes, { xq, wq, tau, xk, xv, store_k->src[1], store_v->src[1] }) ||
-+            inkling2_overlap(dq, xq) || inkling2_overlap(dq, wq) || inkling2_overlap(dq, xk) || inkling2_overlap(dq, xv) ||
++    if (!inkling2_glue_outside(cgraph, i, n_nodes, { xq, wq, tau, xk, xv, store_k->src[1], store_v->src[1] })) {
++        inkling2_declined("qkv", "outside", cgraph->nodes[i]);
++        return false;
++    }
++    if (inkling2_overlap(dq, xq) || inkling2_overlap(dq, wq) || inkling2_overlap(dq, xk) || inkling2_overlap(dq, xv) ||
 +            (tau && inkling2_overlap(dq, tau))) {
-+        inkling2_declined("qkv", "outside/overlap", cgraph->nodes[i]);
++        // the allocator placed the rotated Q where the projection was (dead after the clip in the unfused graph);
++        // src/models/inkling2.cpp keeps the projection alive (ggml_set_output) when LLAMA_INKLING_MK_QKV is set
++        static const bool dbg = getenv("LLAMA_INKLING_MK_DEBUG") != nullptr;
++        if (dbg) {
++            fprintf(stderr, "inkling2 qkv: %s: dq %p+%zu xq %p+%zu xk %p+%zu xv %p+%zu\n", cgraph->nodes[i]->name, dq->data,
++                    ggml_nbytes(dq), xq->data, ggml_nbytes(xq), xk->data, ggml_nbytes(xk), xv->data, ggml_nbytes(xv));
++        }
++        inkling2_declined("qkv", "overlap", cgraph->nodes[i]);
 +        return false;
 +    }
 +    args.type    = GGML_CUDA_INKLING2_QKV;
@@ -4487,7 +4527,7 @@ index abdffb8d4..9b860a696 100644
      const int64_t n_head = tab->ne[1];
      const int64_t n_tok  = tab->ne[2];
      const int64_t n_kv   = pos->ne[0];
-@@ -2110,17 +3840,59 @@ static void inkling2_relbias(ggml_backend_cuda_context & ctx, const ggml_cuda_in
+@@ -2110,17 +3856,59 @@ static void inkling2_relbias(ggml_backend_cuda_context & ctx, const ggml_cuda_in
  
  // ---------------------------------------------------------------------------------------------------------------------
  
@@ -4548,7 +4588,7 @@ index abdffb8d4..9b860a696 100644
              return inkling2_match_situ(cgraph, i, args);
          case GGML_OP_RMS_NORM:
              return inkling2_match_mix(cgraph, i, args) || inkling2_match_ctrl_down(cgraph, i, args) ||
-@@ -2131,6 +3903,8 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
+@@ -2131,6 +3919,8 @@ bool ggml_cuda_inkling2_match(const ggml_cgraph * cgraph, int i, ggml_cuda_inkli
              return inkling2_match_ctrl_out(cgraph, i, args);
          case GGML_OP_SUB:
              return inkling2_match_relbias(cgraph, i, args);
@@ -4557,7 +4597,7 @@ index abdffb8d4..9b860a696 100644
          case GGML_OP_CONCAT:
              return inkling2_match_conv_state(cgraph, i, args) || inkling2_match_conv_dyn(cgraph, i, args);
          default:
-@@ -2151,6 +3925,8 @@ void ggml_cuda_inkling2_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_i
+@@ -2151,6 +3941,8 @@ void ggml_cuda_inkling2_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_i
          case GGML_CUDA_INKLING2_CTRL_NORM:  inkling2_ctrl_norm(ctx, args);  break;
          case GGML_CUDA_INKLING2_CTRL_TAIL:  inkling2_ctrl_tail(ctx, args);  break;
          case GGML_CUDA_INKLING2_RELBIAS:    inkling2_relbias(ctx, args);    break;
@@ -6013,10 +6053,10 @@ index c27a91b6e..d94b52193 100644
  
  static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index d503e8310..9bf4c4f65 100644
+index d503e8310..f9cd963e8 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -12,6 +12,25 @@ bool llama_model_inkling2::graph::graph_trim_enabled() {
+@@ -12,6 +12,33 @@ bool llama_model_inkling2::graph::graph_trim_enabled() {
      return enabled;
  }
  
@@ -6039,10 +6079,18 @@ index d503e8310..9bf4c4f65 100644
 +    return enabled;
 +}
 +
++// LLAMA_INKLING_MK_QKV set: the CUDA backend computes the Q clip and rotation in one kernel, which reads the Q
++// projection while it writes the rotated Q. The allocator would place the rotated Q over the projection (dead after
++// the clip in the unfused graph), so the projection is kept alive for the whole graph (12 KB per layer application)
++static bool inkling_mk_qkv() {
++    static const bool enabled = [] { const char * env = getenv("LLAMA_INKLING_MK_QKV"); return env && atoi(env) != 0; }();
++    return enabled;
++}
++
  // LLAMA_INKLING_DECODE_SINKS=0 folds the sink into the bias table for one-token graphs too (SUB + FILL per layer)
  bool llama_model_inkling2::graph::decode_sinks_enabled() {
      static const bool enabled = [] {
-@@ -397,10 +416,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -397,10 +424,24 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          inputs[2] = build_norm(inputs[2], layer.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
      }
  
@@ -6059,12 +6107,15 @@ index d503e8310..9bf4c4f65 100644
 +        // small BF16 ones (sinks, conv taps)
          ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
          ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
++        if (inkling_mk_qkv()) {
++            ggml_set_output(Qcur);
++        }
 +        ggml_build_forward_expand(gf, Qcur);
 +        ggml_build_forward_expand(gf, Rcur);
  
          // a slot that shares the KV cache of another slot (inkling2_loop, LLAMA_INKLING_SHARE_LOOP_KV) computes
          // no K and V: build_attn() reads the source slot's cache, which the source stored earlier in this graph
-@@ -411,7 +441,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -411,7 +452,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
              Vcur = build_lora_mm(layer.wv, inputs[2]);
              cb(Kcur, "Kpre", il);
              cb(Vcur, "Vpre", il);
@@ -6073,15 +6124,15 @@ index d503e8310..9bf4c4f65 100644
 +        }
 +        ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, inputs[0]);
 +        ggml_build_forward_expand(gf, gate);
- 
++
 +        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 +        ggml_build_forward_expand(gf, sinks);
-+
+ 
 +        if (Kcur) {
              Kcur = convolve(Kcur, layer.attn_k_conv,
                      is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
              Vcur = convolve(Vcur, layer.attn_v_conv,
-@@ -435,8 +474,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -435,8 +485,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          cb(Qcur, "Qcur", il);
          cb(Rcur, "Rcur", il);
  
@@ -6090,7 +6141,7 @@ index d503e8310..9bf4c4f65 100644
          // the far bin (distance >= extent) is the zero row of the padded table
          ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
  
-@@ -464,7 +501,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -464,7 +512,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                  nullptr, nullptr, nullptr,
                  Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
  

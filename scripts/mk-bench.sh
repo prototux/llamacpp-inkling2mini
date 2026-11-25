@@ -13,7 +13,9 @@ cd "$(dirname "$0")/.." || exit 1
 # INKLING_ENV_FILE instead of .env for the server's environment; .env still sets MODELS_DIR, IMAGE, ...)
 INKLING_ENV_FILE=$(mktemp)
 export INKLING_ENV_FILE
-trap 'rm -f "$INKLING_ENV_FILE"; docker rm -f inkling-mkbench >/dev/null 2>&1' EXIT
+# afterwards, restart the server if it was running, with .env (not the empty test file)
+was_up=$(docker compose ps -q inkling 2>/dev/null)
+trap 'rm -f "$INKLING_ENV_FILE"; docker rm -f inkling-mkbench >/dev/null 2>&1; [[ -z $was_up ]] || env -u INKLING_ENV_FILE docker compose up -d >/dev/null 2>&1' EXIT
 
 n=${N:-512}
 long=${LONG:-64000}

@@ -3,6 +3,8 @@
 #   - test-flash-attn-indexed-bias: Inkling's relative-position bias in every attention path (decode, small
 #     batches, prefill; F16 and q8_0 caches; index and position modes) against an exact expectation
 #   - test-backend-ops: flash attention and the fused Inkling 2 kernels, CUDA vs CPU
+#   - test-inkling-megakernel, test-inkling-gemv: the decode fusions and the one-token GEMV, bit for bit against the
+#     unfused graph (a few minutes)
 # usage: scripts/verify-kernels.sh      (uses the image of compose.yaml)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -27,6 +29,17 @@ echo "== test-backend-ops: flash attention and Inkling 2 fused ops, CUDA vs CPU"
 for op in FLASH_ATTN_EXT "INKLING2_.*"; do
     if ! run /app/test-backend-ops -b CUDA0 -o "$op" 2>&1 | grep -E 'OK|FAIL|passed|not supported' | tail -5; then
         echo "FAILED: test-backend-ops -o $op" >&2
+        status=1
+    fi
+done
+
+echo
+echo "== decode fusions and one-token GEMV, bit for bit against the unfused graph"
+for t in test-inkling-megakernel test-inkling-gemv; do
+    # PERF FAIL (slower than the unfused reference) is reported, not a failure: only the opt-in MK_MOE has one
+    if ! run env LLAMA_INKLING_GEMV=1 "/app/$t" 2>&1 | grep -E 'cases (failed|passed)| FAIL' | grep -v 'PERF FAIL' |
+            tee /dev/stderr | grep -qE '^0 of [0-9]+ cases failed|^([0-9]+)/\1 cases passed'; then
+        echo "FAILED: $t" >&2
         status=1
     fi
 done

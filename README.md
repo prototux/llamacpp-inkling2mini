@@ -11,12 +11,14 @@ ready-to-use Compose file. It runs fully offline once the image and the model fi
 
 | | Stock llama.cpp | This build | Gain |
 |---|---:|---:|---:|
-| Prompt processing (prefill) | 800 tok/s | **1,800 tok/s** | 2.25x |
-| Generation | 50 tok/s | **75 tok/s** | 1.5x |
-| Maximum context | 42K tokens | **575K tokens** | 13.7x |
+| Prompt processing (prefill) | 800 tok/s | **2,000 tok/s** | 2.5x |
+| Generation | 50 tok/s | **110 tok/s** | 2.2x |
+| Maximum context | 42K tokens | **593K tokens** | 14x |
 
-Measured on an RTX 3090 with nothing else on the GPU. This build: Unsloth UD-Q3_K_XL weights, q8_0 KV cache,
-vision encoder on the CPU, thinking off, default settings of this repository. "Stock" is the official
+Measured on an RTX 3090 with nothing else on the GPU (`scripts/bench.py`, 2026-11-25). This build: Unsloth
+UD-Q3_K_XL weights, q8_0 KV cache, vision encoder on the CPU, thinking off, default settings of this repository.
+Prefill on 7K-30K-token prompts (1,260 tok/s at 118K, 500 tok/s at 493K); generation at a short context (~84 tok/s
+after a 54K-token prompt); a fact hidden at 438K tokens is recalled. "Stock" is the official
 `ghcr.io/ggml-org/llama.cpp:server-cuda` image of 2026-11-23.
 
 ## What is different from stock llama.cpp
@@ -32,10 +34,12 @@ vision encoder on the CPU, thinking off, default settings of this repository. "S
 | 7 | DSpark speculative decoding | upstream [#32218](https://github.com/ggml-org/llama.cpp/pull/32218) | **off**: ~50% acceptance on code, measured slower than plain decoding on a 3090 before the fixes of row 8 | `DSPARK` |
 | 8 | Speculative-decoding fixes: the target's rollback snapshots no longer break the fused convolution kernels (~1.2-1.5K extra kernel launches per verify step before), verification batches on the vec attention kernel, adaptive drafting from [#32773](https://github.com/ggml-org/llama.cpp/pull/32773), a shorter draft block option | this repo | DSpark verify steps should get much cheaper; not yet measured, so DSpark stays off by default | `LLAMA_INKLING_FA_VEC_VERIFY`, `LLAMA_SPEC_ADAPT`, `LLAMA_DSPARK_BLOCK` |
 | 9 | Fewer kernels per generated token: the MoE router norm written so the existing fused top-k kernel covers it, attention sinks passed to flash attention directly, trimmed one-token graphs | this repo | ~300 fewer kernel launches per token (est. +8-10% generation) | `LLAMA_INKLING_MOE_CLAMP_NORM`, `LLAMA_INKLING_GRAPH_TRIM`, `LLAMA_INKLING_DECODE_SINKS` (on) |
-| 10 | Decode attention reads each KV head once for its 3 query heads instead of 3 times | this repo | est. ~1.4x generation at 300-500K context | `LLAMA_INKLING_FA_VEC_GQA` (off) |
-| 11 | Attention without a mask tensor: causal and sliding-window masking derived from token positions in the kernels | this repo | est. -1 GiB VRAM at 1M context, faster long prefill | `LLAMA_INKLING_NO_MASK` (off) |
-| 12 | Multi-stream decode: the independent op chains of each layer (Q, K, V, bias, sinks, gate) run on side streams inside the CUDA graph, fusions kept | this repo | est. 75 -> 85-95 tok/s | `GGML_CUDA_GRAPH_OPT=2` (off) |
+| 10 | Decode attention reads each KV head once for its 3 query heads instead of 3 times | this repo | +5% generation at 90K context, -2% at short context, so `auto` uses it only for caches of 64K cells and more | `LLAMA_INKLING_FA_VEC_GQA` (off; `auto` or `1`) |
+| 11 | Attention without a mask tensor: causal and sliding-window masking derived from token positions in the kernels | this repo | identical output, less VRAM at long context, +1% generation | `LLAMA_INKLING_NO_MASK` (on) |
+| 12 | Multi-stream decode: the independent op chains of each layer (Q, K, V, bias, sinks, gate) run on side streams inside the CUDA graph, fusions kept | this repo | measured slightly slower than the default on a 3090 | `GGML_CUDA_GRAPH_OPT=2` (off) |
 | 13 | With thinking off, the prompt opens the answer block | this repo | Inkling 2 thinks at length even at effort 0 (`none`): the thinking used the token budget and long answers came out cut short | `REASONING_EFFORT` |
+| 14 | Decode fusions: the loop controllers, input norms, depth mix and their quantization ("glue"), the attention bias table, the expert scales, a layer's attention projections, the gated output-projection input and the Q/K/V epilogue (clip, rotation, cache writes) each in one kernel, plus a fused SITU for every layer; every one bit-exact against the unfused graph, checked on the GPU with `LLAMA_INKLING_MK_CHECK` | this repo | ~2,390 -> ~1,600 kernel launches per token: 90 -> ~106 tok/s on a 3090 | `LLAMA_INKLING_MK_GLUE`, `_MK_RELTAB`, `_MK_MOESCALE`, `_MK_PROJ`, `_MK_WOQ`, `_MK_QKV` (on) |
+| 15 | Q8_0/Q6_K one-token products with the row length known at compile time, so all weight loads of a thread are issued at once; same operations in the same order, bit-identical | this repo | +2% generation | `LLAMA_INKLING_GEMV` (on) |
 
 And the configuration the image runs by default:
 
@@ -140,7 +144,7 @@ Copy `.env.example` to `.env`; every setting is optional. The main ones:
 
 ### Kernel switches
 
-Changes 3 to 6 and 8 to 12 each have a switch (`1` = on). If `scripts/verify-kernels.sh` reports a failure on your GPU, turn
+Changes 3 to 6, 8 to 12, 14 and 15 each have a switch (`1` = on, `0` = off). If `scripts/verify-kernels.sh` reports a failure on your GPU, turn
 the matching switch off and restart (`docker compose up -d`); no rebuild is needed.
 
 | Switch | Default |
@@ -151,7 +155,8 @@ the matching switch off and restart (`docker compose up -d`); no rebuild is need
 | `LLAMA_INKLING_SHARE_LOOP_KV` | 0 |
 | `LLAMA_INKLING_FA_VEC_VERIFY` | 1 |
 | `LLAMA_INKLING_MOE_CLAMP_NORM`, `LLAMA_INKLING_GRAPH_TRIM`, `LLAMA_INKLING_DECODE_SINKS` | 1 |
-| `LLAMA_INKLING_FA_VEC_GQA`, `LLAMA_INKLING_NO_MASK` | 0 |
+| `LLAMA_INKLING_NO_MASK`, `LLAMA_INKLING_MK_GLUE`, `LLAMA_INKLING_MK_RELTAB`, `LLAMA_INKLING_MK_MOESCALE`, `LLAMA_INKLING_MK_PROJ`, `LLAMA_INKLING_MK_WOQ`, `LLAMA_INKLING_MK_QKV`, `LLAMA_INKLING_GEMV` | 1 (set by `docker/start-server.sh`) |
+| `LLAMA_INKLING_FA_VEC_GQA` | 0 (`auto` for long contexts) |
 | `GGML_CUDA_GRAPH_OPT` | unset (`2` to enable) |
 
 ## Checking an installation
@@ -160,11 +165,14 @@ All scripts run on the GPU host, from the repository root.
 
 | Script | What it does |
 |---|---|
-| `scripts/verify-kernels.sh` | compares every CUDA attention path and the fused kernels against the CPU reference (no model needed) |
+| `scripts/verify-kernels.sh` | compares every CUDA attention path and the fused kernels against the CPU reference, and the decode fusions bit for bit against the unfused graph (no model needed) |
 | `scripts/smoke_test.py [--needle N]` | text, per-request thinking, vision, and optionally recall of a fact hidden in an N-token prompt |
 | `scripts/bench.py --out results/x.json` | context size, time to first token at several prompt lengths, generation speed, recall |
 | `scripts/compare.py a.json b.json` | two benchmark runs side by side |
 | `scripts/quality.sh` | perplexity with and without a setting (by default the loop KV sharing), with the server stopped |
+| `scripts/mk-bench.sh` | generation speed per kernel-switch configuration, at short context and after a long prompt |
+| `scripts/compare-quality.sh`, `scripts/bisect-loop.sh` | token probabilities and long greedy answers per configuration: finds a setting that changes the output |
+| `scripts/check-thinking.sh` | thinking off by default, on per request |
 
 ## Binaries
 
@@ -192,9 +200,9 @@ The build clones upstream llama.cpp at the commit pinned in the Dockerfile (`LLA
   acceptance was ~50% on code and decoding dropped from 75 to ~63 tok/s on a 3090. Row 8 fixes the main cause found
   (unfused kernels in verification steps); to try it: convert the draft, set `DSPARK=on` and compare with
   `scripts/bench.py`. Adding `BACKEND_SAMPLING=on` and `LLAMA_SPEC_ADAPT=0.33` may help further.
-- **Changes 9 to 12 are new**: they run on an RTX 3090 (rows 10-12 are off by default) but are not benchmarked
-  yet; the gains in the table are estimates. `LLAMA_INKLING_KV_TYPE_FULL=q4_0` (q4_0 cache for the full-attention
-  slots) is included but produces garbage output; leave it unset.
+- **Generation slows with context depth**: ~109 tok/s on a short prompt, ~83 after a 54K-token prompt; the decode
+  attention kernel reaches only ~40% of the memory bandwidth at depth. `LLAMA_INKLING_KV_TYPE_FULL=q4_0` (q4_0 cache
+  for the full-attention slots) is included but produces garbage output; leave it unset.
 - **Loop KV sharing (`LLAMA_INKLING_SHARE_LOOP_KV=1`) makes long answers degrade into repetition**: short tests
   look fine, but a 3000-token greedy Terraform answer diverges from the default after ~60 characters and ends in
   a loop (`scripts/bisect-loop.sh`). Leave it off.

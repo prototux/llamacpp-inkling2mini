@@ -14,7 +14,7 @@ Applied in file-name order with `git apply` on upstream llama.cpp at the commit 
 | `0009-inkling2-thinking-off-answers-directly.patch` | this repository | with thinking disabled the Inkling parser opens the text block in the prompt (not with tools), and a server default of `--reasoning-effort none` disables thinking; a parser test |
 
 | `0007-inkling2-moonshot-decode-attention-maskless-q4-kv.patch` | this repository | fewer one-token kernels (router norm, sinks, graph trim), decode attention per KV head, attention without a mask tensor, q4_0 full-attention cache (known bug), graph statistics |
-| `0008-cuda-multi-stream-decode-plan.patch` | this repository | multi-stream plan for small-batch CUDA graphs (`GGML_CUDA_GRAPH_OPT=2`), fix for the vec kernel with a NULL mask, flash-attention tests at the Inkling 2 shapes |
+| `0008-cuda-multi-stream-decode-plan.patch` | this repository (branch `megakernel`) | multi-stream plan for small-batch CUDA graphs (`GGML_CUDA_GRAPH_OPT=2`), fix for the vec kernel with a NULL mask, flash-attention tests at the Inkling 2 shapes; the decode fusions (`LLAMA_INKLING_MK_*`), the one-token GEMV (`LLAMA_INKLING_GEMV`), `FA_VEC_GQA=auto`, the `MK_CHECK`/`MK_PROFILE` diagnostics and their self-tests (`test-inkling-megakernel`, `test-inkling-gemv`) |
 
 The build applies the patches listed in `series`, in that order.
 

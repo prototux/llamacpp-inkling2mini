@@ -3,6 +3,13 @@
 # Arguments given to the container are appended, e.g. `docker run ... image --verbose`.
 set -euo pipefail
 
+# decode fusions, all bit-exact against the unfused graph and measured on a 3090 (README, "Kernel switches"):
+# on unless .env sets them, `0` turns one off
+for v in LLAMA_INKLING_MK_GLUE LLAMA_INKLING_MK_RELTAB LLAMA_INKLING_MK_MOESCALE LLAMA_INKLING_MK_PROJ \
+         LLAMA_INKLING_MK_WOQ LLAMA_INKLING_MK_QKV LLAMA_INKLING_GEMV LLAMA_INKLING_NO_MASK; do
+    export "$v=${!v:-1}"
+done
+
 models=${MODELS:-/models}
 model=$models/${MODEL_FILE:-Inkling-2-Mini-UD-Q3_K_XL.gguf}
 [[ -f $model ]] || { echo "error: model $model not found: see README, 'Model files'" >&2; exit 1; }

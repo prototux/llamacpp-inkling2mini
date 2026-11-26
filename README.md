@@ -17,8 +17,8 @@ ready-to-use Compose file. It runs fully offline once the image and the model fi
 
 Measured on an RTX 3090 with nothing else on the GPU (`scripts/bench.py`, 2026-11-25). This build: Unsloth
 UD-Q3_K_XL weights, q8_0 KV cache, vision encoder on the CPU, thinking off, default settings of this repository.
-Prefill on 7K-30K-token prompts (1,260 tok/s at 118K, 500 tok/s at 493K); generation at a short context (~84 tok/s
-after a 54K-token prompt); a fact hidden at 438K tokens is recalled. "Stock" is the official
+Prefill on 7K-30K-token prompts (1,260 tok/s at 118K, 500 tok/s at 493K); generation at a short context with the
+default sampling, on the GPU (114 tok/s greedy; 98 tok/s after a 17K-token prompt, ~84 after 54K); a fact hidden at 438K tokens is recalled. "Stock" is the official
 `ghcr.io/ggml-org/llama.cpp:server-cuda` image of 2026-11-23.
 
 ## What is different from stock llama.cpp
@@ -138,6 +138,7 @@ Copy `.env.example` to `.env`; every setting is optional. The main ones:
 | `VISION` | `cpu` | `cpu`: encoder off the GPU; `gpu`: faster images, ~50K tokens less; `off` |
 | `UBATCH` | 512 | prefill micro-batch: larger = faster prompt processing, more VRAM |
 | `REASONING_EFFORT` | `none` | default thinking effort |
+| `BACKEND_SAMPLING` | `on` | sample on the GPU; `off` samples on the host (~8% slower generation) |
 | `BIND_ADDR` / `API_KEY` | `127.0.0.1` / empty | set both before exposing the port |
 | `DSPARK` | `off` | speculative decoding, see "Known limitations" |
 | `EXTRA_ARGS` | empty | any other `llama-server` flags |
@@ -199,7 +200,9 @@ The build clones upstream llama.cpp at the commit pinned in the Dockerfile (`LLA
 - **DSpark speculative decoding is off.** With the draft model converted for this build (`scripts/convert-dspark.sh`),
   acceptance was ~50% on code and decoding dropped from 75 to ~63 tok/s on a 3090. Row 8 fixes the main cause found
   (unfused kernels in verification steps); to try it: convert the draft, set `DSPARK=on` and compare with
-  `scripts/bench.py`. Adding `BACKEND_SAMPLING=on` and `LLAMA_SPEC_ADAPT=0.33` may help further.
+  `scripts/bench.py`. Adding `LLAMA_SPEC_ADAPT=0.33` may help further.
+- **Requests with tools are ~8% slower**: llama.cpp samples on the host for any request with a grammar, and a
+  tool-calling client (Open WebUI with tools, for example) sends one with every request. Being fixed.
 - **Generation slows with context depth**: ~109 tok/s on a short prompt, ~83 after a 54K-token prompt; the decode
   attention kernel reaches only ~40% of the memory bandwidth at depth. `LLAMA_INKLING_KV_TYPE_FULL=q4_0` (q4_0 cache
   for the full-attention slots) is included but produces garbage output; leave it unset.

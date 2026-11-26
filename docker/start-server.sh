@@ -70,8 +70,10 @@ if [[ ${DSPARK:-off} == on ]]; then
     )
 fi
 
-# sampling inside the GPU graph: no logits copy to the host per token (not with grammars or a reasoning budget)
-if [[ ${BACKEND_SAMPLING:-off} == on ]]; then
+# sampling inside the GPU graph: no copy of the 200K logits to the host per token, +7-9% generation with the default
+# sampling settings. llama.cpp falls back to host sampling for a request with a grammar (tools, JSON schema) or a
+# reasoning budget
+if [[ ${BACKEND_SAMPLING:-on} == on ]]; then
     args+=(--backend-sampling)
 fi
 

@@ -180,7 +180,7 @@ The build clones upstream llama.cpp at the commit pinned in the Dockerfile (`LLA
 - **DSpark speculative decoding is off.** With the draft model converted for this build (`scripts/convert-dspark.sh`),
   acceptance was ~50% on code and decoding dropped from 75 to ~63 tok/s on a 3090. Row 8 fixes the main cause found
   (unfused kernels in verification steps); to try it: convert the draft, set `DSPARK=on` and compare with
-  `scripts/bench.py`. Adding `BACKEND_SAMPLING=on` and `LLAMA_SPEC_ADAPT=0.33` may help further.
+  `scripts/bench.py`. Adding `LLAMA_SPEC_ADAPT=0.33` may help further.
 - **Loop KV sharing (`LLAMA_INKLING_SHARE_LOOP_KV=1`) makes long answers degrade into repetition**: short tests
   look fine, but a 3000-token greedy Terraform answer diverges from the default after ~60 characters and ends in
   a loop (`scripts/bisect-loop.sh`). Leave it off.
